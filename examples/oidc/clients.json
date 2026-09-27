@@ -1,0 +1,16 @@
+[
+  {
+    "client_id": "demo-rp",
+    "name": "Demo App",
+    "redirect_uris": ["http://localhost:3000/cb"],
+    "post_logout_redirect_uris": ["http://localhost:3000/"],
+    "audience": "api://invoices"
+  },
+  {
+    "client_id": "grafana",
+    "client_secret": "change-me",
+    "name": "Grafana",
+    "redirect_uris": ["http://localhost:3001/login/generic_oauth"],
+    "subject_type": "public"
+  }
+]

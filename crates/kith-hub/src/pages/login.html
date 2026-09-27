@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Kith</title>
+<style nonce="{{NONCE}}">{{STYLE}}</style>
+</head>
+<body>
+<main>
+  <div class="brand">Kith</div>
+  <h1>Sign in to <span id="client"></span></h1>
+  <p>Use a passkey on this device or a security key.</p>
+  <div class="stack">
+    <button id="passkey" class="primary" type="button">Sign in with a passkey</button>
+  </div>
+  <div id="otp-box" class="hidden">
+    <label for="otp">One-time code from your authenticator app</label>
+    <input id="otp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" maxlength="8">
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+  <details id="more">
+    <summary>Other ways to sign in</summary>
+    <label for="did">Your Kith identity (did:kith:…)</label>
+    <input id="did" autocomplete="username" spellcheck="false">
+    <div class="stack mt">
+      <button id="wallet" class="secondary" type="button">Sign with an Ethereum wallet</button>
+      <button id="show-otp" class="secondary" type="button">Add a one-time code</button>
+    </div>
+  </details>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+let challenge = { id: D.challenge_id, message: D.message };
+$("client").textContent = D.client_name;
+try { $("did").value = localStorage.getItem("kith_did") || ""; } catch {}
+if (D.min_aal >= 3) {
+  status("This app requires a hardware security key.");
+} else if (D.min_aal >= 2) {
+  $("otp-box").classList.remove("hidden");
+  status("This app asks for a strong sign-in: a passkey with PIN or biometrics, or add a one-time code.");
+}
+if (!webauthnSupported()) {
+  $("passkey").disabled = true;
+  status("This browser doesn't support passkeys. Use another way to sign in below.", "error");
+}
+$("show-otp").onclick = () => { $("otp-box").classList.remove("hidden"); $("otp").focus(); };
+
+function busy(on) {
+  for (const id of ["passkey", "wallet"]) $(id).disabled = on;
+}
+
+async function submit(did, factors) {
+  const code = $("otp").value.trim();
+  if (code) factors.push({ type: "totp", code });
+  status("Checking…");
+  const r = await postJSON("/oauth/login", { request_id: D.request_id, challenge_id: challenge.id, did, factors });
+  if (r.ok) {
+    try { localStorage.setItem("kith_did", did); } catch {}
+    status("Signed in. Returning to " + D.client_name + "…", "ok");
+    location.assign(r.body.redirect);
+    return;
+  }
+  if (r.body.challenge_id) challenge = { id: r.body.challenge_id, message: r.body.message };
+  if (r.body.error === "step_up_required" && r.body.required_aal >= 3) {
+    status("This app requires a hardware security key (assurance level 3). This passkey reached level " + r.body.aal + ". Try a device-bound security key.", "error");
+  } else if (r.body.error === "step_up_required") {
+    $("otp-box").classList.remove("hidden");
+    $("otp").focus();
+    status("One more step: enter a one-time code, then sign in again.", "error");
+  } else {
+    status(r.body.error_description || "Sign-in failed.", "error");
+  }
+}
+
+$("passkey").onclick = async () => {
+  busy(true);
+  try {
+    const cred = await navigator.credentials.get({
+      publicKey: { challenge: await sha256(challenge.message), rpId: D.rp_id, userVerification: "preferred", allowCredentials: [] },
+    });
+    const r = cred.response;
+    if (!r.userHandle || r.userHandle.byteLength === 0) {
+      status("That passkey isn't linked to a Kith identity. Enroll it with `kith passkey enroll`.", "error");
+      return;
+    }
+    const did = new TextDecoder().decode(r.userHandle);
+    await submit(did, [{
+      type: "webauthn",
+      authenticator_data: b64u(r.authenticatorData),
+      client_data_json: b64u(r.clientDataJSON),
+      signature: b64u(r.signature),
+    }]);
+  } catch (e) {
+    status(e.name === "NotAllowedError" ? "Passkey sign-in was cancelled." : "Passkey error: " + e.message, "error");
+  } finally {
+    busy(false);
+  }
+};
+
+$("wallet").onclick = async () => {
+  const did = $("did").value.trim();
+  if (!did.startsWith("did:kith:")) { status("Enter your Kith identity first.", "error"); $("did").focus(); return; }
+  if (!window.ethereum) { status("No Ethereum wallet found in this browser.", "error"); return; }
+  busy(true);
+  try {
+    const [account] = await window.ethereum.request({ method: "eth_requestAccounts" });
+    const chainId = parseInt(await window.ethereum.request({ method: "eth_chainId" }), 16);
+    const hex = "0x" + Array.from(new TextEncoder().encode(challenge.message), (b) => b.toString(16).padStart(2, "0")).join("");
+    const sigHex = await window.ethereum.request({ method: "personal_sign", params: [hex, account] });
+    const sig = Uint8Array.from(sigHex.slice(2).match(/../g), (h) => parseInt(h, 16));
+    await submit(did, [{ type: "signature", sig: { signer: `eip155:${chainId}:${account.toLowerCase()}`, alg: "EIP191", sig: b64u(sig) } }]);
+  } catch (e) {
+    status("Wallet error: " + e.message, "error");
+  } finally {
+    busy(false);
+  }
+};
+</script>
+</body>
+</html>

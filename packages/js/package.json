@@ -1,0 +1,35 @@
+{
+  "name": "@kith/auth",
+  "version": "0.1.0",
+  "description": "Kith for JavaScript: verify Kith access tokens, evaluate Cedar policies, lock down GraphQL, and log in from the browser with passkeys.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./graphql": "./src/graphql.ts",
+    "./client": "./src/client.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "scripts": {
+    "test": "node --test 'src/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=23.6"
+  },
+  "dependencies": {
+    "@cedar-policy/cedar-wasm": "^4.13.0",
+    "jose": "^6.0.0"
+  },
+  "peerDependencies": {
+    "graphql": "^16.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "graphql": "^16.11.0",
+    "graphql-yoga": "^5.13.0",
+    "openid-client": "^6.8.8",
+    "playwright-core": "^1.63.0",
+    "typescript": "^5.9.0"
+  }
+}

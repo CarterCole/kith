@@ -1,0 +1,5 @@
+[
+  { "id": "inv_1", "ownerEmail": "ada@acme.test", "amount": 1200, "status": "open", "internalNotes": "net 30" },
+  { "id": "inv_2", "ownerEmail": "bob@acme.test", "amount": 800, "status": "open", "internalNotes": "friendly customer" },
+  { "id": "inv_3", "ownerEmail": "carol@acme.test", "amount": 25000, "status": "open", "internalNotes": "escalate" }
+]

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "groups": {
+    "finance": {
+      "description": "Explicit members plus a nested group",
+      "members": ["__ADA__", "group:finance-contractors"]
+    },
+    "finance-contractors": { "members": [] },
+    "staff": {
+      "description": "Dynamic: anyone whose directory email is on the company domain",
+      "rule": "principal has email && principal.email like \"*@acme.test\""
+    },
+    "strong-auth": {
+      "description": "Dynamic: sessions at AAL2 or higher (passkey with UV, or MFA)",
+      "rule": "principal has aal && principal.aal >= 2"
+    }
+  },
+  "roles": {
+    "billing-reader": { "members": ["group:finance"] },
+    "billing-admin": {
+      "description": "Dynamic role: finance members, but only on strongly authenticated sessions",
+      "rule": "principal in Group::\"finance\" && principal in Group::\"strong-auth\""
+    }
+  },
+  "directory": {
+    "__ADA__": { "attrs": { "email": "ada@acme.test", "name": "Ada", "department": "finance" } },
+    "__BOB__": { "attrs": { "email": "bob@acme.test", "name": "Bob", "department": "sales" } }
+  },
+  "policies": "// Anyone authenticated may ask who they are.\n@id(\"me\")\npermit(principal, action == Action::\"Query.me\", resource);\n\n// Staff and billing readers may list invoices; which rows they see is decided per row below.\n@id(\"list-invoices\")\npermit(principal, action == Action::\"Query.invoices\", resource)\nwhen { principal in Group::\"staff\" || principal in Role::\"billing-reader\" };\n\n// Row level: billing readers see every invoice, everyone else only their own.\n@id(\"invoice-rows-billing\")\npermit(principal in Role::\"billing-reader\", action == Action::\"Invoice.read\", resource);\n@id(\"invoice-rows-own\")\npermit(principal, action == Action::\"Invoice.read\", resource)\nwhen { principal has email && resource has ownerEmail && resource.ownerEmail == principal.email };\n\n// Field level: internal notes only for billing admins.\n@id(\"invoice-notes\")\npermit(principal in Role::\"billing-admin\", action == Action::\"Invoice.internalNotes\", resource);\n\n// Paying requires the admin role and a limit, and is never allowed through delegation.\n@id(\"pay\")\npermit(principal in Role::\"billing-admin\", action == Action::\"Mutation.payInvoice\", resource)\nwhen { context has amount && context.amount < 10000 };\n@id(\"no-delegated-mutations\")\nforbid(principal, action, resource)\nwhen { context has actor && context has operationType && context.operationType == \"mutation\" };\n"
+}

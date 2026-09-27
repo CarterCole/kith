@@ -1,0 +1,23 @@
+[package]
+name = "kith-hub"
+description = "Reference Kith hub: KEL registry, authentication, token exchange and OpenID Connect provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kith-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+axum.workspace = true
+sha2.workspace = true
+rand.workspace = true
+hmac = "0.12"
+base64.workspace = true
+rsa = { version = "0.9", features = ["sha2"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

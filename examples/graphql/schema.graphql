@@ -1,0 +1,32 @@
+"Kith: check this field (optionally with a custom action), or check every object of this type (row level)."
+directive @auth(action: String) on FIELD_DEFINITION | OBJECT
+
+type Query {
+  "Who am I? Allowed for any authenticated principal."
+  me: Me!
+  "Row-level filtered: you only get the invoices you may read."
+  invoices: [Invoice!]!
+  invoice(id: ID!): Invoice
+}
+
+type Mutation {
+  payInvoice(id: ID!, amount: Int!): Invoice
+}
+
+type Me {
+  did: String!
+  actor: String
+  groups: [String!]!
+  roles: [String!]!
+  aal: Int!
+}
+
+"Every Invoice object is checked with action Invoice.read."
+type Invoice @auth {
+  id: ID!
+  ownerEmail: String!
+  amount: Int!
+  status: String!
+  "Field level: action Invoice.internalNotes."
+  internalNotes: String @auth
+}

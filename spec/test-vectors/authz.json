@@ -1,0 +1,41 @@
+{
+  "description": "Kith authorization conformance vectors. Every implementation must compute the same memberships and decisions.",
+  "bundle": {
+    "version": 1,
+    "groups": {
+      "finance": { "members": ["did:kith:ada", "group:contractors"] },
+      "contractors": { "members": ["did:kith:bob"] },
+      "staff": { "rule": "principal has email && principal.email like \"*@acme.test\"" },
+      "strong": { "rule": "principal has aal && principal.aal >= 2" },
+      "vip": { "rule": "principal in Role::\"billing-admin\"" }
+    },
+    "roles": {
+      "billing-reader": { "members": ["group:finance"] },
+      "billing-admin": { "rule": "principal in Group::\"finance\" && principal in Group::\"strong\"" }
+    },
+    "directory": {
+      "did:kith:ada": { "attrs": { "email": "ada@acme.test", "department": "finance" } },
+      "did:kith:bob": { "attrs": { "email": "bob@partner.test" } }
+    },
+    "policies": "@id(\"read-invoices\")\npermit(principal in Role::\"billing-reader\", action == Action::\"Query.invoices\", resource);\n@id(\"pay\")\npermit(principal in Role::\"billing-admin\", action == Action::\"Mutation.payInvoice\", resource) when { context has amount && context.amount < 10000 };\n@id(\"own-invoice\")\npermit(principal, action == Action::\"Invoice.read\", resource) when { principal has email && resource has ownerEmail && resource.ownerEmail == principal.email };\n@id(\"no-delegated-pay\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) when { context has actor };"
+  },
+  "memberships": [
+    { "id": "did:kith:ada", "attrs": { "aal": 2 }, "groups": ["finance", "staff", "strong", "vip"], "roles": ["billing-admin", "billing-reader"] },
+    { "id": "did:kith:ada", "attrs": { "aal": 1 }, "groups": ["finance", "staff"], "roles": ["billing-reader"] },
+    { "id": "did:kith:bob", "attrs": { "aal": 3 }, "groups": ["contractors", "finance", "strong", "vip"], "roles": ["billing-admin", "billing-reader"] },
+    { "id": "did:kith:eve", "attrs": { "aal": 3, "email": "eve@acme.test" }, "groups": ["staff", "strong"], "roles": [] },
+    { "id": "did:kith:mallory", "attrs": {}, "groups": [], "roles": [] }
+  ],
+  "decisions": [
+    { "name": "reader lists invoices", "principal": "did:kith:ada", "attrs": { "aal": 1 }, "action": "Query.invoices", "resource": { "type": "Operation", "id": "Query.invoices" }, "context": {}, "allowed": true },
+    { "name": "stranger cannot list", "principal": "did:kith:eve", "attrs": { "aal": 3, "email": "eve@acme.test" }, "action": "Query.invoices", "resource": { "type": "Operation", "id": "Query.invoices" }, "context": {}, "allowed": false },
+    { "name": "admin pays under limit", "principal": "did:kith:ada", "attrs": { "aal": 2 }, "action": "Mutation.payInvoice", "resource": { "type": "Operation", "id": "Mutation.payInvoice" }, "context": { "amount": 500 }, "allowed": true },
+    { "name": "admin over limit", "principal": "did:kith:ada", "attrs": { "aal": 2 }, "action": "Mutation.payInvoice", "resource": { "type": "Operation", "id": "Mutation.payInvoice" }, "context": { "amount": 50000 }, "allowed": false },
+    { "name": "weak session is not admin", "principal": "did:kith:ada", "attrs": { "aal": 1 }, "action": "Mutation.payInvoice", "resource": { "type": "Operation", "id": "Mutation.payInvoice" }, "context": { "amount": 5 }, "allowed": false },
+    { "name": "row level: own invoice (float attr ignored safely)", "principal": "did:kith:ada", "attrs": { "aal": 1 }, "action": "Invoice.read", "resource": { "type": "Invoice", "id": "inv_1", "attrs": { "ownerEmail": "ada@acme.test", "amount": 12.5, "note": null } }, "context": {}, "allowed": true },
+    { "name": "row level: someone else's invoice", "principal": "did:kith:bob", "attrs": { "aal": 1 }, "action": "Invoice.read", "resource": { "type": "Invoice", "id": "inv_1", "attrs": { "ownerEmail": "ada@acme.test" } }, "context": {}, "allowed": false },
+    { "name": "delegated: cap allows query", "principal": "did:kith:ada", "attrs": { "aal": 2 }, "actor": "did:kith:agent", "caps": [{ "action": "Query.*" }], "action": "Query.invoices", "resource": { "type": "Operation", "id": "Query.invoices" }, "context": {}, "allowed": true },
+    { "name": "delegated: cap missing", "principal": "did:kith:ada", "attrs": { "aal": 2 }, "actor": "did:kith:agent", "caps": [{ "action": "Query.*" }], "action": "Invoice.read", "resource": { "type": "Invoice", "id": "inv_1", "attrs": { "ownerEmail": "ada@acme.test" } }, "context": {}, "allowed": false },
+    { "name": "delegated: cap present but policy forbids", "principal": "did:kith:ada", "attrs": { "aal": 2 }, "actor": "did:kith:agent", "caps": [{ "action": "*" }], "action": "Mutation.payInvoice", "resource": { "type": "Operation", "id": "Mutation.payInvoice" }, "context": { "amount": 5 }, "allowed": false }
+  ]
+}

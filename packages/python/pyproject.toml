@@ -1,0 +1,26 @@
+[project]
+name = "kith-auth"
+version = "0.1.0"
+description = "Kith for Python: verify Kith access tokens, evaluate Cedar policies with dynamic groups, and lock down GraphQL (graphql-core, Strawberry, Ariadne)."
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+  "cedarpy>=4.12",
+  "pyjwt[crypto]>=2.10",
+]
+
+[project.optional-dependencies]
+graphql = ["graphql-core>=3.2"]
+
+[dependency-groups]
+dev = ["pytest>=8", "graphql-core>=3.2,<3.3", "starlette>=0.46", "uvicorn>=0.34", "ariadne>=0.26", "httpx>=0.28"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kith"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

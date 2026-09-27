@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Add a passkey · Kith</title>
+<style nonce="{{NONCE}}">{{STYLE}}</style>
+</head>
+<body>
+<main>
+  <div class="brand">Kith</div>
+  <h1>Add a passkey to your identity</h1>
+  <p>This passkey becomes a device of<code id="did" class="block"></code>Your terminal approves it with your manage key.</p>
+  <div class="stack">
+    <button id="create" class="primary" type="button">Create passkey</button>
+    <button id="confirm" class="primary hidden" type="button">Confirm with your passkey</button>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+$("did").textContent = D.did;
+let key, rawId;
+
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function base58(bytes) {
+  let n = 0n;
+  for (const b of bytes) n = n * 256n + BigInt(b);
+  let out = "";
+  while (n > 0n) { out = B58[Number(n % 58n)] + out; n /= 58n; }
+  for (const b of bytes) { if (b !== 0) break; out = "1" + out; }
+  return out;
+}
+function p256DidKey(spki) {
+  const b = new Uint8Array(spki);
+  const pt = b.slice(b.length - 65);
+  const compressed = [pt[64] & 1 ? 3 : 2, ...pt.slice(1, 33)];
+  return "did:key:z" + base58(new Uint8Array([0x80, 0x24, ...compressed]));
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+if (!webauthnSupported()) { $("create").disabled = true; status("This browser doesn't support passkeys.", "error"); }
+if (D.state !== "waiting_for_passkey") { $("create").disabled = true; status("This link has already been used.", "error"); }
+
+$("create").onclick = async () => {
+  $("create").disabled = true;
+  try {
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        rp: { id: D.rp_id, name: "Kith" },
+        user: { id: new TextEncoder().encode(D.did), name: D.name, displayName: D.name },
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "preferred" },
+        attestation: "none",
+      },
+    });
+    const spki = cred.response.getPublicKey();
+    if (!spki) throw new Error("the authenticator did not return a public key");
+    key = p256DidKey(spki);
+    rawId = cred.rawId;
+    const r = await postJSON(`/v1/enroll/${D.id}/key`, { key, credential_id: b64u(rawId) });
+    if (!r.ok) throw new Error(r.body.error_description || "could not submit the passkey");
+    status("Passkey created. Waiting for your terminal to approve it…");
+    for (;;) {
+      const s = await (await fetch(`/v1/enroll/${D.id}`)).json();
+      if (s.message) { D.message = s.message; break; }
+      await sleep(500);
+    }
+    $("create").classList.add("hidden");
+    $("confirm").classList.remove("hidden");
+    status("Approved. Confirm with your passkey to prove you hold it.");
+  } catch (e) {
+    $("create").disabled = false;
+    status(e.name === "NotAllowedError" ? "Passkey creation was cancelled." : "Error: " + e.message, "error");
+  }
+};
+
+$("confirm").onclick = async () => {
+  $("confirm").disabled = true;
+  try {
+    const a = await navigator.credentials.get({
+      publicKey: { challenge: await sha256(D.message), rpId: D.rp_id, allowCredentials: [{ type: "public-key", id: rawId }], userVerification: "preferred" },
+    });
+    const sig = {
+      signer: key, alg: "WebAuthn", sig: b64u(a.response.signature),
+      webauthn: { authenticator_data: b64u(a.response.authenticatorData), client_data_json: b64u(a.response.clientDataJSON) },
+    };
+    const r = await postJSON(`/v1/enroll/${D.id}/sig`, { sig });
+    if (!r.ok) throw new Error(r.body.error_description || "signature rejected");
+    $("confirm").classList.add("hidden");
+    status("Done. This passkey is now a device of your identity. You can close this tab.", "ok");
+  } catch (e) {
+    $("confirm").disabled = false;
+    status(e.name === "NotAllowedError" ? "Cancelled. Try again." : "Error: " + e.message, "error");
+  }
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kith</title>
+<style nonce="{{NONCE}}">{{STYLE}}</style>
+</head>
+<body>
+<main>
+  <div class="brand">Kith</div>
+  <h1 id="title"></h1>
+  <p id="text"></p>
+  <div id="status" class="status"></div>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+$("title").textContent = D.title;
+$("text").textContent = D.text;
+document.title = D.title + " · Kith";
+</script>
+</body>
+</html>
