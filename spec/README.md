@@ -49,6 +49,7 @@ the only way to read the spec.
 | 5 | [Aliases](05-aliases.md) | public and private aliases, proving the link on demand |
 | 6 | [Vault](06-vault.md) | crypto-enforced access: skip ratchets, WNFS relationship |
 | 7 | [OpenID Connect](07-oidc.md) | "Sign in with Kith": code + PKCE, passkey login page, SSO, step-up, pairwise subjects, browser passkey enrollment |
+| 8 | [Policy DAG, revocations, freshness](08-policy-dag.md) | bundles as content-addressed blocks, provable slices, org policy roots, signed revocation chains, beacon heartbeats (drand, NIST 2.0), degraded mode, OpenTimestamps anchoring |
 | — | [Test vectors](test-vectors/) | conformance vectors every implementation must pass |
 
 ## Conventions
@@ -69,6 +70,7 @@ An implementation claims one or more profiles:
 | Profile | Must implement |
 |---------|----------------|
 | **Resource server** | Verify access tokens against a JWKS (§3.5). Pass `test-vectors/authz.json` (§4). |
+| **Slice reader** | The above, plus load slices and follow revocations (§8). Pass `test-vectors/policy-dag.json` and `test-vectors/beacons.json`. |
 | **Verifier** | The above, plus KEL replay (§1.6), session-chain verification (§3.3), and alias proofs (§5). |
 | **Hub** | The above, plus the endpoints of §2, §3.4 and §7. |
 | **Wallet / agent** | Create and sign KEL events, grants, session tokens and delegations. |
@@ -77,6 +79,6 @@ Current implementations:
 
 | Implementation | Profile |
 |----------------|---------|
-| Rust (`kith-core`, `kith-hub`, `kith` CLI) | All four. |
-| JS (`@kith/auth`) | Resource server, plus a browser client for passkey and wallet login. |
+| Rust (`kith-core`, `kith-hub`, `kith` CLI) | All five, plus DAG building and OpenTimestamps (`test-vectors/ots.json`). |
+| JS (`@kith/auth`) | Resource server and slice reader (Ed25519 revokers only), plus a browser client for passkey and wallet login. |
 | Python (`kith-auth`) | Resource server. |

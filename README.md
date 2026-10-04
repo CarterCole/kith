@@ -24,6 +24,17 @@
   field and row level in JS and Python.
 - **Crypto-enforced sharing** uses skip-ratchet group keys, WNFS style, sealed to
   device keys. It covers data that lives on untrusted storage.
+- **Policies as a content-addressed DAG.**
+  - The bundle is stored as IPFS-compatible blocks with indexes, and the org's KEL
+    commits to the root.
+  - A session that reads one GraphQL field fetches only that field's policies,
+    from anyone. It can prove nothing was left out.
+- **Pushed revocations with provable freshness.** A signed, hash-chained revocation
+  list plus heartbeats that embed a drand or NIST beacon.
+  - Each verifier sets how long it can go between syncs: fresh, then degraded, then
+    it fails closed.
+  - Policies can demand a fresher view, for example payments under 60 s.
+  - OpenTimestamps anchors the history to Bitcoin.
 
 Start with [`spec/`](spec/README.md). Then read [prior art](docs/prior-art.md),
 [passports](docs/passports.md), and the [roadmap](docs/roadmap.md).
@@ -34,6 +45,7 @@ Start with [`spec/`](spec/README.md). Then read [prior art](docs/prior-art.md),
 scripts/demo.sh        # hub + JS API + Python API, CLI logins, TOTP step-up, delegation, browser passkey
 scripts/cli-flows.sh   # devices, passkeys, aliases, delegation, revocation, TOTP co-signed recovery
 scripts/oidc-demo.sh   # real Chrome + virtual passkey: enroll from the browser, OIDC sign-in, SSO, step-up, logout
+scripts/policy-dag-demo.sh  # org publishes a policy DAG, provable slices, revocation push, drand-verified freshness
 scripts/test-all.sh    # unit tests (Rust, JS, Python) incl. shared conformance vectors
 ```
 
@@ -102,6 +114,25 @@ let claims = verify_access_token(tok, &jwks, HUB, "api://invoices", now())?;
 let ok = engine.authorize(&principal, "Query.invoices", &Resource::new("Operation", "Query.invoices"), &ctx)?.allowed;
 ```
 
+**Policy slices and revocations** ([spec §8](spec/08-policy-dag.md))
+
+```bash
+kith policy publish bundle.json              # as the org: DAG blocks up, root into the org's KEL
+kith policy add-revoker                      # let the hub sign heartbeats (a revoke-only device)
+kith policy slice --org did:kith:… --action Query.invoices   # just that field, checked against the KEL
+kith revoke member did:kith:ada… Group::finance              # pushed, signed, hash-chained
+kith revocations --org did:kith:… --max-staleness 86400      # "I sync once a day"
+kith anchor stamp --out root.ots             # OpenTimestamps: existed by Bitcoin block N
+```
+
+```ts
+import { loadSlice, gatewayBlocks, Follower, HubFeed, Verifiers, authorize } from "@kith/auth";
+const slice = await loadSlice(gatewayBlocks("https://ipfs.io"), root, { kind: "actions", actions: ["Query.invoices"] });
+const feed = new HubFeed(HUB, org, new Follower(org.did, through, { fresh_for: 60, max_staleness: 900, require_beacon: true }), await Verifiers.create());
+await feed.sync(); feed.listen();
+authorize(slice, feed.follower, { principal, jti, action: "Query.invoices", resource }, Date.now() / 1000 | 0);
+```
+
 **Policies** ([example bundle](examples/policy/bundle.template.json))
 
 ```cedar
@@ -118,11 +149,11 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 
 | Path | What |
 |------|------|
-| `spec/` | Normative spec and [conformance vectors](spec/test-vectors/authz.json) |
-| `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, vault |
-| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, OpenID Connect provider with passkey login and enrollment pages |
+| `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
+| `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
+| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, OpenID Connect provider with passkey login and enrollment pages, block store and IPFS-gateway route, revocation feeds and heartbeats |
 | `crates/kith-cli` | `kith` binary |
-| `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client |
+| `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |
 | `examples/` | Shared policy bundle, GraphQL schema and data used by every example and test |
 

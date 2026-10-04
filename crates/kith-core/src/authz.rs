@@ -149,6 +149,12 @@ fn entity(kind: &str, id: &str, attrs: Value, parents: Vec<(&str, &str)>) -> Val
 impl Engine {
     pub fn new(bundle: Bundle) -> Result<Self> {
         let policies = PolicySet::from_str(&bundle.policies).map_err(|e| Error::Authz(format!("policies: {e}")))?;
+        Self::with_policy_set(bundle, policies)
+    }
+
+    /// An engine over `bundle`'s sets and directory with an already-built policy set
+    /// (`bundle.policies` is ignored). Used for policy DAG slices.
+    pub fn with_policy_set(bundle: Bundle, policies: PolicySet) -> Result<Self> {
         let mut membership = PolicySet::new();
         for (kind, sets) in [("Group", &bundle.groups), ("Role", &bundle.roles)] {
             for (name, def) in sets {
@@ -197,6 +203,12 @@ impl Engine {
 
     /// Compute explicit + nested + dynamic group and role membership.
     pub fn memberships(&self, id: &str, attrs: &Map<String, Value>) -> Result<Memberships> {
+        self.memberships_excluding(id, attrs, &BTreeSet::new())
+    }
+
+    /// Memberships with some sets (`Group::x`, `Role::x`) ruled out, as revocations
+    /// require. An excluded set never joins, so neither do sets that depended on it.
+    pub fn memberships_excluding(&self, id: &str, attrs: &Map<String, Value>, excluded: &BTreeSet<String>) -> Result<Memberships> {
         let mut groups = BTreeSet::new();
         let mut roles = BTreeSet::new();
         let limit = self.bundle.groups.len() + self.bundle.roles.len() + 1;
@@ -210,7 +222,7 @@ impl Engine {
             for (kind, defs) in [("Group", &self.bundle.groups), ("Role", &self.bundle.roles)] {
                 for (name, def) in defs {
                     let current = if kind == "Group" { &groups } else { &roles };
-                    if current.contains(name) {
+                    if current.contains(name) || excluded.contains(&format!("{kind}::{name}")) {
                         continue;
                     }
                     let explicit = def.members.iter().any(|m| {

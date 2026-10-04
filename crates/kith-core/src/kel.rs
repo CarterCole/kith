@@ -9,8 +9,9 @@
 //! | L0    | `next` rotation policy  | rotate (replace `manage`), revoke all devices         |
 //! |       | (pre-committed, cold)   |                                                       |
 //! | L1    | `manage` policy         | add/revoke devices, link/unlink public aliases        |
+//! | L1    | `manage` policy         | commit policy roots (orgs, spec §8)                   |
 //! | L2    | devices                 | sign session grants, commit private aliases, revoke   |
-//! |       |                         | themselves                                            |
+//! |       |                         | themselves; `revoke` devices sign revocations (§8.6)  |
 //! | L3    | session keys            | sign requests / tokens (never appear in the KEL)      |
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,7 +48,8 @@ pub struct Device {
     pub kind: DeviceKind,
     /// Highest NIST 800-63 authenticator assurance level this device can assert (1-3).
     pub aal: u8,
-    /// Capabilities: `session` (sign session grants), `alias` (commit private aliases).
+    /// Capabilities: `session` (sign session grants), `alias` (commit private aliases),
+    /// `revoke` (sign an org's revocations and heartbeats, spec §8.6).
     #[serde(default)]
     pub caps: Vec<String>,
     /// For passkeys: the WebAuthn relying party id the credential is scoped to.
@@ -102,6 +104,13 @@ pub enum EventBody {
     AliasUnlink {
         alias: String,
     },
+    /// An organization's current policy DAG (spec §8). `revocations_through` says
+    /// which revocation entries this root already reflects.
+    PolicyRoot {
+        root: String,
+        #[serde(default)]
+        revocations_through: u64,
+    },
 }
 
 impl EventBody {
@@ -114,6 +123,7 @@ impl EventBody {
             EventBody::AliasCommit { .. } => "alias_commit",
             EventBody::AliasLink { .. } => "alias_link",
             EventBody::AliasUnlink { .. } => "alias_unlink",
+            EventBody::PolicyRoot { .. } => "policy_root",
         }
     }
 }
@@ -197,6 +207,16 @@ pub struct AliasCommitment {
     pub commitment: String,
 }
 
+/// The latest policy root an identity committed to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyHead {
+    /// KEL sequence number of the `policy_root` event.
+    pub seq: u64,
+    pub ts: i64,
+    pub root: String,
+    pub revocations_through: u64,
+}
+
 /// The current state of an identity, derived by replaying its KEL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyState {
@@ -209,6 +229,8 @@ pub struct KeyState {
     pub revoked: BTreeSet<String>,
     pub aliases: BTreeSet<String>,
     pub alias_commitments: Vec<AliasCommitment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyHead>,
     pub created: i64,
     pub updated: i64,
 }
@@ -216,6 +238,12 @@ pub struct KeyState {
 impl KeyState {
     pub fn device(&self, id: &str) -> Option<&Device> {
         self.devices.get(id)
+    }
+
+    /// True if `signed` may sign this identity's revocations: the manage policy, or
+    /// any one active device with the `revoke` capability.
+    pub fn may_revoke(&self, signed: &BTreeSet<String>) -> bool {
+        self.manage.is_satisfied_by(signed) || self.devices.values().any(|d| d.has_cap("revoke") && signed.contains(&d.key))
     }
 
     /// Every signer that may authenticate as this identity (device keys and the
@@ -315,6 +343,7 @@ pub fn verify_log(events: &[Event], opts: &VerifyOptions) -> Result<KeyState> {
         revoked: BTreeSet::new(),
         aliases: BTreeSet::new(),
         alias_commitments: vec![],
+        policy: None,
         created: first.ts,
         updated: first.ts,
     };
@@ -392,6 +421,18 @@ pub fn verify_log(events: &[Event], opts: &VerifyOptions) -> Result<KeyState> {
                     return Err(Error::Kel("alias_unlink requires the manage policy".into()));
                 }
                 st.aliases.remove(alias);
+            }
+            EventBody::PolicyRoot { root, revocations_through } => {
+                if !by_manage {
+                    return Err(Error::Kel("policy_root requires the manage policy".into()));
+                }
+                if !root.starts_with('b') || root.len() < 10 {
+                    return Err(Error::Kel(format!("policy root {root:?} is not a CID")));
+                }
+                if st.policy.as_ref().is_some_and(|p| *revocations_through < p.revocations_through) {
+                    return Err(Error::Kel("revocations_through went backwards".into()));
+                }
+                st.policy = Some(PolicyHead { seq: ev.seq, ts: ev.ts, root: root.clone(), revocations_through: *revocations_through });
             }
         }
         st.seq = ev.seq;
@@ -559,6 +600,25 @@ pub(crate) mod tests {
         let log_b = [f.log.clone(), vec![b]].concat();
         assert!(extends(&f.log, &log_a).unwrap());
         assert!(!extends(&log_a, &log_b).unwrap());
+    }
+
+    #[test]
+    fn policy_root_needs_manage_and_is_monotone() {
+        let mut f = fixture();
+        let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
+        let root = "baguqeerasords4njcts6vs7qvdjfcvgnume4hqohf65zsfguprqphs3icwea".to_string();
+        let mut by_device = next_event(&st, EventBody::PolicyRoot { root: root.clone(), revocations_through: 3 });
+        by_device.sign(&f.device).unwrap();
+        assert!(verify_log(&[f.log.clone(), vec![by_device]].concat(), &VerifyOptions::default()).is_err());
+        let mut ev = next_event(&st, EventBody::PolicyRoot { root: root.clone(), revocations_through: 3 });
+        ev.sign(&f.root).unwrap();
+        f.log.push(ev);
+        let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
+        assert_eq!(st.policy.as_ref().unwrap().root, root);
+        let mut back = next_event(&st, EventBody::PolicyRoot { root, revocations_through: 2 });
+        back.sign(&f.root).unwrap();
+        f.log.push(back);
+        assert!(verify_log(&f.log, &VerifyOptions::default()).is_err());
     }
 
     #[test]

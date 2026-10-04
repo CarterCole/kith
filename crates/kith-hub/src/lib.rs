@@ -21,12 +21,14 @@
 //! | `POST /v1/totp/enroll`, `/v1/totp/confirm`| TOTP factor (bearer)                            |
 //! | `POST /v1/cosigner`, `/v1/cosign`         | TOTP-gated co-signer                            |
 //! | `POST /v1/enroll`, `GET /enroll/{id}`     | enroll a browser passkey as a device            |
+//! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
 
 // ApiError carries an HTTP status plus a JSON body; boxing it buys nothing here.
 #![allow(clippy::result_large_err)]
 
 pub mod enroll;
 pub mod oidc;
+pub mod org;
 mod pages;
 
 use std::collections::{BTreeSet, HashMap};
@@ -64,6 +66,12 @@ pub struct HubConfig {
     pub origins: Vec<String>,
     /// Registered OIDC clients.
     pub clients: Vec<oidc::Client>,
+    /// Take groups and roles from this org's policy DAG (with its revocations
+    /// applied) instead of `bundle_path`.
+    pub policy_org: Option<String>,
+    /// Where heartbeats get their beacon value, and how often they are signed.
+    pub beacon: org::BeaconSource,
+    pub heartbeat_secs: u64,
 }
 
 impl HubConfig {
@@ -72,7 +80,17 @@ impl HubConfig {
         let issuer: String = issuer.into();
         let issuer = issuer.trim_end_matches('/').to_string();
         let rp_id = host_of(&issuer).unwrap_or_else(|| "localhost".into());
-        HubConfig { origins: vec![issuer.clone()], issuer, data_dir: data_dir.into(), bundle_path: None, rp_id, clients: vec![] }
+        HubConfig {
+            origins: vec![issuer.clone()],
+            issuer,
+            data_dir: data_dir.into(),
+            bundle_path: None,
+            rp_id,
+            clients: vec![],
+            policy_org: None,
+            beacon: org::BeaconSource::None,
+            heartbeat_secs: 15,
+        }
     }
 }
 
@@ -120,6 +138,7 @@ pub struct Hub {
     cosigners: Mutex<HashMap<String, LocalSigner>>,
     pub(crate) oidc: Mutex<oidc::OidcState>,
     pub(crate) enrollments: Mutex<HashMap<String, enroll::Enrollment>>,
+    pub orgs: org::Orgs,
 }
 
 #[derive(Debug)]
@@ -257,6 +276,7 @@ impl Hub {
         for c in &cfg.clients {
             c.validate()?;
         }
+        let cfg_dir = cfg.data_dir.clone();
         let hub = Hub {
             cfg,
             signer,
@@ -270,6 +290,7 @@ impl Hub {
             cosigners: Mutex::new(cosigners),
             oidc: Mutex::new(oidc::OidcState::default()),
             enrollments: Mutex::new(HashMap::new()),
+            orgs: org::Orgs::open(&cfg_dir)?,
         };
         hub.engine()?;
         Ok(Arc::new(hub))
@@ -323,6 +344,10 @@ impl Hub {
 
     pub fn get_kel(&self, did: &str) -> Option<Vec<Event>> {
         self.kels.read().unwrap().get(did).cloned()
+    }
+
+    pub fn kel_dids(&self) -> Vec<String> {
+        self.kels.read().unwrap().keys().cloned().collect()
     }
 
     fn check_jti(&self, jti: &str, exp: i64) -> ApiResult<()> {
@@ -463,12 +488,17 @@ impl Hub {
 
     /// Access token claims for an authenticated principal.
     pub fn access_claims(&self, a: &Authn, audience: &str, delegation: Option<(String, Vec<Capability>)>) -> ApiResult<AccessClaims> {
-        let engine = self.engine()?;
         let mut kel_attrs = Map::new();
         kel_attrs.insert("aliases".into(), json!(a.st.aliases));
-        let mut attrs = engine.attributes(&a.st.did, &kel_attrs);
-        attrs.insert("aal".into(), json!(a.aal));
-        let m = engine.memberships(&a.st.did, &attrs)?;
+        kel_attrs.insert("aal".into(), json!(a.aal));
+        let (m, attrs) = match self.org_memberships(&a.st.did, &kel_attrs)? {
+            Some(found) => found,
+            None => {
+                let engine = self.engine()?;
+                let attrs = engine.attributes(&a.st.did, &kel_attrs);
+                (engine.memberships(&a.st.did, &attrs)?, attrs)
+            }
+        };
         let iat = now();
         let (act, cap) = match delegation {
             Some((actor, caps)) => (Some(Actor { sub: actor, act: None }), Some(caps)),
@@ -741,12 +771,23 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/enroll/{id}/event", post(enroll::submit_event))
         .route("/v1/enroll/{id}/sig", post(enroll::submit_sig))
         .route("/enroll/{id}", get(enroll::page))
+        .route("/v1/hub", get(org::info))
+        .route("/v1/hub/revoker", post(org::sign_revoker))
+        .route("/v1/blocks", axum::routing::put(org::put_blocks))
+        .route("/v1/blocks/{cid}", get(org::get_block))
+        .route("/ipfs/{cid}", get(org::get_block))
+        .route("/v1/policy/{org}", get(org::policy))
+        .route("/v1/policy/{org}/slice", post(org::slice))
+        .route("/v1/revocations/{org}", get(org::get_revocations).post(org::post_revocation))
+        .route("/v1/revocations/{org}/heartbeat", get(org::get_heartbeat))
+        .route("/v1/revocations/{org}/events", get(org::events))
         .with_state(hub)
 }
 
 pub async fn serve(cfg: HubConfig, addr: &str) -> anyhow::Result<()> {
     let hub = Hub::open(cfg)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    tokio::spawn(org::heartbeat_loop(hub.clone()));
     eprintln!("kith hub listening on http://{addr} (issuer {}, rp id {}, {} OIDC clients)", hub.cfg.issuer, hub.cfg.rp_id, hub.cfg.clients.len());
     axum::serve(listener, router(hub)).await?;
     Ok(())

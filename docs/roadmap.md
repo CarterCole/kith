@@ -21,6 +21,19 @@
   WebCrypto authenticator in tests.
 - **Vault.** Skip-ratchet group keyrings with join-later, skip-ahead, and re-key, sealed
   to devices' X25519 keys from the KEL.
+- **Policy DAG, revocations, freshness** ([spec §8](../spec/08-policy-dag.md)).
+  - Bundles become DAG-JSON blocks. The CIDs match `@ipld/dag-json` + `multiformats`.
+  - A slice (one action, or one principal) decides exactly like the full bundle for
+    every conformance vector. Withholding any block fails the load.
+  - Org `policy_root` events and revoke-only devices.
+  - Hash-chained revocation entries with gap, fork and forgery detection.
+  - Heartbeats with drand quicknet (BLS12-381) and NIST 2.0 (RSA) beacons. Tested with
+    real rounds and pulses, in Rust and JS.
+  - Fresh, degraded and stale levels, `context.kith.sync_age` for per-action
+    budgets, and a monotonic clock.
+  - Hub tokens are issued from the DAG with revocations applied.
+  - OpenTimestamps: parse and write `.ots` byte-exactly, Bitcoin header verification,
+    calendar stamp and upgrade.
 - **OpenID Connect provider** ([spec §7](../spec/07-oidc.md)).
   - Code + PKCE, a username-less passkey login page, wallet sign-in, TOTP step-up.
   - SSO cookie, `prompt`, `max_age`, `acr_values`.
@@ -56,11 +69,27 @@
 - **Other.**
   - DPoP binding of access tokens to session keys.
   - Multi-hop delegation (UCAN 1.0 or Biscuit).
-  - Session and access token revocation before expiry (short TTLs are the only
-    mechanism today).
+  - Session and access token revocation before expiry exists as `token {jti}`
+    revocations (§8). The GraphQL middleware doesn't consult a revocation follower yet.
   - Cedar schemas, for validation and policy analysis.
   - Partial-evaluation pushdown of row-level filters into SQL.
   - The vault uses an HPKE-shaped construction; move to RFC 9180 HPKE.
+
+- **Policy DAG follow-ups.**
+  - Python slice reader.
+  - JS revokers other than Ed25519: P-256, and WebAuthn passkeys as revoke devices.
+  - An `ipfs dag import` CAR export instead of a directory of blocks.
+  - Encrypting the `members` and `directory` maps with the vault, for public DAGs.
+  - Witnesses for heartbeats. Several hubs co-signing would stop one relay from
+    silently withholding them.
+  - Wiring `HubFeed` into `kithGraphQL`.
+  - `kith anchor stamp` follows the reference client, but has not been run against
+    the public calendars yet (a live stamp publishes a hash to them).
+- **NIST beacon signatures.** Since 2026-09-03 (chain 2, pulse 1925734), NIST's pulses
+  are signed with a 4096-bit key. The certificate NIST publishes for their
+  `certificateId` holds a 2048-bit key, so they fail verification, and Kith rejects
+  them (tested). Older NIST pulses and Brazil's current pulses verify, and drand is the
+  default. Worth reporting to NIST (beacon@nist.gov).
 
 ## Open questions (need a decision)
 
@@ -89,4 +118,4 @@
 | 4 | Digital Credentials API attribute source, then Self/ZKPassport proofs | Government-ID-backed attributes ([passports](passports.md)) |
 | 5 | Cedar partial evaluation to SQL/Prisma filters; DataLoader-friendly row checks | "Lock down the query" at scale |
 | 6 | rs-wnfs integration, with `did:kith` as the WNFS agent | Encrypted shared data for groups |
-| 7 | Witnesses and optional chain anchoring | Third-party duplicity detection and public timestamps |
+| 7 | Witnesses and optional chain anchoring. OpenTimestamps anchoring of policy roots and revocations is done (§8.10); KEL witnesses and heartbeat co-signing remain | Third-party duplicity detection and public timestamps |

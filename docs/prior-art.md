@@ -55,6 +55,18 @@ of September 2026.
 | [Skip ratchet](https://github.com/fission-codes/skip-ratchet-paper) / [WNFS](https://github.com/wnfs-wg/rs-wnfs) | **Adopted** for crypto-enforced group access ([spec §6](../spec/06-vault.md)). |
 | MLS (RFC 9420) | Group key agreement with post-compromise security for *messaging*. It is the better choice when members are online and interactive. The skip ratchet is better for storage shared with changing, offline groups. |
 
+## Distribution, revocation and time
+
+| Project | Takeaway |
+|---------|----------|
+| IPFS / IPLD (DAG-JSON, CIDv1, trustless gateways) | **Adopted** as the block format ([spec §8](../spec/08-policy-dag.md)). Any gateway or pinning service can serve policy blocks. |
+| ATProto repositories (Merkle search tree, signed commits, did:plc) | The closest prior art: a signed root over a Merkle map, rooted in a self-certifying DID. Kith's map is a HAMT, and adds indexes built for policy slicing. |
+| CRLs, OCSP stapling, CRLite | Grants propagate slowly, revocations are pushed. Kith's heartbeats play the part of stapled OCSP responses: any client can carry them. |
+| [drand](https://drand.love) (League of Entropy) | **Adopted.** It is the default heartbeat beacon: threshold BLS, 3 s rounds, verifiable offline. |
+| [NIST Interoperable Randomness Beacons](https://csrc.nist.gov/projects/interoperable-randomness-beacons) | **Supported** (the 2.0 format: NIST, Brazil). Pulses come every 60 s, RSA-signed. |
+| [OpenTimestamps](https://opentimestamps.org) | **Adopted** for anchoring policy roots and revocations to Bitcoin (§8.10). |
+| KERI witnesses | Planned for heartbeats. Several relays co-signing heads would make withholding detectable. |
+
 ## The Wave analogy
 
 Google Wave was a protocol (federation over XMPP), a spec (operational transform), and

@@ -19,7 +19,8 @@ export interface Bundle {
   groups?: Record<string, SetDef>;
   roles?: Record<string, SetDef>;
   directory?: Record<string, { attrs?: Record<string, unknown> }>;
-  policies?: string;
+  /** Cedar source, or policies by id (as a policy DAG slice provides them). */
+  policies?: string | Record<string, string>;
 }
 
 export interface Capability {
@@ -131,8 +132,12 @@ export class Engine {
     };
   }
 
-  /** Compute explicit + nested + dynamic group and role membership. */
-  memberships(id: string, attrs: Record<string, unknown>): { groups: string[]; roles: string[] } {
+  /**
+   * Compute explicit + nested + dynamic group and role membership. Sets in
+   * `excluded` (`Group::x`, `Role::x`, from revocations) never join, so neither do
+   * sets that depended on them.
+   */
+  memberships(id: string, attrs: Record<string, unknown>, excluded: Set<string> = new Set()): { groups: string[]; roles: string[] } {
     const groups = new Set<string>();
     const roles = new Set<string>();
     const defs = [["Group", this.bundle.groups ?? {}, groups], ["Role", this.bundle.roles ?? {}, roles]] as const;
@@ -142,7 +147,7 @@ export class Engine {
       const entities = [...this.setEntities(), this.principalEntity(id, attrs, groups, roles)];
       for (const [kind, sets, current] of defs) {
         for (const [name, def] of Object.entries(sets)) {
-          if (current.has(name)) continue;
+          if (current.has(name) || excluded.has(`${kind}::${name}`)) continue;
           const explicit = (def.members ?? []).some(
             (m) => m === id || (m.startsWith("group:") && groups.has(m.slice(6))) || (m.startsWith("role:") && roles.has(m.slice(5))),
           );

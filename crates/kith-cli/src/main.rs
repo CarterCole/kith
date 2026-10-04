@@ -5,6 +5,8 @@
 //! in a wallet, recovery keys offline, and device keys in the OS keychain / Secure
 //! Enclave / TPM.
 
+mod org;
+
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -113,6 +115,32 @@ enum Cmd {
     Inspect { token: String },
     #[command(subcommand)]
     Hub(HubCmd),
+    /// Policy DAGs: publish a bundle, fetch provable slices, list grants.
+    #[command(subcommand)]
+    Policy(org::PolicyCmd),
+    /// Push a signed revocation for this org.
+    #[command(subcommand)]
+    Revoke(org::RevokeCmd),
+    /// OpenTimestamps: prove a policy root or revocation existed by a Bitcoin block.
+    #[command(subcommand)]
+    Anchor(org::AnchorCmd),
+    /// Follow an org's revocations and report how fresh this view is.
+    Revocations {
+        #[arg(long)]
+        org: Option<String>,
+        /// Seconds a view counts as fresh.
+        #[arg(long, default_value_t = 120)]
+        fresh_for: i64,
+        /// Seconds between syncs you can tolerate before everything is denied.
+        #[arg(long, default_value_t = 900)]
+        max_staleness: i64,
+        /// Accept heartbeats without a beacon (trusting the signer's clock).
+        #[arg(long)]
+        no_beacon: bool,
+        /// Keep watching, re-checking every N seconds.
+        #[arg(long)]
+        watch: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -212,6 +240,15 @@ enum HubCmd {
         /// JSON file with an array of OpenID Connect clients.
         #[arg(long)]
         clients: Option<PathBuf>,
+        /// Take groups and roles from this org's policy DAG instead of --bundle.
+        #[arg(long)]
+        policy_org: Option<String>,
+        /// Beacon for heartbeats: drand, nist or none.
+        #[arg(long, default_value = "drand")]
+        beacon: String,
+        /// Seconds between heartbeats.
+        #[arg(long, default_value_t = 15)]
+        heartbeat: u64,
     },
 }
 
@@ -430,13 +467,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let dir = cli.home.clone().unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".kith"));
 
-    if let Cmd::Hub(HubCmd::Serve { addr, issuer, data, bundle, rp_id, origins, clients }) = cli.cmd {
+    if let Cmd::Hub(HubCmd::Serve { addr, issuer, data, bundle, rp_id, origins, clients, policy_org, beacon, heartbeat }) = cli.cmd {
         // Browsers only allow passkeys on "localhost", not "127.0.0.1", so default to it.
         let port = addr.rsplit(':').next().unwrap_or("7777");
         let local = ["127.0.0.1", "0.0.0.0", "localhost", "[::1]"].iter().any(|h| addr.starts_with(h));
         let issuer = issuer.unwrap_or_else(|| if local { format!("http://localhost:{port}") } else { format!("http://{addr}") });
         let mut cfg = kith_hub::HubConfig::new(issuer, data);
         cfg.bundle_path = bundle;
+        cfg.policy_org = policy_org;
+        cfg.beacon = kith_hub::org::BeaconSource::parse(&beacon)?;
+        cfg.heartbeat_secs = heartbeat;
         if let Some(rp) = rp_id {
             cfg.rp_id = rp;
         }
@@ -758,6 +798,12 @@ fn main() -> Result<()> {
             print(&json!({"header": header, "claims": t.claims}));
         }
         Cmd::Hub(_) => unreachable!(),
+        Cmd::Policy(cmd) => org::policy(&mut home, cmd)?,
+        Cmd::Revoke(cmd) => org::revoke(&mut home, cmd)?,
+        Cmd::Anchor(cmd) => org::anchor(&home, cmd)?,
+        Cmd::Revocations { org, fresh_for, max_staleness, no_beacon, watch } => {
+            org::status(&home, org, kith_core::revoke::FreshnessPolicy { fresh_for, max_staleness, require_beacon: !no_beacon }, watch)?
+        }
     }
     Ok(())
 }
