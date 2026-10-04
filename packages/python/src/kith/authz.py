@@ -7,6 +7,7 @@ run the shared vectors in ``spec/test-vectors/authz.json``.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -57,6 +58,40 @@ def cedar_value(v: Any) -> Any:
     if isinstance(v, Mapping):
         return {str(k): c for k, x in v.items() if (c := cedar_value(x)) is not None}
     return str(v)
+
+
+def number_text(v: float | int) -> str:
+    """The pinned text of a stringified number (spec §4.2): ECMAScript ``Number::toString``
+    of the double nearest ``v``, the form RFC 8785 §3.2.2.3 uses. It is the shortest
+    digits that read back as that double, written plainly when the decimal exponent is in
+    −7 < e < 21 and as ``d.ddde+N`` or ``d.ddde-N`` otherwise."""
+    try:
+        f = float(v)
+    except OverflowError:  # an int beyond the double range rounds to an infinity
+        f = math.inf if v > 0 else -math.inf
+    if f != f:
+        return "NaN"
+    if f == 0:
+        return "0"
+    sign = "-" if f < 0 else ""
+    if math.isinf(f):
+        return sign + "Infinity"
+    # repr() gives the shortest digits, as ``ddd.ddd`` or ``d.ddde[+-]NN``.
+    mantissa, _, exp = repr(abs(f)).partition("e")
+    whole, _, frac = mantissa.partition(".")
+    digits = (whole + frac).lstrip("0")
+    # The decimal point sits after digit ``n`` of the ``k`` digits.
+    n = len(whole) + int(exp or 0) - (len(whole + frac) - len(digits))
+    digits = digits.rstrip("0")
+    k = len(digits)
+    if k <= n <= 21:
+        return sign + digits + "0" * (n - k)
+    if 0 < n <= 21:
+        return f"{sign}{digits[:n]}.{digits[n:]}"
+    if -6 < n <= 0:
+        return f"{sign}0.{'0' * -n}{digits}"
+    point = "." if k > 1 else ""
+    return f"{sign}{digits[0]}{point}{digits[1:]}e{'+' if n > 0 else '-'}{abs(n - 1)}"
 
 
 def _glob(pattern: str, value: str) -> bool:
