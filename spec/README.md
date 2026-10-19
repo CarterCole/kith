@@ -52,6 +52,42 @@ the only way to read the spec.
 | 8 | [Policy DAG, revocations, freshness](08-policy-dag.md) | bundles as content-addressed blocks, provable slices, org policy roots, signed revocation chains, beacon heartbeats (drand, NIST 2.0), degraded mode, OpenTimestamps anchoring |
 | — | [Test vectors](test-vectors/) | conformance vectors every implementation must pass |
 
+## Interoperability
+
+Kith reuses an existing standard wherever one fits. Nothing here asks you to replace
+the keys, tools or services you already use. An identity is its key log, which anyone
+can mirror and verify (§1.8), so moving it elsewhere never needs anything a hub holds.
+
+1. **Bring the keys you have.** A signer is a public key plus a signature format. It is
+   not a Kith-specific wallet. Passkeys, Ethereum accounts, hardware tokens, OpenPGP
+   (GPG) keys and SSH keys can all be signers (§1.3). The identity does not care where
+   a key lives.
+2. **Standard formats on the wire.**
+
+   | Need | Standard |
+   |------|----------|
+   | Raw keys | `did:key` multikeys, CAIP-10 account ids |
+   | Identity documents | W3C DID Core, `Multikey` verification methods (§1.7) |
+   | Tokens | JOSE and JWT, RFC 9068 access tokens, RFC 8693 token exchange |
+   | Sign-in | OpenID Connect (§7), WebAuthn |
+   | Signatures | EIP-191, EIP-1271, ERC-6492, OpenSSH `SSHSIG`; draft: OpenPGP |
+   | Policy | Cedar |
+   | Storage | DAG-JSON and CIDv1, served by any IPFS trustless gateway (§8) |
+   | Time | drand, NIST beacon 2.0, OpenTimestamps `.ots` files (§8) |
+
+3. **Standard tools can check the standard parts.** An `SSHSIG` signer's signatures
+   come from `ssh-keygen` and check with `ssh-keygen -Y check-novalidate -n kith`; the
+   vectors record its verdict (§1.3.1). Anchors are ordinary `.ots` files (§8.10), and
+   policy blocks have the same CIDs that `@ipld/dag-json` computes, so an IPFS client
+   can fetch them from a hub's `/ipfs/{cid}` route (§8.11).
+4. **Kith-specific formats are few and listed.** They are the `did:kith` method and its
+   log format (§1), the `WebAuthn` JWS algorithm and the `kith-*+jwt` token types (§3),
+   and the policy DAG layout (§8). Each has conformance vectors, and none is the only
+   way to read the spec.
+5. **Say what a key is for.** Keys are annotated with the primitive and the purposes
+   they may be used for, using DID Core's vocabulary, so any resolver can read them
+   (§1.3.2, draft).
+
 ## Conventions
 
 - **Canonical JSON** is JSON with object keys sorted by UTF-16 code unit, no whitespace,

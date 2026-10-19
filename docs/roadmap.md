@@ -6,6 +6,8 @@
   pre-rotation, device add and revoke with proof of possession, public and private
   aliases, fork (duplicity) rejection, DID documents.
 - **Signers.** Ed25519, P-256, secp256k1, passkeys (WebAuthn), Ethereum EOAs (EIP-191).
+  SSH keys (`SSHSIG`, Ed25519 and P-256) in the Rust core, checked against vectors that
+  real `ssh-keygen` signed (`scripts/sshsig-vectors.mjs`).
 - **Login.** Session-chain login, SIWE-style challenge login (device key or passkey),
   TOTP enrollment and step-up, AAL/AMR computation.
 - **Recovery.** The TOTP-gated hub co-signer as a rotation signer. The demo recovers an
@@ -59,7 +61,18 @@
 - **Signers still to do:**
   - EIP-1271 needs a `ChainVerifier` implementation (JSON-RPC, pinned block, ERC-6492);
   - BIP-322;
-  - SSH signatures.
+  - SSH signatures, the rest: `kith` signing through `ssh-keygen` or `ssh-agent`
+    (today you run `ssh-keygen -Y sign -n kith` yourself), JS and Python verifiers,
+    and FIDO `sk-` keys.
+  - OpenPGP signatures. Specified as a draft ([spec §1.3.1](../spec/01-identity.md)),
+    not implemented. It needs a minimal signature-packet parser, which is a larger
+    attack surface than `SSHSIG`, and vectors made with real `gpg`.
+  - RSA signatures, after the above. Many existing SSH and GPG keys are RSA, so
+    "bring the keys you have" is only partly true without it. It is a new key type
+    through the KEL, the `did:key` encoding and all three languages; the hub's OIDC
+    RSA code is a start.
+  - Key purposes (`use`, `alg`) on device keys, and `keyAgreement` in the DID document.
+    Specified as a draft ([spec §1.3.2](../spec/01-identity.md)), not implemented.
 - **OIDC gaps.** No consent screen, dynamic registration, PAR, back-channel logout, or
   rate limiting on `/oauth/login`. The wallet button on the login page has not been
   tested in a browser (the server path is tested). The Grafana config in §7.8 has not

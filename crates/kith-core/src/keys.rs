@@ -4,7 +4,7 @@
 //! named by a string identifier:
 //!
 //! * `did:key:z…` – a raw public key (Ed25519, P-256, secp256k1). P-256 keys may be
-//!   passkeys (alg `WebAuthn`).
+//!   passkeys (alg `WebAuthn`). Ed25519 and P-256 keys may be SSH keys (alg `SSHSIG`).
 //! * `eip155:<chain>:0x<address>` – an Ethereum account (CAIP-10). EOAs sign with
 //!   EIP-191; contract wallets (Safe, Coinbase Smart Wallet) verify through EIP-1271
 //!   via a [`ChainVerifier`].
@@ -74,7 +74,7 @@ impl PublicKey {
         Err(Error::Unsupported(format!("did:key multicodec in {did}")))
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         match self.kty {
             KeyType::Ed25519 => {
                 let arr: [u8; 32] = self.bytes.as_slice().try_into().map_err(|_| Error::Encoding("ed25519 key length".into()))?;
@@ -322,7 +322,7 @@ impl SignerRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sig {
     pub signer: String,
-    /// `Ed25519`, `ES256`, `ES256K`, `WebAuthn`, `EIP191`, `EIP1271`, `BIP322`.
+    /// `Ed25519`, `ES256`, `ES256K`, `WebAuthn`, `SSHSIG`, `EIP191`, `EIP1271`, `BIP322`.
     pub alg: String,
     /// base64url signature bytes.
     pub sig: String,
@@ -350,6 +350,7 @@ pub fn verify_sig(sig: &Sig, message: &[u8], opts: &VerifyOptions) -> Result<()>
             let data = sig.webauthn.as_ref().ok_or_else(|| Error::Signature("WebAuthn sig missing data".into()))?;
             webauthn::verify_assertion(&pk, data, &raw, &AssertionCheck::for_message(message)).map(|_| ())
         }
+        (SignerRef::Key(pk), "SSHSIG") => crate::sshsig::verify(&pk, message, &raw),
         (SignerRef::Key(pk), alg) if alg == key_sig_alg(pk.kty) => pk.verify(message, &raw),
         (SignerRef::Eip155 { chain_id, address }, "EIP191" | "EIP1271") => {
             let hash = eip191_hash(message);

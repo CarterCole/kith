@@ -6,9 +6,11 @@
 - **One root identity per person.** It is a self-certifying `did:kith` backed by a
   signed key event log.
 - **Controlled by a policy over many signers.** Passkeys, hardware keys, Ethereum
-  wallets (including contract wallets through EIP-1271), Bitcoin (planned), and
-  software keys. Different levels need different quorums, for example "2 of my 3
-  passkeys to add a device, and my cold recovery keys to rotate".
+  wallets (including contract wallets through EIP-1271), Bitcoin (planned), SSH keys,
+  GPG keys (specified, not yet implemented), and software keys. Interoperability is a
+  goal: keys you already have, standard formats on the wire
+  ([spec](spec/README.md#interoperability)). Different levels need different quorums,
+  for example "2 of my 3 passkeys to add a device, and my cold recovery keys to rotate".
 - **Keys cascade.** identity → devices → session keys → optional delegation to someone
   else.
 - **Log in with anything.** A device session chain, a signed challenge (SIWE-style), a

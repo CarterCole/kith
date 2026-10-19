@@ -1,0 +1,124 @@
+{
+  "description": "SSHSIG vectors (spec §1.3.1), signed by ssh-keygen -Y sign with throwaway keys. For each case, verify {signer, alg: \"SSHSIG\", sig} over the UTF-8 bytes of message; the result must equal valid. sig is base64url of the blob inside armored, which is what ssh-keygen wrote. public_key is the OpenSSH public key that signed. ssh_keygen is what `ssh-keygen -Y check-novalidate -n kith` said; it checks structure and the signature, not who the signer is. Regenerate with scripts/sshsig-vectors.mjs.",
+  "generated_with": "OpenSSH_10.3p1, LibreSSL 3.3.6",
+  "cases": [
+    {
+      "name": "ed25519-sha512",
+      "why": "ssh-keygen's default hash",
+      "signer": "did:key:z6MkoEhM29rLN1adwgUJxidPeqg8pzDhQr9as1K55uhWoBXZ",
+      "message": "kith identity event v1\ndid: new\nseq: 0\nkind: inception\ndigest: 1FyrqQRe0XZyJcsbEDo9Dvj8JTIdhwrX1Cv-9iW3ccA",
+      "sig": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22-C7XC_mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAECx0xFyvb8_XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLExhJTX-tq3_ppKgZ2ypeqAYO",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22+C7X\nC/mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx\nOQAAAECx0xFyvb8/XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLEx\nhJTX+tq3/ppKgZ2ypeqAYO\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIKBPTvTgn41xLr2opBHXNtvgu1wv5r1cJjyCt7YiqBU kith-vector-ed25519",
+      "valid": true,
+      "ssh_keygen": true
+    },
+    {
+      "name": "ed25519-sha256",
+      "signer": "did:key:z6MkoEhM29rLN1adwgUJxidPeqg8pzDhQr9as1K55uhWoBXZ",
+      "message": "kith identity event v1\ndid: new\nseq: 0\nkind: inception\ndigest: 1FyrqQRe0XZyJcsbEDo9Dvj8JTIdhwrX1Cv-9iW3ccA",
+      "sig": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22-C7XC_mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhMjU2AAAAUwAAAAtzc2gtZWQyNTUxOQAAAEB7t3lbYDEryY4pUObnntoH-uYTGC-imCGZ1KAt3W1fWrCRWzDTnF3P1qwHqdzPGJmcPes3zB37r5IVKhB47F0D",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22+C7X\nC/mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhMjU2AAAAUwAAAAtzc2gtZWQyNTUx\nOQAAAEB7t3lbYDEryY4pUObnntoH+uYTGC+imCGZ1KAt3W1fWrCRWzDTnF3P1qwHqdzPGJ\nmcPes3zB37r5IVKhB47F0D\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIKBPTvTgn41xLr2opBHXNtvgu1wv5r1cJjyCt7YiqBU kith-vector-ed25519",
+      "valid": true,
+      "ssh_keygen": true
+    },
+    {
+      "name": "ed25519-revocation",
+      "why": "any Kith message, not just key events",
+      "signer": "did:key:z6MkoEhM29rLN1adwgUJxidPeqg8pzDhQr9as1K55uhWoBXZ",
+      "message": "kith revocation v1\norg: did:kith:example-org\nseq: 9\ndigest: YITZpcO_jnvY9wWWXNNaZsc4P7R_sr311ujMcn3W-rQ",
+      "sig": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22-C7XC_mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAEAAbB6kqFZV0225kFhZ2MsnRhZwS9hrMLfto3_aGST5IT1baeqE1gi5SSnX99tFBvmNLfCqcAChwImpMjCzyEoO",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22+C7X\nC/mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx\nOQAAAEAAbB6kqFZV0225kFhZ2MsnRhZwS9hrMLfto3/aGST5IT1baeqE1gi5SSnX99tFBv\nmNLfCqcAChwImpMjCzyEoO\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIKBPTvTgn41xLr2opBHXNtvgu1wv5r1cJjyCt7YiqBU kith-vector-ed25519",
+      "valid": true,
+      "ssh_keygen": true
+    },
+    {
+      "name": "p256-sha512",
+      "signer": "did:key:zDnaeh7mzYz4JaK1sTzV7WWRjvViA1ay1nVf4anowTw424ZSG",
+      "message": "kith identity event v1\ndid: new\nseq: 0\nkind: inception\ndigest: 1FyrqQRe0XZyJcsbEDo9Dvj8JTIdhwrX1Cv-9iW3ccA",
+      "sig": "U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEE9-25tC980_kn_0QA6ct8BTvrO1euloX1tGkR4QjwlyHqwIPVm9i3jze1X53jYPzwgoMHNOctsllvfudVuLiRtgAAAARraXRoAAAAAAAAAAZzaGE1MTIAAABlAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAABKAAAAIQC3plHOd5CXmb9sHBE67qJEG0cKM8RYZBh0ePRQp08esAAAACEAwuSszWj8V88Lfji6MiLj6HwqoWCqvX_lpNBtobvRwjU",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAE\nEE9+25tC980/kn/0QA6ct8BTvrO1euloX1tGkR4QjwlyHqwIPVm9i3jze1X53jYPzwgoMH\nNOctsllvfudVuLiRtgAAAARraXRoAAAAAAAAAAZzaGE1MTIAAABlAAAAE2VjZHNhLXNoYT\nItbmlzdHAyNTYAAABKAAAAIQC3plHOd5CXmb9sHBE67qJEG0cKM8RYZBh0ePRQp08esAAA\nACEAwuSszWj8V88Lfji6MiLj6HwqoWCqvX/lpNBtobvRwjU=\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPftubQvfNP5J/9EAOnLfAU76ztXrpaF9bRpEeEI8Jch6sCD1ZvYt483tV+d42D88IKDBzTnLbJZb37nVbi4kbY= kith-vector-p256",
+      "valid": true,
+      "ssh_keygen": true
+    },
+    {
+      "name": "p256-sha256",
+      "signer": "did:key:zDnaeh7mzYz4JaK1sTzV7WWRjvViA1ay1nVf4anowTw424ZSG",
+      "message": "kith revocation v1\norg: did:kith:example-org\nseq: 9\ndigest: YITZpcO_jnvY9wWWXNNaZsc4P7R_sr311ujMcn3W-rQ",
+      "sig": "U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEE9-25tC980_kn_0QA6ct8BTvrO1euloX1tGkR4QjwlyHqwIPVm9i3jze1X53jYPzwgoMHNOctsllvfudVuLiRtgAAAARraXRoAAAAAAAAAAZzaGEyNTYAAABkAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAABJAAAAIHw18On02C0bDPirbMrcSC6QDgacVy-A5xpldsgbmM5JAAAAIQCS2tacLb9VzE2hB7Ygm9tOcwEHXZ5ZYx18R7kLcuXlBA",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAE\nEE9+25tC980/kn/0QA6ct8BTvrO1euloX1tGkR4QjwlyHqwIPVm9i3jze1X53jYPzwgoMH\nNOctsllvfudVuLiRtgAAAARraXRoAAAAAAAAAAZzaGEyNTYAAABkAAAAE2VjZHNhLXNoYT\nItbmlzdHAyNTYAAABJAAAAIHw18On02C0bDPirbMrcSC6QDgacVy+A5xpldsgbmM5JAAAA\nIQCS2tacLb9VzE2hB7Ygm9tOcwEHXZ5ZYx18R7kLcuXlBA==\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPftubQvfNP5J/9EAOnLfAU76ztXrpaF9bRpEeEI8Jch6sCD1ZvYt483tV+d42D88IKDBzTnLbJZb37nVbi4kbY= kith-vector-p256",
+      "valid": true,
+      "ssh_keygen": true
+    },
+    {
+      "name": "wrong-namespace",
+      "why": "signed with -n git; the namespace must be kith",
+      "signer": "did:key:z6MkoEhM29rLN1adwgUJxidPeqg8pzDhQr9as1K55uhWoBXZ",
+      "message": "kith identity event v1\ndid: new\nseq: 0\nkind: inception\ndigest: 1FyrqQRe0XZyJcsbEDo9Dvj8JTIdhwrX1Cv-9iW3ccA",
+      "sig": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22-C7XC_mvVwmPIK3tiKoFQAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5AAAAQL8QElFdJjAjPPpQ4wRbtE7sZvhPTIAJEZMAd0Ou5jgPxyLn1MlWJL90-hSc7s6yV5iOHyE8k7F3-ztB14kizgg",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22+C7X\nC/mvVwmPIK3tiKoFQAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\nAAAAQL8QElFdJjAjPPpQ4wRbtE7sZvhPTIAJEZMAd0Ou5jgPxyLn1MlWJL90+hSc7s6yV5\niOHyE8k7F3+ztB14kizgg=\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIKBPTvTgn41xLr2opBHXNtvgu1wv5r1cJjyCt7YiqBU kith-vector-ed25519",
+      "valid": false,
+      "ssh_keygen": false
+    },
+    {
+      "name": "wrong-message",
+      "why": "a valid signature over a different message",
+      "signer": "did:key:z6MkoEhM29rLN1adwgUJxidPeqg8pzDhQr9as1K55uhWoBXZ",
+      "message": "kith revocation v1\norg: did:kith:example-org\nseq: 9\ndigest: YITZpcO_jnvY9wWWXNNaZsc4P7R_sr311ujMcn3W-rQ",
+      "sig": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22-C7XC_mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAECx0xFyvb8_XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLExhJTX-tq3_ppKgZ2ypeqAYO",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22+C7X\nC/mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx\nOQAAAECx0xFyvb8/XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLEx\nhJTX+tq3/ppKgZ2ypeqAYO\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIKBPTvTgn41xLr2opBHXNtvgu1wv5r1cJjyCt7YiqBU kith-vector-ed25519",
+      "valid": false,
+      "ssh_keygen": false
+    },
+    {
+      "name": "wrong-signer",
+      "why": "valid signature, but the signer id names another key",
+      "signer": "did:key:z6Mkp3XEPRUr8d8WL22bTq5jqBytKpNp7gaAAxFuo31Fg16e",
+      "message": "kith identity event v1\ndid: new\nseq: 0\nkind: inception\ndigest: 1FyrqQRe0XZyJcsbEDo9Dvj8JTIdhwrX1Cv-9iW3ccA",
+      "sig": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22-C7XC_mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAECx0xFyvb8_XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLExhJTX-tq3_ppKgZ2ypeqAYO",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22+C7X\nC/mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx\nOQAAAECx0xFyvb8/XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLEx\nhJTX+tq3/ppKgZ2ypeqAYO\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIKBPTvTgn41xLr2opBHXNtvgu1wv5r1cJjyCt7YiqBU kith-vector-ed25519",
+      "valid": false,
+      "ssh_keygen": true
+    },
+    {
+      "name": "tampered-signature",
+      "why": "one bit of the Ed25519 signature flipped",
+      "signer": "did:key:z6MkoEhM29rLN1adwgUJxidPeqg8pzDhQr9as1K55uhWoBXZ",
+      "message": "kith identity event v1\ndid: new\nseq: 0\nkind: inception\ndigest: 1FyrqQRe0XZyJcsbEDo9Dvj8JTIdhwrX1Cv-9iW3ccA",
+      "sig": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22-C7XC_mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAECx0xFyvb8_XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLExhJTX-tq3_opKgZ2ypeqAYO",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22+C7X\nC/mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx\nOQAAAECx0xFyvb8/XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLEx\nhJTX+tq3/opKgZ2ypeqAYO\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIKBPTvTgn41xLr2opBHXNtvgu1wv5r1cJjyCt7YiqBU kith-vector-ed25519",
+      "valid": false,
+      "ssh_keygen": false
+    },
+    {
+      "name": "trailing-data",
+      "why": "a zero byte after the blob",
+      "signer": "did:key:z6MkoEhM29rLN1adwgUJxidPeqg8pzDhQr9as1K55uhWoBXZ",
+      "message": "kith identity event v1\ndid: new\nseq: 0\nkind: inception\ndigest: 1FyrqQRe0XZyJcsbEDo9Dvj8JTIdhwrX1Cv-9iW3ccA",
+      "sig": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22-C7XC_mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUxOQAAAECx0xFyvb8_XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLExhJTX-tq3_ppKgZ2ypeqAYOAA",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAggoE9O9OCfjXEuvaikEdc22+C7X\nC/mvVwmPIK3tiKoFQAAAAEa2l0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx\nOQAAAECx0xFyvb8/XozdedBLyKYlGI7xcdyUA37MeHTDt9rL5dxs0S8qIbcQDgrLdiVLEx\nhJTX+tq3/ppKgZ2ypeqAYOAA==\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIKBPTvTgn41xLr2opBHXNtvgu1wv5r1cJjyCt7YiqBU kith-vector-ed25519",
+      "valid": false,
+      "ssh_keygen": false
+    },
+    {
+      "name": "p384-unsupported",
+      "why": "ecdsa-sha2-nistp384 is not a Kith SSHSIG key type",
+      "signer": "did:key:z82Lm25tScethmeEQkAGLVo55MpFoPhcZ5UgHttZf9VHMp4vPaFuaNhMZ1diEFpBTff5XnH",
+      "message": "kith identity event v1\ndid: new\nseq: 0\nkind: inception\ndigest: 1FyrqQRe0XZyJcsbEDo9Dvj8JTIdhwrX1Cv-9iW3ccA",
+      "sig": "U1NIU0lHAAAAAQAAAIgAAAATZWNkc2Etc2hhMi1uaXN0cDM4NAAAAAhuaXN0cDM4NAAAAGEEqFBPwx7F88vUc76dCwX-csyfoj-my8Wx2QDV-yANK1va53oixsVgsTmAaEzHPOW6taKFo1nxjZ3_2-y57c5EcteQr2QSPZHP_ej7zn_hh7cslrCFQezbUU2-e-jKWr_BAAAABGtpdGgAAAAAAAAABnNoYTUxMgAAAIMAAAATZWNkc2Etc2hhMi1uaXN0cDM4NAAAAGgAAAAwQSfmNLOyitfEyIk20pBCLfPyAJpLjroCGa9LEp0Ep7_oQbcc24oc_6rTWFwQ_hAjAAAAMHEnP-ULks6qbuhnibtvzhWN6If0cADV9M7cgDPvoHxzyX9kJZjSiwrwQsB5iGVHcg",
+      "armored": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAIgAAAATZWNkc2Etc2hhMi1uaXN0cDM4NAAAAAhuaXN0cDM4NAAAAG\nEEqFBPwx7F88vUc76dCwX+csyfoj+my8Wx2QDV+yANK1va53oixsVgsTmAaEzHPOW6taKF\no1nxjZ3/2+y57c5EcteQr2QSPZHP/ej7zn/hh7cslrCFQezbUU2+e+jKWr/BAAAABGtpdG\ngAAAAAAAAABnNoYTUxMgAAAIMAAAATZWNkc2Etc2hhMi1uaXN0cDM4NAAAAGgAAAAwQSfm\nNLOyitfEyIk20pBCLfPyAJpLjroCGa9LEp0Ep7/oQbcc24oc/6rTWFwQ/hAjAAAAMHEnP+\nULks6qbuhnibtvzhWN6If0cADV9M7cgDPvoHxzyX9kJZjSiwrwQsB5iGVHcg==\n-----END SSH SIGNATURE-----\n",
+      "public_key": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBKhQT8MexfPL1HO+nQsF/nLMn6I/psvFsdkA1fsgDStb2ud6IsbFYLE5gGhMxzzlurWihaNZ8Y2d/9vsue3ORHLXkK9kEj2Rz/3o+85/4Ye3LJawhUHs21FNvnvoylq/wQ== kith-vector-p384",
+      "valid": false,
+      "ssh_keygen": true
+    }
+  ]
+}

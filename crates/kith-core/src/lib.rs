@@ -3,6 +3,7 @@
 //! Layers (see `spec/`):
 //! * [`keys`]      – signer identifiers (did:key, CAIP-10 wallets) and signature verification
 //! * [`webauthn`]  – passkey (WebAuthn) assertion verification
+//! * [`sshsig`]    – OpenSSH `SSHSIG` signatures: SSH keys as signers
 //! * [`policy`]    – threshold signer policies ("2 of my 3 devices")
 //! * [`kel`]       – the key event log that defines a `did:kith` identity
 //! * [`alias`]     – private, provable aliases of a root identity
@@ -32,6 +33,7 @@ pub mod pdag;
 pub mod policy;
 pub mod revoke;
 pub mod session;
+pub mod sshsig;
 pub mod token;
 pub mod totp;
 pub mod util;

@@ -5,8 +5,8 @@
 - One **root identity per person** (or org, or agent) that outlives any single key,
   device, provider or chain.
 - Control is a **policy over many signers**, not one key. A signer can be a passkey, a
-  hardware key, a software key, an Ethereum account (EOA or contract wallet), or a
-  Bitcoin address. Multisig is the normal case.
+  hardware key, a software key, an OpenPGP or SSH key, an Ethereum account (EOA or
+  contract wallet), or a Bitcoin address. Multisig is the normal case.
 - Different **authority levels** get different policies. Rotating the identity should
   need more than adding a laptop, and adding a laptop should need more than signing in.
 - **Self-certifying**: anyone can verify an identity's full history from the data alone.
@@ -42,6 +42,8 @@ A signature is carried as:
 | `EIP191` | `eip155:<chain>:<addr>` | `personal_sign` ecrecover equals the address |
 | `EIP1271` | `eip155:<chain>:<addr>` | the contract's `isValidSignature(EIP-191 hash, sig)` returns `0x1626ba7e` |
 | `BIP322` | `bip122:<genesis>:<addr>` | BIP-322 generic signed message (not implemented yet) |
+| `OpenPGP` | `did:key:z6Mk…`, `zDn…` or `zQ3s…` | detached OpenPGP signature over the message (draft, §1.3.1) |
+| `SSHSIG` | `did:key:z6Mk…` or `zDn…` | OpenSSH `SSHSIG` over the message, namespace `kith` (§1.3.1) |
 
 **Contract wallets** such as Safe, Coinbase Smart Wallet and ERC-4337 accounts use
 `EIP1271`.
@@ -60,6 +62,116 @@ seq: <n>
 kind: <kind>
 digest: <digest of the event without sigs>
 ```
+
+### 1.3.1 OpenPGP and SSH signatures
+
+These let a GPG key or an SSH key, including one on a YubiKey, act as a signer. The
+signature formats are the standards' own. This section only fixes the choices they
+leave open.
+
+Status: `SSHSIG` verification is implemented in the Rust core and pinned by
+[`test-vectors/sshsig.json`](test-vectors/sshsig.json), whose signatures come from
+`ssh-keygen`. `OpenPGP` is a draft and not implemented.
+
+- **`sig`** is `base64url` of the binary signature.
+  - OpenPGP: the detached signature packet as `gpg --detach-sign` writes it, not
+    ASCII-armored.
+  - SSHSIG: the blob inside the `-----BEGIN SSH SIGNATURE-----` armor.
+- **Signed bytes** are the Kith message being signed, unchanged: a key event message
+  as above, a revocation entry, a login challenge.
+- **Signer id** is the `did:key` of the key that made the signature, which for OpenPGP
+  is usually a signing subkey. It is never an OpenPGP fingerprint. A v4 fingerprint is
+  a SHA-1 hash that covers the key's creation time, so it names a key at a moment
+  rather than a key, and SHA-1 is a weak thing to name an identity with.
+- **The certificate is never consulted.** User IDs, subkey binding signatures, expiry
+  and OpenPGP revocation certificates have no effect. The key log is the only
+  authority on whether a key is trusted.
+
+**OpenPGP** (RFC 4880, RFC 9580):
+- The `sig` holds exactly one signature packet and nothing else. Version 4 or 6.
+  Signature type MUST be `0x00` (binary document).
+- Public-key algorithms: EdDSA on Ed25519 (`z6Mk…`), ECDSA on NIST P-256 (`zDn…`),
+  ECDSA on secp256k1 (`zQ3s…`). RSA is planned as a separate key type, since many
+  existing keys use it. DSA, Ed448 and other curves are not supported.
+- Hash: SHA-256, SHA-384 or SHA-512. Anything else is rejected.
+- Only the hashed subpacket area counts, and the unhashed area MUST be ignored.
+  Verifiers ignore the issuer, issuer fingerprint, creation time and expiration time
+  subpackets, because log events are not time-bound. A signature with an unrecognized
+  critical subpacket is invalid, as the RFC requires.
+
+**SSHSIG** (OpenSSH `PROTOCOL.sshsig`):
+- The namespace MUST be `kith`, the reserved field empty, and the hash `sha256` or
+  `sha512`.
+- Key types: `ssh-ed25519` (`z6Mk…`) and `ecdsa-sha2-nistp256` (`zDn…`). The public
+  key inside the signature MUST equal the signer's key. FIDO `sk-` keys are a follow-up.
+- Each vector records what `ssh-keygen -Y check-novalidate -n kith` says. It accepts
+  two cases Kith must reject: a valid signature whose signer id names another key, and
+  a P-384 key. It checks structure and the signature, not who signed.
+
+**Domain separation.** SSHSIG has a namespace. OpenPGP has none, so separation rests on
+the message text, which names the protocol, DID, sequence number and event digest. A
+signing tool MUST show the user that text before signing.
+
+**Tooling (planned).** `kith` will show the message and run `gpg --detach-sign` or
+`ssh-keygen -Y sign -n kith`, directly or through the agent, so the private key never
+enters Kith. Until then, `ssh-keygen -Y sign -n kith` on the message text produces a
+valid `SSHSIG`.
+
+### 1.3.2 Key purposes (draft, not implemented)
+
+Today a device has one signing key (`key`) and an optional X25519 key (`xkey`) that
+only the vault reads (§6). The curve is implied by the `did:key` prefix, and `caps`
+says what the device may do. Nothing says what each *key* is for. The DID document
+lists every device key under the signing relationships and leaves `xkey` out.
+
+A device MAY annotate its keys:
+
+```json
+"device": { "id": "dev_x", "name": "yubikey", "kind": "hardware", "aal": 3,
+  "keys": [
+    { "id": "sig", "key": "did:key:z6Mk…", "alg": "OpenPGP",
+      "use": ["authentication", "assertionMethod", "capabilityInvocation"] },
+    { "id": "enc", "key": "did:key:z6LS…", "alg": "X25519", "use": ["keyAgreement"] }
+  ] }
+```
+
+`use` is a subset of DID Core's verification relationships:
+
+| `use` | The key may |
+|-------|-------------|
+| `authentication` | sign logins and session grants (the `session` cap is still required) |
+| `capabilityInvocation` | sign the key log events its device is allowed to sign |
+| `assertionMethod` | sign any other statement the identity makes |
+| `keyAgreement` | receive messages encrypted to the identity, such as vault key rings (§6) |
+| `capabilityDelegation` | reserved for re-delegation (§3.3, future work) |
+
+`alg` names the format. The curve always comes from the `did:key`, and `alg` must be
+compatible with it.
+- For a signing key, `alg` is one of the algorithms in the table above.
+- For a `keyAgreement` key, `alg` says how a sender seals to it. `X25519` is the
+  vault's current construction. Other containers, such as an OpenPGP message to a
+  cv25519 subkey so that `gpg --decrypt` works, can be added without changing the
+  log format.
+
+**Defaults.** A device without `keys` is read as its `key` with `use` set to
+`authentication`, `assertionMethod` and `capabilityInvocation`, plus its `xkey` (if any)
+with `use` set to `keyAgreement`. Existing logs keep their meaning.
+
+**Rules.**
+1. A verifier MUST NOT accept a signature from a key for an operation its `use` does
+   not include. Annotations are part of `add_device`, which the manage policy signs, so
+   a hub cannot change them. To change one, add a new device.
+2. A key MUST NOT have both a signing use and `keyAgreement`. An Ed25519 key MUST NOT
+   be converted to X25519 to get around this. Use one key per primitive.
+3. Every key with a signing use MUST sign the `add_device` event, as `key` does today.
+   A `keyAgreement` key can't sign, so the manage policy's signature covers it.
+
+**DID document (§1.7).** Each key becomes a `Multikey` verification method, listed under
+exactly the relationships in its `use`. Keys with `keyAgreement` appear under that
+relationship, so any DID resolver can find an identity's encryption keys.
+
+**Scope.** Annotations cover device keys. The signers inside the manage and `next`
+policies are bare ids that only ever sign key log events.
 
 ## 1.4 Signer policies
 
@@ -146,6 +258,8 @@ controller key signed two histories.
 The DID document is derived from the key state:
 - Each active device becomes a `Multikey` verification method, listed under
   `authentication`, `assertionMethod` and `capabilityInvocation`.
+- With key annotations (§1.3.2, draft), each key is listed only under the relationships
+  in its `use`, and `keyAgreement` keys appear too.
 - Public aliases go in `alsoKnownAs`.
 - The hub goes in `service`.
 - A `kith` member carries `seq`, `manage` and `next`, so resolvers can see the policy.
