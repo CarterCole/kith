@@ -202,8 +202,9 @@ pub fn anchor(home: &Home, cmd: AnchorCmd) -> Result<()> {
     Ok(())
 }
 
+/// The org argument as a DID: a DID, an alias or a name (see `names`), or this identity.
 fn org_or_self(home: &Home, org: Option<String>) -> Result<String> {
-    org.map(Ok).unwrap_or_else(|| home.did())
+    org.map(|o| super::names::principal(home, &o)).unwrap_or_else(|| home.did())
 }
 
 fn policy_root(st: &KeyState) -> Result<(String, u64)> {
@@ -293,7 +294,7 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
         }
         PolicyCmd::Grants { org, principal, aal } => {
             let org = org_or_self(home, org)?;
-            let id = principal.map(Ok).unwrap_or_else(|| home.did())?;
+            let id = principal.map(|p| super::names::principal(home, &p)).unwrap_or_else(|| home.did())?;
             let st = fetch_state(&hub, &org)?;
             let (root, _) = policy_root(&st)?;
             let q = Query::Principal { id: id.clone() };
@@ -352,14 +353,14 @@ pub fn revoke(home: &mut Home, cmd: RevokeCmd) -> Result<()> {
     let hub = home.hub()?;
     let st = home.state()?;
     let r = match cmd {
-        RevokeCmd::Principal { id } => Revocation::Principal { id },
+        RevokeCmd::Principal { id } => Revocation::Principal { id: super::names::principal(home, &id)? },
         RevokeCmd::Member { id, set } => {
             if !(set.starts_with("Group::") || set.starts_with("Role::")) {
                 bail!("set must be Group::<name> or Role::<name>");
             }
-            Revocation::Member { id, set }
+            Revocation::Member { id: super::names::principal(home, &id)?, set }
         }
-        RevokeCmd::Device { did, device } => Revocation::Device { did, device },
+        RevokeCmd::Device { did, device } => Revocation::Device { did: super::names::principal(home, &did)?, device },
         RevokeCmd::Policy { id } => Revocation::Policy { id },
         RevokeCmd::Token { jti } => Revocation::Token { jti },
     };

@@ -46,7 +46,7 @@ the only way to read the spec.
 | 2 | [Authentication](02-authentication.md) | session chains, challenge login, passkeys, wallets, TOTP, assurance levels, TOTP co-signer |
 | 3 | [Tokens & delegation](03-tokens-and-delegation.md) | grant, session and delegation JWTs, token exchange, access token claims |
 | 4 | [Authorization](04-authorization.md) | policy bundles, explicit/nested/dynamic groups, roles, Cedar mapping, GraphQL mapping |
-| 5 | [Aliases](05-aliases.md) | public and private aliases, proving the link on demand |
+| 5 | [Aliases](05-aliases.md) | public and private aliases, proving the link on demand, resolving a public alias through WebFinger, DNS or did:web back-links, local names for roots |
 | 6 | [Vault](06-vault.md) | crypto-enforced access: skip ratchets, WNFS relationship |
 | 7 | [OpenID Connect](07-oidc.md) | "Sign in with Kith": code + PKCE, passkey login page, SSO, step-up, pairwise subjects, browser passkey enrollment |
 | 8 | [Policy DAG, revocations, freshness](08-policy-dag.md) | bundles as content-addressed blocks, provable slices, org policy roots, signed revocation chains, beacon heartbeats (drand, NIST 2.0), degraded mode, OpenTimestamps anchoring |

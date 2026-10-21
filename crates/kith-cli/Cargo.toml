@@ -19,3 +19,4 @@ tokio.workspace = true
 reqwest.workspace = true
 clap.workspace = true
 rand.workspace = true
+hickory-resolver.workspace = true

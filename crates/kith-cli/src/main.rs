@@ -5,6 +5,7 @@
 //! in a wallet, recovery keys offline, and device keys in the OS keychain / Secure
 //! Enclave / TPM.
 
+mod names;
 mod org;
 
 use std::path::PathBuf;
@@ -68,6 +69,13 @@ enum Cmd {
     },
     #[command(subcommand)]
     Alias(AliasCmd),
+    /// Local names for roots: `kith name add ada mailto:ada@acme.test`, then
+    /// `--to ada` anywhere a DID is expected.
+    #[command(subcommand)]
+    Name(names::NameCmd),
+    /// Resolve a public alias to its root: the alias side's back-link (WebFinger,
+    /// DNS TXT or did:web) must name the root, and the root's KEL must link the alias.
+    Resolve { alias: String },
     /// Authenticate to the hub and get an access token for an audience.
     Login {
         #[arg(long)]
@@ -671,6 +679,11 @@ fn main() -> Result<()> {
         }
         Cmd::Alias(AliasCmd::List) => print(&json!(home.v["aliases"].as_array().map(|a| a.iter().map(|x| json!({"label": x["label"], "alias": x["signer"]["id"], "seq": x["seq"]})).collect::<Vec<_>>()))),
         Cmd::Alias(AliasCmd::New { label }) => {
+            // `prove` finds an alias by label, so a second one would never be reachable.
+            // Refuse before anything is committed to the KEL.
+            if home.v["aliases"].as_array().is_some_and(|a| a.iter().any(|x| x["label"] == label.as_str())) {
+                bail!("you already have a private alias labelled {label:?}; labels are how `kith alias prove` finds one, so pick another");
+            }
             let st = home.state()?;
             let alias = PrivateAlias::generate(&label);
             let mut ev = next_event(&st, EventBody::AliasCommit { commitment: alias.commitment(&st.did) });
@@ -704,6 +717,8 @@ fn main() -> Result<()> {
             publish(&home)?;
             eprintln!("linked {alias} (add a back-link on the alias side so others can check both directions)");
         }
+        Cmd::Name(cmd) => names::run(&home, cmd)?,
+        Cmd::Resolve { alias } => print(&names::resolve(&home, &alias)?.json()),
         Cmd::Login { aud, method, totp, delegation, print: show } => {
             let (aud, tok) = login(&mut home, aud, &method, totp, delegation)?;
             let c = jws::decode(&tok)?.claims;
@@ -718,6 +733,7 @@ fn main() -> Result<()> {
             print(&jws::decode(&tok)?.claims);
         }
         Cmd::Delegate { to, actions, ttl } => {
+            let to = names::principal(&home, &to)?;
             let hub = home.hub()?;
             let sk = session(&mut home)?;
             println!("{}", sk.delegate(&to, &hub, actions.into_iter().map(Capability::new).collect(), ttl)?);

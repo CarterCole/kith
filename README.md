@@ -19,8 +19,9 @@
 - **"Sign in with Kith" for existing apps.** The hub is a standard OpenID Connect
   provider: code flow with PKCE, username-less passkey login, SSO, step-up through
   `acr_values`, and pairwise subjects.
-- **Aliases.** Public ones are proved in both directions. Private ones are unlinkable
-  until you choose to prove the link.
+- **Aliases.** Public ones are proved in both directions and resolve through WebFinger,
+  DNS or did:web back-links; the CLI pins them as local names. Private ones are
+  unlinkable until you choose to prove the link.
 - **Authorization** uses Cedar policies with explicit, nested and dynamic groups and
   roles. Dynamic groups are defined by propositions. It plugs into GraphQL at the root,
   field and row level in JS and Python.
@@ -68,6 +69,10 @@ kith alias new gaming && kith alias prove gaming --aud https://shop.example
 kith delegate --to did:kith:… --action 'Query.*'
 kith rotate --revoke-devices                 # recovery keys (or paper key + TOTP co-signer)
 kith hub serve --bundle bundle.json --clients clients.json   # run a hub (+ OIDC clients)
+kith name add ada mailto:ada@acme.test       # follow her WebFinger (or DNS) back-link, check her KEL links it, pin it
+kith delegate --to ada --action 'Query.*'    # a name works wherever a DID does
+kith resolve https://acme.test               # just look: both directions checked, and exactly one root must pass
+kith name check                              # re-resolve pinned names; report any that moved or became ambiguous
 kith passkey enroll                          # create a passkey in your browser, approve it here
 ```
 

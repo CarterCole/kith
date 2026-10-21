@@ -7,6 +7,7 @@
 //! * [`policy`]    – threshold signer policies ("2 of my 3 devices")
 //! * [`kel`]       – the key event log that defines a `did:kith` identity
 //! * [`alias`]     – private, provable aliases of a root identity
+//! * [`resolve`]   – public aliases back to their root: WebFinger, DNS and did:web back-links
 //! * [`jws`]       – compact JWS helpers
 //! * [`session`]   – device → session key grants, session tokens, delegation
 //! * [`token`]     – hub-issued access tokens (RFC 9068 profile)
@@ -31,6 +32,7 @@ pub mod keys;
 pub mod ots;
 pub mod pdag;
 pub mod policy;
+pub mod resolve;
 pub mod revoke;
 pub mod session;
 pub mod sshsig;

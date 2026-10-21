@@ -18,6 +18,8 @@ pub enum Error {
     Authz(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("ambiguous: {0}")]
+    Ambiguous(String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }

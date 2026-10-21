@@ -17,7 +17,7 @@ sed -e "s|__ADA__|$(cat "$D/ada.did")|g" -e "s|__BOB__|$(cat "$D/bob.did")|g" ex
 
 $K hub serve --addr 127.0.0.1:$PORT --data "$D/hub" --bundle "$D/bundle.json" > "$D/hub.log" 2>&1 &
 HUB=$!
-trap 'kill $HUB 2>/dev/null' EXIT
+trap 'kill $HUB ${WFS:-} 2>/dev/null' EXIT
 for _ in $(seq 50); do curl -sf "$KITH_HUB/.well-known/jwks.json" >/dev/null && break; sleep 0.1; done
 $K --home "$D/ada" publish && $K --home "$D/bob" publish
 
@@ -46,8 +46,51 @@ $K --home "$D/bob" alias verify "$D/proof.json" --aud https://shop.example
 if $K --home "$D/bob" alias verify "$D/proof.json" --aud https://other.example 2>/dev/null; then echo "FAIL: proof accepted for wrong audience"; exit 1; fi
 echo "rejected for the wrong audience (good)"
 
+WF=$((PORT+1))
+step "public alias: a host serves Ada's WebFinger back-link; it resolves only once her KEL links it; Bob names her"
+mkdir -p "$D/wf/.well-known"
+# The host names both Ada and Bob; only a root whose KEL links the alias back counts.
+printf '{"links":[{"rel":"urn:kith:root","href":"%s"},{"rel":"urn:kith:root","href":"%s"}]}' "$(cat "$D/ada.did")" "$(cat "$D/bob.did")" > "$D/wf/.well-known/webfinger"
+(cd "$D/wf" && exec python3 -m http.server "$WF") > "$D/wf.log" 2>&1 &
+WFS=$!
+for _ in $(seq 50); do curl -sf "http://localhost:$WF/.well-known/webfinger" >/dev/null && break; sleep 0.1; done
+if $K --home "$D/bob" resolve "mailto:ada@localhost:$WF" 2>/dev/null; then echo "FAIL: resolved before Ada linked the alias"; exit 1; fi
+echo "a back-link alone does not resolve (good)"
+$K --home "$D/ada" alias link "mailto:ada@localhost:$WF"
+$K --home "$D/bob" resolve "mailto:ada@localhost:$WF" | python3 -c "import sys,json;r=json.load(sys.stdin);assert r['did']==open('$D/ada.did').read().strip(),r;print('resolved via',r['via'])"
+$K --home "$D/bob" name add ada "mailto:ada@localhost:$WF" >/dev/null
+$K --home "$D/ada" name add bob "$(cat "$D/bob.did")" >/dev/null
+$K --home "$D/bob" name list | python3 -c "import sys,json;ns=json.load(sys.stdin);assert [n['name'] for n in ns]==['ada'],ns;print('bob knows:',', '.join(n['name']+' via '+n.get('via','a pinned DID') for n in ns))"
+if $K --home "$D/bob" name add ada "$(cat "$D/bob.did")" 2>/dev/null; then echo "FAIL: a name moved without --replace"; exit 1; fi
+echo "a name does not move silently (good)"
+
+step "collisions: two roots linking one alias is ambiguous, a pinned name is checked, a private label cannot repeat"
+$K --home "$D/ada" alias link "mailto:team@localhost:$WF"
+$K --home "$D/bob" alias link "mailto:team@localhost:$WF"
+if OUT=$($K --home "$D/bob" resolve "mailto:team@localhost:$WF" 2>&1); then echo "FAIL: an alias two roots link resolved to one"; exit 1; fi
+echo "$OUT" | grep -q "ambiguous" && echo "$OUT" | grep -q "$(cat "$D/ada.did")" && echo "$OUT" | grep -q "$(cat "$D/bob.did")" || { echo "FAIL: ambiguity error does not name both roots: $OUT"; exit 1; }
+echo "ambiguous, and both roots are named (good)"
+$K --home "$D/bob" resolve "mailto:ada@localhost:$WF" >/dev/null   # the host names Bob too, but his KEL does not link ada@
+echo "a root the host names but whose KEL does not link back is ignored (good)"
+$K --home "$D/bob" name check | python3 -c "import sys,json;r=json.load(sys.stdin);assert [x['status'] for x in r]==['ok'],r;print('name check:', r[0]['name'], r[0]['status'])"
+$K --home "$D/ada" name check | python3 -c "import sys,json;r=json.load(sys.stdin);assert [x['status'] for x in r]==['pinned'],r;print('name check:', r[0]['name'], r[0]['status'])"
+# Bob links ada@ too, and the host stops naming Ada: the alias now resolves to Bob.
+$K --home "$D/bob" alias link "mailto:ada@localhost:$WF"
+printf '{"links":[{"rel":"urn:kith:root","href":"%s"}]}' "$(cat "$D/bob.did")" > "$D/wf/.well-known/webfinger"
+if CHK=$($K --home "$D/bob" name check 2>/dev/null); then echo "FAIL: a moved name passed the check"; exit 1; fi
+echo "$CHK" | python3 -c "import sys,json;r=json.load(sys.stdin);assert r[0]['status']=='moved' and r[0]['now']==open('$D/bob.did').read().strip(),r;print('name check:', r[0]['name'], r[0]['status'])"
+$K --home "$D/bob" name list | python3 -c "import sys,json;n=json.load(sys.stdin)[0];assert n['did']==open('$D/ada.did').read().strip(),n;print('the name still points at Ada (good)')"
+# The host drops its back-link altogether.
+printf '{"links":[]}' > "$D/wf/.well-known/webfinger"
+if CHK=$($K --home "$D/bob" name check 2>/dev/null); then echo "FAIL: an unresolvable name passed the check"; exit 1; fi
+echo "$CHK" | python3 -c "import sys,json;r=json.load(sys.stdin);assert r[0]['status']=='unresolved',r;print('name check:', r[0]['name'], r[0]['status'])"
+SEQ=$($K --home "$D/ada" status | python3 -c "import sys,json;print(json.load(sys.stdin)['seq'])")
+if $K --home "$D/ada" alias new gaming 2>/dev/null; then echo "FAIL: a second private alias took the label gaming"; exit 1; fi
+test "$($K --home "$D/ada" status | python3 -c "import sys,json;print(json.load(sys.stdin)['seq'])")" = "$SEQ" || { echo "FAIL: the refused alias still committed to the KEL"; exit 1; }
+echo "the label gaming cannot be reused, and nothing was committed (good)"
+
 step "delegation: Ada lets Bob read invoices on her behalf"
-DT=$($K --home "$D/ada" delegate --to "$(cat "$D/bob.did")" --action 'Query.*' --action 'Invoice.read')
+DT=$($K --home "$D/ada" delegate --to bob --action 'Query.*' --action 'Invoice.read')
 $K --home "$D/bob" login --delegation "$DT" --aud api://invoices
 $K --home "$D/bob" whoami --aud api://invoices | python3 -c "import sys,json;c=json.load(sys.stdin);print('sub=',c['sub'],'\nact=',c['act'],'\ncap=',c['cap'])"
 

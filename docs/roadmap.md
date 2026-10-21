@@ -5,6 +5,15 @@
 - **Identity.** A `did:kith` identity from a KEL: nested threshold signer policies,
   pre-rotation, device add and revoke with proof of possession, public and private
   aliases, fork (duplicity) rejection, DID documents.
+- **Names for roots** ([spec §5.1.1–5.1.2](../spec/05-aliases.md)). `kith resolve`
+  follows a public alias's WebFinger, DNS TXT or did:web back-link to a root and
+  accepts it only if the root's KEL links the alias back and no other root passes
+  too (two is an error, never a pick). `kith name add` pins the result as a local
+  petname; names work wherever a DID does, and `kith name check` re-resolves the book
+  and reports names that moved, went ambiguous or stopped resolving. Private alias
+  labels are unique. `scripts/cli-flows.sh` serves a WebFinger back-link and checks
+  that it alone does not resolve, that two roots linking one alias is ambiguous, and
+  that a re-pointed alias shows up as `moved`.
 - **Signers.** Ed25519, P-256, secp256k1, passkeys (WebAuthn), Ethereum EOAs (EIP-191).
   SSH keys (`SSHSIG`, Ed25519 and P-256) in the Rust core, checked against vectors that
   real `ssh-keygen` signed (`scripts/sshsig-vectors.mjs`).
@@ -103,6 +112,12 @@
   `certificateId` holds a 2048-bit key, so they fail verification, and Kith rejects
   them (tested). Older NIST pulses and Brazil's current pulses verify, and drand is the
   default. Worth reporting to NIST (beacon@nist.gov).
+
+- **Alias back-links.** Only WebFinger, DNS TXT and did:web are followed. GitHub
+  (gist), ENS, wallet signatures and `at://` are listed in §5.1 but not resolvable.
+  DNS answers are not DNSSEC-validated. `kith name check` is a command you run, not a
+  watcher, and an `alias list` on a home made before labels were unique can still show
+  two aliases with one label (`prove` uses the first).
 
 ## Open questions (need a decision)
 
