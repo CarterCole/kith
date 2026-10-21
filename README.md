@@ -42,6 +42,17 @@
 Start with [`spec/`](spec/README.md). Then read [prior art](docs/prior-art.md),
 [passports](docs/passports.md), and the [roadmap](docs/roadmap.md).
 
+## Install
+
+On a Mac, or on Linux with Homebrew:
+
+```bash
+brew install cartercole/tap/kith
+```
+
+Each release also carries archives for macOS and Linux on ARM64 and x86-64. To build
+it yourself you need a recent stable Rust: `cargo install --path crates/kith-cli`.
+
 ## Try it
 
 ```bash
@@ -170,6 +181,7 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |
 | `examples/` | Shared policy bundle, GraphQL schema and data used by every example and test |
+| `packaging/` | Release archives (`archive.sh`) and the Homebrew formula (`homebrew/formula.sh`), which [the release workflow](.github/workflows/release.yml) publishes on a tag |
 
 **Status:** a draft spec with a working reference implementation. It is not production
 ready. On Linux the CLI stores keys in plaintext (macOS uses the keychain and Secure
