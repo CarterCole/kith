@@ -12,6 +12,9 @@ Public aliases are Keybase and Keyoxide style. The root publishes
 - `did:web:ada.dev`
 - `eip155:1:0x…` or an ENS name
 - `at://ada.bsky.social`
+- `https://oauth.telegram.org#424242`: an account at an OpenID Connect provider,
+  written `{iss}#{sub}` with `sub` percent-encoded. A hub that trusts the provider
+  accepts a login from that account as a factor ([§7.8](07-oidc.md)).
 
 Verification is **bidirectional**: the alias side must also point back to the root. The
 back-link can be:
@@ -20,7 +23,9 @@ back-link can be:
 - for `did:web`, the DID document's `alsoKnownAs` (§5.1.1);
 - a gist;
 - an ENS text record;
-- a signed message from the wallet (`EIP191` over "I am did:kith:…").
+- a signed message from the wallet (`EIP191` over "I am did:kith:…");
+- for an OpenID Connect account, an ID token for that `sub`. It proves the link only
+  to the party it was issued to, at the time of the login.
 
 Public aliases show up in the DID document's `alsoKnownAs` and in the access token's
 `attrs.aliases`, so policies can use them.
@@ -92,8 +97,10 @@ The back-link is one of:
 Resolvers MUST use `https://` except for `localhost`, `*.localhost`, `127.0.0.1` and
 `[::1]`, which MAY be plain `http://` so tests can run without certificates.
 
-Not resolvable yet: GitHub (a gist), ENS text records, a wallet's signed message
-and `at://`. Those aliases can be linked, but `kith resolve` does not follow them.
+Not resolvable yet: GitHub (a gist), ENS text records, a wallet's signed message,
+`at://`, and OpenID Connect accounts. Those aliases can be linked, and some are
+proved another way (§7.8 for OpenID Connect), but `kith resolve` does not follow
+them.
 
 ### 5.1.2 Names are local
 
@@ -144,7 +151,8 @@ Each kind of name gets its uniqueness from somewhere different:
   (§5.1), but it resolves only if the alias side names that root. A root that links
   `ada@acme.test` without control of `acme.test` gets nothing. When two roots do both
   link an alias, only the ones the alias side names are candidates, and if two pass
-  the result is ambiguous, not a pick (§5.1.1 step 4).
+  the result is ambiguous, not a pick (§5.1.1 step 4). The hub's OpenID Connect login
+  (§7.8) follows the same rule and asks the user which identity they mean.
 - **Petnames** are one flat namespace per user, in the user's own home directory.
   There is nothing to collide with, because nobody else's names are ever consulted.
   Adding a name that already points at a different root is refused without `--replace`.
@@ -154,7 +162,8 @@ Each kind of name gets its uniqueness from somewhere different:
   never published; the KEL holds only the commitment.
 
 Protocol identifiers are namespaced by their owner: the WebFinger relation and
-property are `urn:kith:…` and the DNS label is `_kith`.
+property are `urn:kith:…`, the DNS label is `_kith`, and the `kith:` prefix is reserved
+in schemas (§9.2).
 
 ## 5.2 Private aliases (unlinkable until you choose)
 

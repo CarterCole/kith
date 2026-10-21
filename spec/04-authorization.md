@@ -46,6 +46,9 @@ The portable unit that hubs and resource servers load:
   `members` and a `rule`. Membership is the union.
 - `directory` holds admin-assigned attributes. Other attribute sources (verified
   credentials, upstream IdPs, KEL-derived data such as aliases) merge into the same map.
+- A bundle MAY also carry `attributes` and `schemas` (§9, draft). They declare the
+  attributes, actions and object types that policies may name, and give each audience
+  its own namespace.
 
 ## 4.2 Entity model
 

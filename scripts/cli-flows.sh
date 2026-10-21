@@ -9,19 +9,23 @@ PORT=${PORT:-7788}
 export KITH_HUB=http://localhost:$PORT
 rm -rf "$D" && mkdir -p "$D"
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+# On macOS, keys go to the login keychain (and this device's key into the Secure
+# Enclave); each run makes new identities, so drop their keychain items at the end.
+cleanup() { kill "${HUB:-}" "${WFS:-}" 2>/dev/null || true; for h in ada bob phone; do $K --home "$D/$h" keys forget --yes 2>/dev/null || true; done; }
+trap cleanup EXIT
 
-step "create identities (Ada uses an Ethereum wallet as a recovery signer)"
-$K --home "$D/ada" init --wallet > "$D/ada.did" 2>/dev/null
-$K --home "$D/bob" init > "$D/bob.did" 2>/dev/null
+step "create identities (Ada uses an Ethereum wallet as a recovery signer; Bob keeps his keys in a file for now)"
+$K --home "$D/ada" init --wallet > "$D/ada.did"
+$K --home "$D/bob" init --keystore file > "$D/bob.did" 2>/dev/null
+$K --home "$D/ada" keys list | python3 -c 'import sys,json;print("ada keys:", ", ".join(k["role"]+"="+k["where"] for k in json.load(sys.stdin)["keys"]))'
 sed -e "s|__ADA__|$(cat "$D/ada.did")|g" -e "s|__BOB__|$(cat "$D/bob.did")|g" examples/policy/bundle.template.json > "$D/bundle.json"
 
 $K hub serve --addr 127.0.0.1:$PORT --data "$D/hub" --bundle "$D/bundle.json" > "$D/hub.log" 2>&1 &
 HUB=$!
-trap 'kill $HUB ${WFS:-} 2>/dev/null' EXIT
 for _ in $(seq 50); do curl -sf "$KITH_HUB/.well-known/jwks.json" >/dev/null && break; sleep 0.1; done
 $K --home "$D/ada" publish && $K --home "$D/bob" publish
 
-step "session-chain login with a software key (AAL1: billing-reader, not billing-admin)"
+step "session-chain login with this device's key alone (AAL1: billing-reader, not billing-admin)"
 $K --home "$D/ada" login --aud api://invoices
 
 step "TOTP: enroll, confirm, step up to AAL2 (dynamic role billing-admin appears)"
@@ -29,6 +33,14 @@ SECRET=$($K --home "$D/ada" totp enroll | python3 -c "import sys,json;print(json
 $K --home "$D/ada" totp confirm "$($K totp code "$SECRET")" >/dev/null
 echo "waiting for the next TOTP window…"; sleep $((31 - $(date +%s) % 30))
 $K --home "$D/ada" login --aud api://invoices --totp "$($K totp code "$SECRET")"
+
+if [[ "$(uname)" == Darwin ]]; then
+  step "keychain: move Bob's keys out of identity.json into the login keychain, then keep using them"
+  test "$(grep -c '"secret"' "$D/bob/identity.json")" -gt 0
+  $K --home "$D/bob" keys migrate
+  if grep -q '"secret"' "$D/bob/identity.json"; then echo "FAIL: secrets left in identity.json"; exit 1; fi
+  $K --home "$D/bob" keys list | python3 -c "import sys,json;ks=json.load(sys.stdin)['keys'];assert all(k['where']=='keychain' for k in ks),ks;print('bob keys in keychain:', len(ks))"
+fi
 
 step "challenge login (SIWE-style) signed by a device key"
 $K --home "$D/bob" login --method challenge --aud api://invoices
@@ -106,10 +118,12 @@ echo "revoked device refused (good)"
 
 step "recovery: make the hub's TOTP-gated co-signer a recovery signer, then recover with 1 paper key + TOTP"
 $K --home "$D/ada" rotate --add-cosigner
-python3 - "$D/ada/identity.json" <<'PY'
-import json,sys; p=sys.argv[1]; v=json.load(open(p)); v["recovery"]=v["recovery"][:1]; json.dump(v,open(p,"w"))
+# Lose all but one recovery key: drop them from identity.json and, on macOS, from the keychain.
+python3 - "$D/ada/identity.json" <<'PY' | while read -r acct; do [[ "$(uname)" == Darwin ]] && security delete-generic-password -s kith -a "$acct" >/dev/null 2>&1 || true; done
+import json,sys; p=sys.argv[1]; v=json.load(open(p)); lost=v["recovery"][1:]; v["recovery"]=v["recovery"][:1]; json.dump(v,open(p,"w"))
+for k in lost: print(v["did"]+"/"+k["id"])
 PY
-echo "(deleted one of the two local recovery keys)"
+echo "(deleted all but one of the local recovery keys)"
 if $K --home "$D/ada" rotate 2>/dev/null; then echo "FAIL: rotated without enough signers"; exit 1; fi
 echo "one key alone cannot rotate (good)"
 sleep $((31 - $(date +%s) % 30))

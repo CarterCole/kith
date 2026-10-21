@@ -173,6 +173,46 @@ relationship, so any DID resolver can find an identity's encryption keys.
 **Scope.** Annotations cover device keys. The signers inside the manage and `next`
 policies are bare ids that only ever sign key log events.
 
+### 1.3.3 Device kinds and where keys live
+
+A device's `kind` says what holds its key. Its declared `aal` is the highest assurance
+a login with that device alone may claim (§2.5); the manage policy signs both at
+enrollment.
+
+| `kind` | The key is | Declared `aal` |
+|--------|------------|----------------|
+| `software` | in a file or an OS keychain, loaded by the process that signs | 1 |
+| `passkey` | a WebAuthn credential; signatures are assertions (`alg: WebAuthn`) | 2 with user verification, else 1 |
+| `hardware` | non-exportable: Secure Enclave, TPM, YubiKey PIV, HSM. The process holds a handle; the chip signs | 1 without a per-use activation factor; up to 3 when every signature needs one (Touch ID, a PIN) |
+| `wallet` | a crypto wallet acting as a device | 1 |
+
+A key that cannot be exported still proves only possession. NIST SP 800-63B counts a
+single-factor cryptographic device as AAL1; what lifts a `hardware` device to AAL3 is an
+activation factor the chip enforces on every use. So a bare Secure Enclave key is
+`hardware` at `aal: 1`, and the same key behind Touch ID is `aal: 3`. Verifiers can
+still tell either from a software key: a `hardware` device yields `amr: hwk` (§2.5),
+and a policy may require it.
+
+**Reference CLI.** `kith` keeps private keys in one of two stores, chosen by
+`kith init --keystore keychain|file` (default `keychain` on macOS, `file` elsewhere):
+
+- `file`: secret bytes inline in `identity.json`, mode 0600, plaintext.
+- `keychain` (macOS): one generic password item per key in the login keychain, service
+  `kith`, account `<did>/<key id>`. The key id is the signer's `did:key` (or
+  `eip155:…`), `xkey/<device id>` for the device's X25519 exchange key and
+  `session/<device id>` for the current session key. `identity.json` keeps public data
+  and those ids. This device's own key is created in the Secure Enclave when there is
+  one: the keychain item then holds the Enclave's opaque, device-bound handle
+  (`kSecAttrTokenOID`, what CryptoKit calls `dataRepresentation`), the device is
+  enrolled with `kind: hardware`, and every signature is made in the chip. Without a
+  Secure Enclave, or with `--no-secure-enclave`, the device key is a software key in the
+  keychain. `kith keys migrate` moves a file-backed home into the keychain; `kith keys
+  list` shows where each key lives; `kith keys forget` deletes them.
+
+Device keys exported for another machine (`kith device add --out`) are software keys in
+plaintext, because the file has to travel; the importing machine then stores them the
+way it stores its own.
+
 ## 1.4 Signer policies
 
 ```json
@@ -209,7 +249,7 @@ A typical setup looks like Coinbase or Casa:
 |------|-----------------|
 | manage | Ledger OR 2-of-3 of my passkeys |
 | next | 2-of-3 of {paper key, Safe multisig, hub TOTP co-signer (§2.6)} |
-| devices | phone passkey (AAL2), laptop Secure Enclave key (AAL3), browser software key (AAL1) |
+| devices | phone passkey (AAL2), laptop Secure Enclave key behind Touch ID (AAL3), browser software key (AAL1) |
 
 ## 1.6 Key event log (KEL)
 

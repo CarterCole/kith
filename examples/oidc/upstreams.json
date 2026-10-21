@@ -1,0 +1,9 @@
+[
+  {
+    "id": "telegram",
+    "name": "Telegram",
+    "issuer": "https://oauth.telegram.org",
+    "client_id": "YOUR_BOT_CLIENT_ID",
+    "client_secret": "YOUR_BOT_CLIENT_SECRET"
+  }
+]

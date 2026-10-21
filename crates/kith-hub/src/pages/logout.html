@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signed out · Kith</title>
+<style nonce="{{NONCE}}">{{STYLE}}</style>
+</head>
+<body>
+<main>
+  <div class="brand">Kith</div>
+  <h1>Signed out</h1>
+  <p id="text">Signing you out of your apps…</p>
+  <div id="frames" class="hidden"></div>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+// Front-channel logout: each app clears its own session inside a hidden iframe.
+let left = D.frames.length;
+let finished = false;
+function finish() {
+  if (finished) return;
+  finished = true;
+  if (D.redirect) location.replace(D.redirect);
+  else $("text").textContent = "You are signed out of the Kith hub.";
+}
+for (const src of D.frames) {
+  const f = document.createElement("iframe");
+  f.onload = f.onerror = () => { if (--left <= 0) finish(); };
+  f.src = src;
+  $("frames").append(f);
+}
+// An app that never answers must not keep the user here.
+setTimeout(finish, 3000);
+</script>
+</body>
+</html>

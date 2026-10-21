@@ -17,8 +17,11 @@ rand.workspace = true
 hmac = "0.12"
 base64.workspace = true
 rsa = { version = "0.9", features = ["sha2"] }
+aes-gcm = "0.10"
+p256 = { workspace = true, features = ["ecdh"] }
 reqwest.workspace = true
 tokio-stream = { version = "0.1", features = ["sync"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

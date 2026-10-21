@@ -62,6 +62,9 @@ installed Google Chrome headlessly.
 
 ```bash
 kith init --hub https://hub.example          # root identity + this device + 2-of-3 recovery keys
+                                             # macOS: keys in the login keychain, this device's key in the Secure Enclave
+kith init --keystore file                    # or a plaintext identity.json (the default on Linux)
+kith keys list && kith keys migrate          # where each key lives; move a file-backed home into the keychain
 kith device add --name phone --kind passkey --out phone.json
 kith login --aud api://invoices --totp 123456
 curl -H "authorization: Bearer $(kith token --aud api://invoices)" https://api.example/graphql …
@@ -69,6 +72,10 @@ kith alias new gaming && kith alias prove gaming --aud https://shop.example
 kith delegate --to did:kith:… --action 'Query.*'
 kith rotate --revoke-devices                 # recovery keys (or paper key + TOTP co-signer)
 kith hub serve --bundle bundle.json --clients clients.json   # run a hub (+ OIDC clients)
+kith hub serve --upstreams upstreams.json    # also accept "Sign in with Telegram"
+kith hub serve --registration-token "$TOKEN" # let apps register themselves (RFC 7591)
+kith hub serve --admin-token "$TOKEN"        # /v1/admin/…: sessions, consent, clients
+kith alias link 'https://oauth.telegram.org#<your id>'   # let that Telegram account sign in as you
 kith name add ada mailto:ada@acme.test       # follow her WebFinger (or DNS) back-link, check her KEL links it, pin it
 kith delegate --to ada --action 'Query.*'    # a name works wherever a DID does
 kith resolve https://acme.test               # just look: both directions checked, and exactly one root must pass
@@ -158,12 +165,13 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 |------|------|
 | `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
 | `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
-| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, OpenID Connect provider with passkey login and enrollment pages, block store and IPFS-gateway route, revocation feeds and heartbeats |
+| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, OpenID Connect provider with passkey login and enrollment pages, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
 | `crates/kith-cli` | `kith` binary |
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |
 | `examples/` | Shared policy bundle, GraphQL schema and data used by every example and test |
 
 **Status:** a draft spec with a working reference implementation. It is not production
-ready. The CLI stores keys in plaintext, and the hub keeps some state in memory. See
+ready. On Linux the CLI stores keys in plaintext (macOS uses the keychain and Secure
+Enclave), and the hub has no TLS of its own. See
 [the roadmap](docs/roadmap.md#known-gaps-in-the-reference-code-not-production-ready).

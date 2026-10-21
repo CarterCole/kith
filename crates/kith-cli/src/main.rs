@@ -1,10 +1,12 @@
 //! `kith` – the Kith command line.
 //!
-//! State lives in `$KITH_HOME` (default `~/.kith`). **Keys are stored in plaintext
-//! JSON in this reference CLI**; real deployments keep the manage key on hardware or
-//! in a wallet, recovery keys offline, and device keys in the OS keychain / Secure
-//! Enclave / TPM.
+//! State lives in `$KITH_HOME` (default `~/.kith`). Private keys go to the OS keychain
+//! on macOS, with this device's key in the Secure Enclave, and to a plaintext
+//! `identity.json` (mode 0600) elsewhere or with `--keystore file`; see [`keystore`].
+//! Real deployments keep the manage key on hardware or in a wallet and recovery keys
+//! offline.
 
+mod keystore;
 mod names;
 mod org;
 
@@ -16,12 +18,14 @@ use serde_json::{json, Value};
 
 use kith_core::alias::{verify_alias_proof, AliasProof, PrivateAlias};
 use kith_core::kel::{new_inception, next_event, verify_log, Device, DeviceKind, Event, EventBody, KeyState};
-use kith_core::keys::{KeyType, LocalSigner, VerifyOptions};
+use kith_core::keys::{KeyType, LocalSigner, Scheme, SecretKey, Sig, VerifyOptions};
 use kith_core::policy::SignerPolicy;
 use kith_core::session::{Capability, DeviceSigner, SessionKey};
 use kith_core::util::{b64u, b64u_decode, now, random_id};
 use kith_core::vault::ExchangeKey;
 use kith_core::{jws, totp};
+
+use keystore::Backend;
 
 #[derive(Parser)]
 #[command(name = "kith", version, about = "Universal identity: one root, many devices, sessions, aliases and delegation")]
@@ -44,6 +48,18 @@ enum Cmd {
         /// Use a (simulated) Ethereum wallet as one of the recovery signers.
         #[arg(long)]
         wallet: bool,
+        /// Where private keys live: `keychain` (the macOS login keychain, with this
+        /// device's key in the Secure Enclave) or `file` (plaintext identity.json).
+        /// Default: keychain on macOS, file elsewhere.
+        #[arg(long)]
+        keystore: Option<String>,
+        /// Keep this device's key in software even when a Secure Enclave is available.
+        #[arg(long)]
+        no_secure_enclave: bool,
+        /// Ask for Touch ID (or the login password) on every signature by this device's
+        /// Secure Enclave key, and enroll the device at AAL3.
+        #[arg(long)]
+        touch_id: bool,
     },
     /// Show this identity.
     Status,
@@ -55,6 +71,10 @@ enum Cmd {
     Publish,
     #[command(subcommand)]
     Device(DeviceCmd),
+    /// Where this identity's private keys are kept: list them, move them into the OS
+    /// keychain, or forget them.
+    #[command(subcommand)]
+    Keys(KeysCmd),
     /// Rotate the manage key using the pre-committed recovery keys.
     Rotate {
         /// Also revoke every device (use after a compromise).
@@ -180,8 +200,28 @@ enum DeviceCmd {
         sig: String,
     },
     /// Use an exported device on this machine.
-    Import { file: PathBuf },
+    Import {
+        file: PathBuf,
+        /// `keychain` or `file` (default: keychain on macOS, file elsewhere).
+        #[arg(long)]
+        keystore: Option<String>,
+    },
     Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Every private key this machine holds for the identity, and where each one lives.
+    List,
+    /// Move the secrets in identity.json into the OS keychain and blank them in the
+    /// file (macOS).
+    Migrate,
+    /// Delete this identity's keys from the OS keychain. This machine can then no
+    /// longer sign for it.
+    Forget {
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -248,6 +288,22 @@ enum HubCmd {
         /// JSON file with an array of OpenID Connect clients.
         #[arg(long)]
         clients: Option<PathBuf>,
+        /// JSON file with an array of upstream OIDC providers to accept logins from
+        /// (e.g. Telegram).
+        #[arg(long)]
+        upstreams: Option<PathBuf>,
+        /// Turn on dynamic client registration (`POST /oauth/register`) for callers
+        /// that present this bearer token.
+        #[arg(long, env = "KITH_REGISTRATION_TOKEN")]
+        registration_token: Option<String>,
+        /// Let callers that present this bearer token use the admin API
+        /// (`/v1/admin/…`). Identities in the `hub-admin` role can always use it.
+        #[arg(long, env = "KITH_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+        /// The hub sits behind one reverse proxy: rate limits use the client address
+        /// that proxy appended to `X-Forwarded-For`.
+        #[arg(long)]
+        behind_proxy: bool,
         /// Take groups and roles from this org's policy DAG instead of --bundle.
         #[arg(long)]
         policy_org: Option<String>,
@@ -262,9 +318,105 @@ enum HubCmd {
 
 // ------------------------------------------------------------------ state
 
+/// `identity.json`: the KEL and public state, plus either the private keys themselves
+/// (`keystore: file`) or only their ids, with the secrets in the OS keychain
+/// (`keystore: keychain`, see [`keystore`]).
 struct Home {
     dir: PathBuf,
     v: Value,
+}
+
+/// This machine's device key.
+enum DeviceKey {
+    /// In this process, loaded from the file or the keychain.
+    Software(Box<LocalSigner>),
+    /// In the Secure Enclave; only its handle is here.
+    #[cfg(target_os = "macos")]
+    Enclave(keystore::enclave::EnclaveKey),
+}
+
+impl DeviceKey {
+    fn id(&self) -> &str {
+        match self {
+            DeviceKey::Software(s) => &s.id,
+            #[cfg(target_os = "macos")]
+            DeviceKey::Enclave(k) => &k.id,
+        }
+    }
+
+    fn is_hardware(&self) -> bool {
+        match self {
+            DeviceKey::Software(_) => false,
+            #[cfg(target_os = "macos")]
+            DeviceKey::Enclave(_) => true,
+        }
+    }
+
+    /// A detached signature over `msg`. Not for passkeys, which sign through WebAuthn.
+    fn sign(&self, msg: &[u8]) -> Result<Sig> {
+        match self {
+            DeviceKey::Software(s) => Ok(s.sign(msg)?),
+            #[cfg(target_os = "macos")]
+            DeviceKey::Enclave(k) => Ok(Sig { signer: k.id.clone(), alg: kith_core::keys::key_sig_alg(KeyType::P256).into(), sig: b64u(k.sign(msg)?), webauthn: None }),
+        }
+    }
+
+    fn sign_event(&self, ev: &mut Event) -> Result<()> {
+        let msg = ev.signing_message()?;
+        ev.add_sig(self.sign(&msg)?);
+        Ok(())
+    }
+
+    /// The private key itself, which software passkeys need (they sign through WebAuthn).
+    fn secret(&self) -> Result<&SecretKey> {
+        match self {
+            DeviceKey::Software(s) => Ok(&s.secret),
+            #[cfg(target_os = "macos")]
+            DeviceKey::Enclave(_) => bail!("a Secure Enclave key cannot act as a software passkey"),
+        }
+    }
+
+    /// Certify a fresh session key.
+    fn grant_session(&self, did: &str, dev: &Device, ttl: i64) -> Result<SessionKey> {
+        Ok(match self {
+            DeviceKey::Software(s) if dev.kind == DeviceKind::Passkey => {
+                SessionKey::create(did, dev, DeviceSigner::Passkey { key: &s.secret, rp_id: "localhost", origin: "http://localhost" }, ttl)?
+            }
+            DeviceKey::Software(s) => SessionKey::create(did, dev, DeviceSigner::Key(&s.secret), ttl)?,
+            #[cfg(target_os = "macos")]
+            DeviceKey::Enclave(k) => {
+                let sign = |m: &[u8]| k.sign(m).map_err(|e| kith_core::Error::Signature(e.to_string()));
+                SessionKey::create(did, dev, DeviceSigner::External { kty: KeyType::P256, sign: &sign }, ttl)?
+            }
+        })
+    }
+}
+
+/// This machine's new device key: in the Secure Enclave when the keychain backend is
+/// on and there is a chip (unless the user opted out), else an Ed25519 software key.
+fn new_device_key(backend: Backend, no_enclave: bool, touch_id: bool) -> DeviceKey {
+    #[cfg(target_os = "macos")]
+    if backend == Backend::Keychain && !no_enclave {
+        match keystore::enclave::EnclaveKey::generate(touch_id) {
+            Ok(k) => return DeviceKey::Enclave(k),
+            Err(e) => eprintln!("note: {e}; using a software key"),
+        }
+    }
+    if touch_id {
+        eprintln!("warning: --touch-id needs a Secure Enclave key; ignored");
+    }
+    let _ = (backend, no_enclave);
+    DeviceKey::Software(Box::new(LocalSigner::generate(KeyType::Ed25519)))
+}
+
+/// The keychain slot of a device's exchange key.
+fn xkey_slot(dev_id: &str) -> String {
+    format!("xkey/{dev_id}")
+}
+
+/// The keychain slot of a device's current session key.
+fn session_slot(dev_id: &str) -> String {
+    format!("session/{dev_id}")
 }
 
 impl Home {
@@ -302,13 +454,206 @@ impl Home {
         Ok(verify_log(&self.kel()?, &VerifyOptions::default())?)
     }
 
-    fn signers(&self, key: &str) -> Result<Vec<LocalSigner>> {
-        self.v[key].as_array().map(|a| a.iter().map(LocalSigner::from_json).collect::<Result<Vec<_>, _>>()).transpose()?.ok_or_else(|| anyhow!("no {key} keys on this machine"))
+    fn backend(&self) -> Backend {
+        if self.v["keystore"] == "keychain" {
+            Backend::Keychain
+        } else {
+            Backend::File
+        }
     }
 
-    fn device(&self) -> Result<(String, LocalSigner)> {
+    fn device_id(&self) -> Result<String> {
+        self.v["device"]["id"].as_str().map(String::from).ok_or_else(|| anyhow!("no device on this machine"))
+    }
+
+    /// Put a secret where this home keeps them. Returns what goes in the JSON file:
+    /// the base64url bytes for the file backend, `null` when it went to the keychain.
+    fn stash(&self, slot: &str, secret: &[u8]) -> Result<Value> {
+        match self.backend() {
+            Backend::File => Ok(json!(b64u(secret))),
+            Backend::Keychain => {
+                keystore::put(&self.did()?, slot, secret)?;
+                Ok(Value::Null)
+            }
+        }
+    }
+
+    /// Read a secret back, from the JSON (`inline`) or the keychain.
+    fn fetch(&self, slot: &str, inline: &Value) -> Result<Vec<u8>> {
+        if let Some(b) = inline.as_str() {
+            return Ok(b64u_decode(b)?);
+        }
+        match self.backend() {
+            Backend::Keychain => keystore::get(&self.did()?, slot),
+            Backend::File => bail!("no secret for {slot} in {}", self.dir.join("identity.json").display()),
+        }
+    }
+
+    /// Drop a secret from the keychain. Inline secrets go away with their JSON.
+    fn forget(&self, slot: &str, inline: &Value) -> Result<bool> {
+        if inline.is_null() && self.backend() == Backend::Keychain {
+            return keystore::delete(&self.did()?, slot);
+        }
+        Ok(false)
+    }
+
+    /// A signer for the JSON file, with its secret stashed.
+    fn signer_json(&self, s: &LocalSigner) -> Result<Value> {
+        let mut v = json!({"id": s.id, "scheme": s.scheme, "kty": s.secret.kty()});
+        let secret = self.stash(&s.id, &s.secret.to_bytes())?;
+        if !secret.is_null() {
+            v["secret"] = secret;
+        }
+        Ok(v)
+    }
+
+    fn signer_from_json(&self, v: &Value) -> Result<LocalSigner> {
+        let id = v["id"].as_str().ok_or_else(|| anyhow!("signer without an id"))?;
+        let kty: KeyType = serde_json::from_value(v["kty"].clone())?;
+        let scheme: Scheme = serde_json::from_value(v["scheme"].clone())?;
+        let secret = SecretKey::from_bytes(kty, &self.fetch(id, &v["secret"])?)?;
+        Ok(LocalSigner::from_secret(secret, scheme, Some(id.to_string()))?)
+    }
+
+    fn signers(&self, key: &str) -> Result<Vec<LocalSigner>> {
+        let arr = self.v[key].as_array().ok_or_else(|| anyhow!("no {key} keys on this machine"))?;
+        arr.iter().map(|s| self.signer_from_json(s)).collect()
+    }
+
+    /// Replace the `key` signers, dropping the old ones from the keychain.
+    fn replace_signers(&mut self, key: &str, new: &[LocalSigner]) -> Result<()> {
+        for old in self.v[key].as_array().cloned().unwrap_or_default() {
+            self.forget(old["id"].as_str().unwrap_or_default(), &old["secret"])?;
+        }
+        let vals = new.iter().map(|s| self.signer_json(s)).collect::<Result<Vec<_>>>()?;
+        self.v[key] = json!(vals);
+        Ok(())
+    }
+
+    fn device(&self) -> Result<(String, DeviceKey)> {
+        let id = self.device_id()?;
+        let s = &self.v["device"]["signer"];
+        if s["store"] != "secure_enclave" {
+            return Ok((id, DeviceKey::Software(Box::new(self.signer_from_json(s)?))));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let kid = s["id"].as_str().unwrap_or_default();
+            let k = keystore::enclave::EnclaveKey::from_blob(&self.fetch(kid, &s["secret"])?)?;
+            if k.id != kid {
+                bail!("the Secure Enclave opened a different key than {kid}");
+            }
+            Ok((id, DeviceKey::Enclave(k)))
+        }
+        #[cfg(not(target_os = "macos"))]
+        bail!("this device's key is in a Secure Enclave on another machine")
+    }
+
+    /// The device entry for the JSON file: id, signer and exchange key, secrets stashed.
+    fn device_json(&self, dev_id: &str, key: &DeviceKey, xkey: Option<&[u8]>) -> Result<Value> {
+        let signer = match key {
+            DeviceKey::Software(s) => self.signer_json(s)?,
+            #[cfg(target_os = "macos")]
+            DeviceKey::Enclave(k) => {
+                let mut v = json!({"id": k.id, "scheme": Scheme::Raw, "kty": KeyType::P256, "store": "secure_enclave"});
+                let secret = self.stash(&k.id, &k.blob()?)?;
+                if !secret.is_null() {
+                    v["secret"] = secret;
+                }
+                v
+            }
+        };
+        let mut d = json!({"id": dev_id, "signer": signer});
+        if let Some(x) = xkey {
+            let x = self.stash(&xkey_slot(dev_id), x)?;
+            if !x.is_null() {
+                d["xkey"] = x;
+            }
+        }
+        Ok(d)
+    }
+
+    /// Where a stored secret lives, for `kith keys list` and `kith status`.
+    fn location(&self, inline: &Value, store: Option<&str>) -> &'static str {
+        match (store, inline.is_null(), self.backend()) {
+            (Some("secure_enclave"), _, _) => "secure_enclave",
+            (_, true, Backend::Keychain) => "keychain",
+            _ => "file",
+        }
+    }
+
+    /// Every private key this machine holds for the identity.
+    fn key_inventory(&self) -> Result<Vec<Value>> {
+        let dev_id = self.device_id()?;
+        let mut keys = vec![];
+        for role in ["manage", "recovery"] {
+            for s in self.v[role].as_array().into_iter().flatten() {
+                keys.push(json!({"role": role, "id": s["id"], "where": self.location(&s["secret"], None)}));
+            }
+        }
         let d = &self.v["device"];
-        Ok((d["id"].as_str().ok_or_else(|| anyhow!("no device on this machine"))?.into(), LocalSigner::from_json(&d["signer"])?))
+        keys.push(json!({"role": "device", "id": d["signer"]["id"], "where": self.location(&d["signer"]["secret"], d["signer"]["store"].as_str())}));
+        if d.get("xkey").is_some() || self.backend() == Backend::Keychain {
+            keys.push(json!({"role": "device_xkey", "id": xkey_slot(&dev_id), "where": self.location(&d["xkey"], None)}));
+        }
+        for a in self.v["aliases"].as_array().into_iter().flatten() {
+            keys.push(json!({"role": "alias", "label": a["label"], "id": a["signer"]["id"], "where": self.location(&a["signer"]["secret"], None)}));
+        }
+        if self.v["session"].is_object() {
+            keys.push(json!({"role": "session", "id": session_slot(&dev_id), "where": self.location(&self.v["session"]["secret"], None)}));
+        }
+        Ok(keys)
+    }
+
+    /// Move every inline secret into the keychain and blank it in the file.
+    fn migrate_to_keychain(&mut self) -> Result<usize> {
+        if !cfg!(target_os = "macos") {
+            bail!("no OS keychain backend on this platform");
+        }
+        let did = self.did()?;
+        let dev_id = self.device_id()?;
+        let mut moved = 0;
+        let mut mv = |v: &mut Value, field: &str, slot: &str| -> Result<()> {
+            if let Some(b) = v[field].as_str() {
+                keystore::put(&did, slot, &b64u_decode(b)?)?;
+                v.as_object_mut().ok_or_else(|| anyhow!("bad state"))?.remove(field);
+                moved += 1;
+            }
+            Ok(())
+        };
+        for role in ["manage", "recovery"] {
+            for s in self.v[role].as_array_mut().into_iter().flatten() {
+                let id = s["id"].as_str().unwrap_or_default().to_string();
+                mv(s, "secret", &id)?;
+            }
+        }
+        for a in self.v["aliases"].as_array_mut().into_iter().flatten() {
+            let id = a["signer"]["id"].as_str().unwrap_or_default().to_string();
+            mv(&mut a["signer"], "secret", &id)?;
+        }
+        let id = self.v["device"]["signer"]["id"].as_str().unwrap_or_default().to_string();
+        mv(&mut self.v["device"]["signer"], "secret", &id)?;
+        mv(&mut self.v["device"], "xkey", &xkey_slot(&dev_id))?;
+        if self.v["session"].is_object() {
+            mv(&mut self.v["session"], "secret", &session_slot(&dev_id))?;
+        }
+        self.v["keystore"] = json!("keychain");
+        self.save()?;
+        Ok(moved)
+    }
+
+    /// Delete every keychain item of this home. Returns how many existed.
+    fn forget_all(&self) -> Result<usize> {
+        let mut n = 0;
+        for k in self.key_inventory()? {
+            if k["where"] == "file" {
+                continue;
+            }
+            if self.forget(k["id"].as_str().unwrap_or_default(), &Value::Null)? {
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     fn append(&mut self, ev: Event) -> Result<KeyState> {
@@ -379,20 +724,22 @@ fn device_sign(ev: &mut Event, signer: &LocalSigner, kind: DeviceKind) -> Result
 
 fn session(home: &mut Home) -> Result<SessionKey> {
     let did = home.did()?;
+    let slot = session_slot(&home.device_id()?);
     let s = &home.v["session"];
     if s["exp"].as_i64().unwrap_or(0) > now() + 300 {
-        let secret = kith_core::keys::SecretKey::from_bytes(KeyType::Ed25519, &b64u_decode(s["secret"].as_str().unwrap_or_default())?)?;
+        let secret = SecretKey::from_bytes(KeyType::Ed25519, &home.fetch(&slot, &s["secret"])?)?;
         return Ok(SessionKey { did, secret, grant: s["grant"].as_str().unwrap_or_default().into() });
     }
     let (dev_id, signer) = home.device()?;
     let st = home.state()?;
     let dev = st.device(&dev_id).ok_or_else(|| anyhow!("this device ({dev_id}) is not active in the KEL"))?.clone();
     let ttl = 12 * 3600;
-    let sk = match dev.kind {
-        DeviceKind::Passkey => SessionKey::create(&did, &dev, DeviceSigner::Passkey { key: &signer.secret, rp_id: "localhost", origin: "http://localhost" }, ttl)?,
-        _ => SessionKey::create(&did, &dev, DeviceSigner::Key(&signer.secret), ttl)?,
-    };
-    home.v["session"] = json!({"secret": b64u(sk.secret.to_bytes()), "grant": sk.grant, "exp": now() + ttl});
+    let sk = signer.grant_session(&did, &dev, ttl)?;
+    let secret = home.stash(&slot, &sk.secret.to_bytes())?;
+    home.v["session"] = json!({"grant": sk.grant, "exp": now() + ttl});
+    if !secret.is_null() {
+        home.v["session"]["secret"] = secret;
+    }
     home.save()?;
     Ok(sk)
 }
@@ -426,7 +773,7 @@ fn login(home: &mut Home, aud: Option<String>, method: &str, totp_code: Option<S
         let dev = home.state()?.device(&dev_id).cloned().ok_or_else(|| anyhow!("device not active"))?;
         let mut factors = vec![];
         if dev.kind == DeviceKind::Passkey {
-            let (data, sig) = kith_core::webauthn::soft_assert(&signer.secret, "localhost", "http://localhost", &kith_core::util::sha256(msg.as_bytes()), true, 1)?;
+            let (data, sig) = kith_core::webauthn::soft_assert(signer.secret()?, "localhost", "http://localhost", &kith_core::util::sha256(msg.as_bytes()), true, 1)?;
             factors.push(json!({"type": "webauthn", "device_id": dev_id, "authenticator_data": data.authenticator_data, "client_data_json": data.client_data_json, "signature": b64u(sig)}));
         } else {
             factors.push(json!({"type": "signature", "sig": signer.sign(msg.as_bytes())?}));
@@ -475,7 +822,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let dir = cli.home.clone().unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".kith"));
 
-    if let Cmd::Hub(HubCmd::Serve { addr, issuer, data, bundle, rp_id, origins, clients, policy_org, beacon, heartbeat }) = cli.cmd {
+    if let Cmd::Hub(HubCmd::Serve { addr, issuer, data, bundle, rp_id, origins, clients, upstreams, registration_token, admin_token, behind_proxy, policy_org, beacon, heartbeat }) = cli.cmd {
         // Browsers only allow passkeys on "localhost", not "127.0.0.1", so default to it.
         let port = addr.rsplit(':').next().unwrap_or("7777");
         let local = ["127.0.0.1", "0.0.0.0", "localhost", "[::1]"].iter().any(|h| addr.starts_with(h));
@@ -497,48 +844,71 @@ fn main() -> Result<()> {
         if let Some(path) = clients {
             cfg.clients = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?)?;
         }
+        cfg.registration_token = registration_token.filter(|t| !t.is_empty());
+        cfg.admin_token = admin_token.filter(|t| !t.is_empty());
+        cfg.behind_proxy = behind_proxy;
+        if let Some(path) = upstreams {
+            cfg.upstreams = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?)?;
+        }
         return tokio::runtime::Runtime::new()?.block_on(kith_hub::serve(cfg, &addr));
     }
 
     let mut home = Home::load(dir)?;
     match cli.cmd {
-        Cmd::Init { hub, device_name, wallet } => {
+        Cmd::Init { hub, device_name, wallet, keystore, no_secure_enclave, touch_id } => {
             if home.v.get("did").is_some() {
                 bail!("{} already holds an identity", home.dir.display());
             }
+            let backend = keystore.as_deref().map(Backend::parse).transpose()?.unwrap_or_else(Backend::platform_default).resolve();
             let root = LocalSigner::generate(KeyType::Ed25519);
             let mut recovery = vec![LocalSigner::generate(KeyType::Ed25519), LocalSigner::generate(KeyType::Ed25519)];
             recovery.push(if wallet { LocalSigner::generate_eth_wallet(1) } else { LocalSigner::generate(KeyType::Ed25519) });
             let rotation = SignerPolicy::threshold(2, recovery.iter().map(|s| SignerPolicy::single(&s.id)).collect());
-            // A software key alone is AAL1 (NIST 800-63B); step up with TOTP or a passkey.
-            let (dev, dsigner, xkey) = new_device(&device_name, DeviceKind::Software, 1);
+            // This device. A key alone is one possession factor, AAL1 (NIST 800-63B),
+            // in software or in the Secure Enclave; step up with TOTP or a passkey. An
+            // Enclave key that asks for Touch ID on every use is a multi-factor
+            // hardware authenticator, AAL3.
+            let dkey = new_device_key(backend, no_secure_enclave, touch_id);
+            let xkey = ExchangeKey::generate();
+            let (kind, aal) = if dkey.is_hardware() { (DeviceKind::Hardware, if touch_id { 3 } else { 1 }) } else { (DeviceKind::Software, 1) };
+            let dev = Device {
+                id: format!("dev_{}", &random_id()[..8]),
+                key: dkey.id().to_string(),
+                name: device_name.clone(),
+                kind,
+                aal,
+                caps: vec!["session".into(), "alias".into()],
+                rp_id: None,
+                xkey: Some(xkey.public_did_key()),
+            };
             let mut inc = new_inception(SignerPolicy::single(&root.id), &rotation, vec![dev.clone()]);
             inc.sign(&root)?;
-            inc.sign(&dsigner)?;
+            dkey.sign_event(&mut inc)?;
             let st = verify_log(std::slice::from_ref(&inc), &VerifyOptions::default())?;
-            home.v = json!({
-                "did": st.did,
-                "hub": hub,
-                "kel": [inc],
-                "manage": [root.to_json()],
-                "recovery": recovery.iter().map(|s| s.to_json()).collect::<Vec<_>>(),
-                "rotation_policy": rotation,
-                "device": {"id": dev.id, "signer": dsigner.to_json(), "xkey": b64u(xkey.to_bytes())},
-                "aliases": [],
-            });
+            home.v = json!({"did": st.did, "hub": hub, "keystore": backend.name(), "kel": [inc], "rotation_policy": rotation, "aliases": []});
+            home.replace_signers("manage", std::slice::from_ref(&root))?;
+            home.replace_signers("recovery", &recovery)?;
+            home.v["device"] = home.device_json(&dev.id, &dkey, Some(&xkey.to_bytes()))?;
             home.save()?;
             if let Err(e) = publish(&home) {
                 eprintln!("warning: could not publish to hub ({e}); run `kith publish` later");
             }
             println!("{}", st.did);
-            eprintln!("created identity with device {} ({}) and 2-of-3 recovery keys{}", dev.id, device_name, if wallet { " (one is an Ethereum wallet)" } else { "" });
-            eprintln!("warning: this reference CLI stores keys in plaintext at {}", home.dir.join("identity.json").display());
+            eprintln!("created identity with device {} ({}, {} key, aal {}) and 2-of-3 recovery keys{}", dev.id, device_name, kind_str(kind), aal, if wallet { " (one is an Ethereum wallet)" } else { "" });
+            match (backend, dkey.is_hardware()) {
+                (Backend::Keychain, true) => eprintln!("keys: in your login keychain (service `kith`); this device's key is in the Secure Enclave{}", if touch_id { " and asks for Touch ID on every signature" } else { "" }),
+                (Backend::Keychain, false) => eprintln!("keys: in your login keychain (service `kith`)"),
+                (Backend::File, _) => eprintln!("warning: keys are stored in plaintext at {}{}", home.dir.join("identity.json").display(), if cfg!(target_os = "macos") { "; `kith keys migrate` moves them into your keychain" } else { "" }),
+            }
         }
         Cmd::Status => {
             let st = home.state()?;
+            let d = &home.v["device"]["signer"];
             print(&json!({
                 "did": st.did, "hub": home.v["hub"], "seq": st.seq,
                 "this_device": home.v["device"]["id"],
+                "keystore": home.backend().name(),
+                "this_device_key": home.location(&d["secret"], d["store"].as_str()),
                 "devices": st.devices.values().map(|d| json!({"id": d.id, "name": d.name, "kind": d.kind, "aal": d.aal})).collect::<Vec<_>>(),
                 "revoked": st.revoked, "public_aliases": st.aliases,
                 "private_aliases": home.v["aliases"].as_array().map(|a| a.iter().map(|x| x["label"].clone()).collect::<Vec<_>>()),
@@ -610,15 +980,20 @@ fn main() -> Result<()> {
             println!("{}", dev.id);
             eprintln!("added {} device {}; import it elsewhere with `kith device import {}`", kind_str(kind), dev.id, out.display());
         }
-        Cmd::Device(DeviceCmd::Import { file }) => {
+        Cmd::Device(DeviceCmd::Import { file, keystore }) => {
             if home.v.get("did").is_some() {
                 bail!("{} already holds an identity", home.dir.display());
             }
             let v: Value = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
-            home.v = json!({"did": v["did"], "hub": v["hub"], "kel": v["kel"], "device": v["device"], "aliases": []});
+            let backend = keystore.as_deref().map(Backend::parse).transpose()?.unwrap_or_else(Backend::platform_default).resolve();
+            home.v = json!({"did": v["did"], "hub": v["hub"], "keystore": backend.name(), "kel": v["kel"], "aliases": []});
             home.state()?;
+            let dev_id = v["device"]["id"].as_str().ok_or_else(|| anyhow!("export has no device id"))?.to_string();
+            let signer = DeviceKey::Software(Box::new(LocalSigner::from_json(&v["device"]["signer"])?));
+            let xkey = v["device"]["xkey"].as_str().map(b64u_decode).transpose()?;
+            home.v["device"] = home.device_json(&dev_id, &signer, xkey.as_deref())?;
             home.save()?;
-            eprintln!("imported device {} for {}", v["device"]["id"].as_str().unwrap_or("?"), v["did"].as_str().unwrap_or("?"));
+            eprintln!("imported device {dev_id} for {} (keys: {})", v["did"].as_str().unwrap_or("?"), backend.name());
         }
         Cmd::Device(DeviceCmd::Revoke { id }) => {
             let st = home.state()?;
@@ -629,6 +1004,23 @@ fn main() -> Result<()> {
             home.append(ev)?;
             publish(&home)?;
             eprintln!("revoked {id}");
+        }
+        Cmd::Keys(KeysCmd::List) => print(&json!({"did": home.did()?, "keystore": home.backend().name(), "keys": home.key_inventory()?})),
+        Cmd::Keys(KeysCmd::Migrate) => {
+            home.did()?;
+            let moved = home.migrate_to_keychain()?;
+            eprintln!("moved {moved} secrets into your login keychain (service `kith`); {} now holds only public data and key ids", home.dir.join("identity.json").display());
+        }
+        Cmd::Keys(KeysCmd::Forget { yes }) => {
+            let did = home.did()?;
+            if home.backend() != Backend::Keychain {
+                eprintln!("this identity keeps its keys in {}; nothing in the keychain to forget", home.dir.join("identity.json").display());
+            } else if !yes {
+                bail!("this deletes every key of {did} from your keychain, and this machine can then no longer sign for it; pass --yes if you mean it");
+            } else {
+                let n = home.forget_all()?;
+                eprintln!("removed {n} keychain items for {did}");
+            }
         }
         Cmd::Rotate { revoke_devices, add_cosigner, totp } => {
             let st = home.state()?;
@@ -666,10 +1058,11 @@ fn main() -> Result<()> {
                 ev.add_sig(serde_json::from_value(sig)?);
             }
             let st = home.append(ev)?;
-            home.v["manage"] = json!([new_root.to_json()]);
-            home.v["recovery"] = json!(new_recovery.iter().map(|s| s.to_json()).collect::<Vec<_>>());
+            home.replace_signers("manage", std::slice::from_ref(&new_root))?;
+            home.replace_signers("recovery", &new_recovery)?;
             home.v["rotation_policy"] = serde_json::to_value(&next)?;
             if revoke_devices {
+                home.forget(&session_slot(&home.device_id()?), &home.v["session"]["secret"])?;
                 home.v["session"] = json!(null);
                 home.v["tokens"] = json!({});
             }
@@ -688,9 +1081,10 @@ fn main() -> Result<()> {
             let alias = PrivateAlias::generate(&label);
             let mut ev = next_event(&st, EventBody::AliasCommit { commitment: alias.commitment(&st.did) });
             let (_, dsigner) = home.device()?;
-            ev.sign(&dsigner)?;
+            dsigner.sign_event(&mut ev)?;
             let st = home.append(ev)?;
-            home.v["aliases"].as_array_mut().ok_or_else(|| anyhow!("bad state"))?.push(json!({"label": label, "signer": alias.signer.to_json(), "salt": alias.salt, "seq": st.seq}));
+            let signer = home.signer_json(&alias.signer)?;
+            home.v["aliases"].as_array_mut().ok_or_else(|| anyhow!("bad state"))?.push(json!({"label": label, "signer": signer, "salt": alias.salt, "seq": st.seq}));
             home.save()?;
             publish(&home)?;
             println!("{}", alias.id());
@@ -698,7 +1092,7 @@ fn main() -> Result<()> {
         Cmd::Alias(AliasCmd::Prove { label, aud, nonce }) => {
             let did = home.did()?;
             let a = home.v["aliases"].as_array().and_then(|a| a.iter().find(|x| x["label"] == label.as_str())).ok_or_else(|| anyhow!("no alias {label}"))?;
-            let alias = PrivateAlias { label: label.clone(), signer: LocalSigner::from_json(&a["signer"])?, salt: a["salt"].as_str().unwrap_or_default().into() };
+            let alias = PrivateAlias { label: label.clone(), signer: home.signer_from_json(&a["signer"])?, salt: a["salt"].as_str().unwrap_or_default().into() };
             print(&serde_json::to_value(alias.prove(&did, a["seq"].as_u64().unwrap_or(0), aud, nonce)?)?);
         }
         Cmd::Alias(AliasCmd::Verify { file, aud }) => {

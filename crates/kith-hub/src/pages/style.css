@@ -34,3 +34,8 @@ code { font-size: 12px; word-break: break-all; color: var(--muted); }
 .hidden { display: none; }
 .mt { margin-top: 10px; }
 code.block { display: block; margin: 6px 0; }
+ul.items { list-style: none; margin: 0 0 18px; padding: 0; border: 1px solid var(--line); border-radius: 10px; }
+ul.items li { padding: 10px 12px; font-size: 14px; }
+ul.items li + li { border-top: 1px solid var(--line); }
+ul.items .value { display: block; color: var(--muted); font-size: 13px; word-break: break-all; }
+p.note { margin: 14px 0 0; font-size: 13px; }

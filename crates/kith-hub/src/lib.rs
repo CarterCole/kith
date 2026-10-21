@@ -12,6 +12,9 @@
 //! | `GET  /.well-known/jwks.json`             | token verification keys (EdDSA + RS256)         |
 //! | `GET  /oauth/authorize`                   | OIDC authorization endpoint (code + PKCE)       |
 //! | `POST /oauth/login`                       | login page posts passkey / wallet / TOTP here   |
+//! | `GET, POST /oauth/consent`                | consent page, and its Allow / Deny decision     |
+//! | `POST /oauth/register`                    | dynamic client registration (RFC 7591), if enabled |
+//! | `GET  /oauth/upstream/{id}/start`, `…/callback` | sign in through Telegram or another upstream OIDC provider (see [`upstream`]) |
 //! | `POST /oauth/token`                       | code, refresh and RFC 8693 token exchange       |
 //! | `GET  /oauth/userinfo`                    | OIDC userinfo                                   |
 //! | `GET  /oauth/logout`                      | RP-initiated logout                             |
@@ -22,30 +25,40 @@
 //! | `POST /v1/cosigner`, `/v1/cosign`         | TOTP-gated co-signer                            |
 //! | `POST /v1/enroll`, `GET /enroll/{id}`     | enroll a browser passkey as a device            |
 //! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
+//! | `/v1/admin/…`                             | sessions, consent and clients, for the operator (see [`admin`]) |
+//!
+//! State that must outlive a restart is in one SQLite file in the data directory
+//! (see [`store`]).
 
 // ApiError carries an HTTP status plus a JSON body; boxing it buys nothing here.
 #![allow(clippy::result_large_err)]
 
+pub mod admin;
 pub mod enroll;
+pub mod jwe;
 pub mod oidc;
 pub mod org;
 mod pages;
+pub mod store;
+pub mod upstream;
 
 use std::collections::{BTreeSet, HashMap};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Form, Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use kith_core::authz::{Bundle, Engine};
 use kith_core::kel::{extends, verify_log, DeviceKind, Event, KeyState};
-use kith_core::keys::{verify_sig, KeyType, LocalSigner, PublicKey, Sig, VerifyOptions};
+use kith_core::keys::{verify_sig, PublicKey, Sig, VerifyOptions};
 use kith_core::session::{self, Capability, KelResolver};
 use kith_core::token::{verify_access_token, AccessClaims, Actor, HubSigner};
 use kith_core::util::{b64u, b64u_decode, now, random_id, sha256};
@@ -54,6 +67,17 @@ use kith_core::{totp, webauthn};
 pub const TOKEN_TTL: i64 = 900;
 pub const TT_SESSION: &str = "urn:kith:params:oauth:token-type:session";
 pub const TT_DELEGATION: &str = "urn:kith:params:oauth:token-type:delegation";
+/// Wrong TOTP codes before the factor is locked, and for how long.
+pub const TOTP_MAX_FAILURES: u32 = 5;
+pub const TOTP_LOCKOUT: i64 = 15 * 60;
+
+/// At most `max` attempts per `window_secs`, per client address. `max: 0` turns the
+/// limit off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    pub max: u32,
+    pub window_secs: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct HubConfig {
@@ -66,12 +90,27 @@ pub struct HubConfig {
     pub origins: Vec<String>,
     /// Registered OIDC clients.
     pub clients: Vec<oidc::Client>,
+    /// Upstream OIDC providers accepted as a login factor (Telegram, …).
+    pub upstreams: Vec<upstream::Upstream>,
+    /// Turns on `/oauth/register` for callers that present this bearer token.
+    pub registration_token: Option<String>,
     /// Take groups and roles from this org's policy DAG (with its revocations
     /// applied) instead of `bundle_path`.
     pub policy_org: Option<String>,
     /// Where heartbeats get their beacon value, and how often they are signed.
     pub beacon: org::BeaconSource,
     pub heartbeat_secs: u64,
+    /// Attempts allowed on `/oauth/login` and `/oauth/register`, per client address.
+    pub login_limit: RateLimit,
+    pub register_limit: RateLimit,
+    /// The hub is behind exactly one reverse proxy: the client address is the last
+    /// `X-Forwarded-For` entry, which that proxy appended.
+    pub behind_proxy: bool,
+    /// Turns on the admin API for callers that present this bearer token.
+    pub admin_token: Option<String>,
+    /// Hub access tokens (`aud` = issuer) whose roles include this one may use the
+    /// admin API too. The policy bundle decides who is in the role.
+    pub admin_role: Option<String>,
 }
 
 impl HubConfig {
@@ -87,9 +126,16 @@ impl HubConfig {
             bundle_path: None,
             rp_id,
             clients: vec![],
+            upstreams: vec![],
+            registration_token: None,
             policy_org: None,
             beacon: org::BeaconSource::None,
             heartbeat_secs: 15,
+            login_limit: RateLimit { max: 20, window_secs: 60 },
+            register_limit: RateLimit { max: 20, window_secs: 3600 },
+            behind_proxy: false,
+            admin_token: None,
+            admin_role: Some("hub-admin".into()),
         }
     }
 }
@@ -101,13 +147,6 @@ pub fn host_of(url: &str) -> Option<String> {
     Some(host.trim_matches(['[', ']']).to_string())
 }
 
-struct TotpRecord {
-    secret: Vec<u8>,
-    confirmed: bool,
-    last_step: i64,
-    failures: u32,
-}
-
 pub(crate) struct Challenge {
     /// Bound identity (API login). OIDC passkey login learns it from the passkey.
     pub did: Option<String>,
@@ -116,13 +155,19 @@ pub(crate) struct Challenge {
 }
 
 /// The result of a successful authentication.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Authn {
     pub st: KeyState,
     pub dev: Option<String>,
     pub aal: u8,
     pub amr: Vec<String>,
     pub auth_time: i64,
+    /// The linked alias a federated login came through; the session ends when it
+    /// is unlinked.
+    pub alias: Option<String>,
+    /// Attributes an upstream provider asserted in this login, already filtered by
+    /// that provider's `attributes` allowlist. The directory overrides them.
+    pub attrs: Map<String, Value>,
 }
 
 pub struct Hub {
@@ -132,13 +177,16 @@ pub struct Hub {
     pub(crate) pairwise_secret: Vec<u8>,
     kels: RwLock<HashMap<String, Vec<Event>>>,
     engine: RwLock<(Option<std::time::SystemTime>, Arc<Engine>)>,
+    /// Login challenges live five minutes; a page whose challenge was lost to a
+    /// restart is handed a fresh one and retries.
     pub(crate) challenges: Mutex<HashMap<String, Challenge>>,
-    seen_jti: Mutex<HashMap<String, i64>>,
-    totp: Mutex<HashMap<String, TotpRecord>>,
-    cosigners: Mutex<HashMap<String, LocalSigner>>,
-    pub(crate) oidc: Mutex<oidc::OidcState>,
+    /// Everything that must survive a restart.
+    pub store: store::Store,
     pub(crate) enrollments: Mutex<HashMap<String, enroll::Enrollment>>,
+    pub(crate) upstream: Mutex<upstream::UpstreamState>,
+    pub(crate) http: reqwest::Client,
     pub orgs: org::Orgs,
+    pub started: i64,
 }
 
 #[derive(Debug)]
@@ -220,6 +268,10 @@ pub enum Factor {
         signature: String,
     },
     Totp { code: String },
+    /// An upstream provider vouched for the account behind `alias`. Only the hub's
+    /// own callback creates this; it cannot be submitted.
+    #[serde(skip)]
+    Federated { provider: String, alias: String },
 }
 
 impl Hub {
@@ -260,21 +312,17 @@ impl Hub {
                 kels.insert(st.did, events);
             }
         }
-        let mut totp_map = HashMap::new();
-        if let Some(Value::Object(m)) = read_json(&cfg.data_dir.join("totp.json")) {
-            for (did, r) in m {
-                let secret = b64u_decode(r["secret"].as_str().unwrap_or_default())?;
-                totp_map.insert(did, TotpRecord { secret, confirmed: r["confirmed"].as_bool().unwrap_or(false), last_step: r["last_step"].as_i64().unwrap_or(0), failures: 0 });
-            }
-        }
-        let mut cosigners = HashMap::new();
-        if let Some(Value::Object(m)) = read_json(&cfg.data_dir.join("cosigners.json")) {
-            for (did, s) in m {
-                cosigners.insert(did, LocalSigner::from_json(&s)?);
-            }
-        }
+        let store = store::Store::open(&cfg.data_dir.join(store::FILE))?;
+        store.import_json_files(&cfg.data_dir)?;
+        store.sweep(now())?;
         for c in &cfg.clients {
             c.validate()?;
+        }
+        for (i, u) in cfg.upstreams.iter().enumerate() {
+            u.validate()?;
+            if cfg.upstreams[..i].iter().any(|o| o.id == u.id) {
+                anyhow::bail!("duplicate upstream id {}", u.id);
+            }
         }
         let cfg_dir = cfg.data_dir.clone();
         let hub = Hub {
@@ -285,12 +333,12 @@ impl Hub {
             kels: RwLock::new(kels),
             engine: RwLock::new((None, Arc::new(Engine::new(Bundle { version: 1, ..Default::default() })?))),
             challenges: Mutex::new(HashMap::new()),
-            seen_jti: Mutex::new(HashMap::new()),
-            totp: Mutex::new(totp_map),
-            cosigners: Mutex::new(cosigners),
-            oidc: Mutex::new(oidc::OidcState::default()),
+            store,
             enrollments: Mutex::new(HashMap::new()),
+            upstream: Mutex::new(upstream::UpstreamState::default()),
+            http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?,
             orgs: org::Orgs::open(&cfg_dir)?,
+            started: now(),
         };
         hub.engine()?;
         Ok(Arc::new(hub))
@@ -314,14 +362,6 @@ impl Hub {
         let mut keys = self.signer.jwks();
         keys["keys"].as_array_mut().expect("keys").push(self.rsa.jwk());
         keys
-    }
-
-    fn persist_totp(&self, map: &HashMap<String, TotpRecord>) -> anyhow::Result<()> {
-        let v: Map<String, Value> = map
-            .iter()
-            .map(|(d, r)| (d.clone(), json!({"secret": b64u(&r.secret), "confirmed": r.confirmed, "last_step": r.last_step})))
-            .collect();
-        write_json(&self.cfg.data_dir.join("totp.json"), &Value::Object(v))
     }
 
     pub fn put_kel(&self, did: &str, events: Vec<Event>) -> ApiResult<KeyState> {
@@ -351,38 +391,57 @@ impl Hub {
     }
 
     fn check_jti(&self, jti: &str, exp: i64) -> ApiResult<()> {
-        let mut seen = self.seen_jti.lock().unwrap();
-        let t = now();
-        seen.retain(|_, e| *e + session::LEEWAY > t);
-        if seen.insert(jti.into(), exp).is_some() {
+        if !self.store.first_use(jti, exp + session::LEEWAY, now())? {
             return Err(ApiError::unauthorized("token replayed"));
         }
         Ok(())
     }
 
-    /// Check a TOTP code for `did`, with replay protection and a failure lockout.
+    /// Check a TOTP code for `did`, with replay protection and a failure lockout:
+    /// after [`TOTP_MAX_FAILURES`] wrong codes the factor is refused for
+    /// [`TOTP_LOCKOUT`] seconds. The lockout survives a restart.
     fn check_totp(&self, did: &str, code: &str, require_confirmed: bool) -> ApiResult<()> {
-        let mut map = self.totp.lock().unwrap();
-        let rec = map.get_mut(did).ok_or_else(|| ApiError::unauthorized("no TOTP enrolled"))?;
+        let mut rec = self.store.totp(did)?.ok_or_else(|| ApiError::unauthorized("no TOTP enrolled"))?;
         if require_confirmed && !rec.confirmed {
             return Err(ApiError::unauthorized("TOTP not confirmed"));
         }
-        if rec.failures >= 5 {
-            return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "locked".into(), "too many TOTP failures".into(), None));
+        let t = now();
+        if rec.locked_until > t {
+            return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "locked".into(), "too many TOTP failures".into(), Some(json!({"retry_after": rec.locked_until - t}))));
         }
-        match totp::verify(&rec.secret, code, now(), 1) {
+        match totp::verify(&rec.secret, code, t, 1) {
             Some(step) if step > rec.last_step => {
                 rec.last_step = step;
                 rec.failures = 0;
                 rec.confirmed = true;
-                self.persist_totp(&map)?;
+                self.store.put_totp(did, &rec)?;
                 Ok(())
             }
             Some(_) => Err(ApiError::unauthorized("TOTP code already used")),
             None => {
                 rec.failures += 1;
+                if rec.failures >= TOTP_MAX_FAILURES {
+                    rec.failures = 0;
+                    rec.locked_until = t + TOTP_LOCKOUT;
+                }
+                self.store.put_totp(did, &rec)?;
                 Err(ApiError::unauthorized("invalid TOTP code"))
             }
+        }
+    }
+
+    /// Count an attempt at `what` from `ip`; `Err` is the `429` to return when it
+    /// is one too many.
+    pub(crate) fn rate_limit(&self, what: &str, ip: &ClientIp, limit: RateLimit) -> Result<(), Response> {
+        match self.store.hit(&format!("{what}|{}", ip.0), limit, now()) {
+            Ok(None) => Ok(()),
+            Ok(Some(retry)) => {
+                let e = ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited".into(), format!("too many {what} attempts from your address; try again in {retry}s"), Some(json!({"retry_after": retry})));
+                let mut r = e.into_response();
+                r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_str(&retry.to_string()).expect("retry-after"));
+                Err(r)
+            }
+            Err(e) => Err(ApiError::from(e).into_response()),
         }
     }
 
@@ -412,6 +471,7 @@ impl Hub {
         let mut amr = Vec::<String>::new();
         let mut kinds = BTreeSet::new();
         let mut dev = None;
+        let mut alias = None;
         for f in factors {
             match f {
                 Factor::Signature { sig } => {
@@ -474,6 +534,16 @@ impl Hub {
                     amr.push("otp".into());
                     kinds.insert("otp");
                 }
+                Factor::Federated { alias: linked, .. } => {
+                    if !st.aliases.contains(linked) {
+                        return Err(ApiError::unauthorized("that account is not linked to this identity"));
+                    }
+                    // The hub can't see how the provider authenticated the user.
+                    aal = aal.max(1);
+                    amr.push("fed".into());
+                    alias = Some(linked.clone());
+                    kinds.insert("federated");
+                }
             }
         }
         if aal == 0 {
@@ -483,7 +553,7 @@ impl Hub {
             aal = aal.max(2);
             amr.push("mfa".into());
         }
-        Ok(Authn { st, dev, aal, amr, auth_time: now() })
+        Ok(Authn { st, dev, aal, amr, auth_time: now(), alias, attrs: Map::new() })
     }
 
     /// Access token claims for an authenticated principal.
@@ -491,14 +561,24 @@ impl Hub {
         let mut kel_attrs = Map::new();
         kel_attrs.insert("aliases".into(), json!(a.st.aliases));
         kel_attrs.insert("aal".into(), json!(a.aal));
-        let (m, attrs) = match self.org_memberships(&a.st.did, &kel_attrs)? {
-            Some(found) => found,
-            None => {
-                let engine = self.engine()?;
-                let attrs = engine.attributes(&a.st.did, &kel_attrs);
-                (engine.memberships(&a.st.did, &attrs)?, attrs)
-            }
+        let resolve = |kel_attrs: &Map<String, Value>| -> ApiResult<_> {
+            Ok(match self.org_memberships(&a.st.did, kel_attrs)? {
+                Some(found) => found,
+                None => {
+                    let engine = self.engine()?;
+                    let attrs = engine.attributes(&a.st.did, kel_attrs);
+                    (engine.memberships(&a.st.did, &attrs)?, attrs)
+                }
+            })
         };
+        let (mut m, mut attrs) = resolve(&kel_attrs)?;
+        // Upstream attributes only fill gaps: they never replace what the directory
+        // or the KEL says. Group rules see them, so memberships are worked out again.
+        let extra: Vec<_> = a.attrs.iter().filter(|(k, _)| !attrs.contains_key(*k)).collect();
+        if !extra.is_empty() {
+            kel_attrs.extend(extra.into_iter().map(|(k, v)| (k.clone(), v.clone())));
+            (m, attrs) = resolve(&kel_attrs)?;
+        }
         let iat = now();
         let (act, cap) = match delegation {
             Some((actor, caps)) => (Some(Actor { sub: actor, act: None }), Some(caps)),
@@ -561,6 +641,26 @@ impl KelResolver for Hub {
     fn resolve(&self, did: &str) -> kith_core::Result<KeyState> {
         let events = self.get_kel(did).ok_or_else(|| kith_core::Error::NotFound(format!("no KEL for {did}")))?;
         verify_log(&events, &VerifyOptions::default())
+    }
+}
+
+/// The address a request came from, for rate limits: the peer, or behind a trusted
+/// proxy ([`HubConfig::behind_proxy`]) the entry that proxy appended to
+/// `X-Forwarded-For`. Earlier entries are whatever the client claimed.
+pub struct ClientIp(pub String);
+
+impl FromRequestParts<Arc<Hub>> for ClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, h: &Arc<Hub>) -> Result<Self, Self::Rejection> {
+        if h.cfg.behind_proxy {
+            let forwarded = parts.headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).rfind(|s| !s.is_empty());
+            if let Some(ip) = forwarded {
+                return Ok(ClientIp(ip.to_string()));
+            }
+        }
+        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_string());
+        Ok(ClientIp(peer.unwrap_or_else(|| "local".into())))
     }
 }
 
@@ -665,6 +765,8 @@ fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
                     _ => "swk".to_string(),
                 }],
                 auth_time: t,
+                alias: None,
+                attrs: Map::new(),
             };
             if let Some(code) = &req.totp {
                 h.check_totp(&v.did, code, true)?;
@@ -684,7 +786,7 @@ fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
             }
             let st = h.resolve(&d.iss)?;
             // The delegate's assurance, not the delegator's, describes this session.
-            let a = Authn { st, dev: None, aal: actor.aal, amr: vec!["delegated".into()], auth_time: t };
+            let a = Authn { st, dev: None, aal: actor.aal, amr: vec!["delegated".into()], auth_time: t, alias: None, attrs: Map::new() };
             h.issue(&a, &audience, Some((actor.did.clone(), d.cap.clone())))
         }
         other => Err(ApiError::bad("invalid_request", format!("unsupported subject_token_type {other}"))),
@@ -693,15 +795,13 @@ fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
 
 async fn totp_enroll(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let c = h.bearer(&headers)?;
-    let mut map = h.totp.lock().unwrap();
-    if map.get(&c.sub).is_some_and(|r| r.confirmed) {
+    if h.store.totp(&c.sub)?.is_some_and(|r| r.confirmed) {
         return Err(ApiError(StatusCode::CONFLICT, "exists".into(), "TOTP already enrolled".into(), None));
     }
     let secret = totp::generate_secret();
     let uri = totp::otpauth_uri(&secret, &h.cfg.rp_id, &c.sub);
     let b32 = totp::to_base32(&secret);
-    map.insert(c.sub.clone(), TotpRecord { secret, confirmed: false, last_step: 0, failures: 0 });
-    h.persist_totp(&map)?;
+    h.store.put_totp(&c.sub, &store::TotpRecord { secret, confirmed: false, last_step: 0, failures: 0, locked_until: 0 })?;
     Ok(Json(json!({"secret": b32, "otpauth_uri": uri})))
 }
 
@@ -721,10 +821,7 @@ async fn totp_confirm(State(h): State<Arc<Hub>>, headers: HeaderMap, Json(req): 
 /// cosigner]` – and TOTP becomes a real signer in your multisig.
 async fn cosigner(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let c = h.bearer(&headers)?;
-    let mut map = h.cosigners.lock().unwrap();
-    let s = map.entry(c.sub.clone()).or_insert_with(|| LocalSigner::generate(KeyType::Ed25519)).clone();
-    let v: Map<String, Value> = map.iter().map(|(d, s)| (d.clone(), s.to_json())).collect();
-    write_json(&h.cfg.data_dir.join("cosigners.json"), &Value::Object(v))?;
+    let s = h.store.cosigner_or_create(&c.sub)?;
     Ok(Json(json!({"signer": s.id, "gated_by": "totp"})))
 }
 
@@ -740,7 +837,7 @@ async fn cosign(State(h): State<Arc<Hub>>, Json(req): Json<CosignReq>) -> ApiRes
     if req.event.did.as_deref() != Some(st.did.as_str()) || req.event.seq != st.seq + 1 || req.event.prev.as_deref() != Some(st.digest.as_str()) {
         return Err(ApiError::bad("invalid_request", "event must be the next event of this identity's KEL"));
     }
-    let signer = h.cosigners.lock().unwrap().get(&st.did).cloned().ok_or_else(|| ApiError::bad("invalid_request", "no co-signer for this identity"))?;
+    let signer = h.store.cosigner(&st.did)?.ok_or_else(|| ApiError::bad("invalid_request", "no co-signer for this identity"))?;
     h.check_totp(&st.did, &req.code, true)?;
     let sig = signer.sign(&req.event.signing_message()?)?;
     Ok(Json(json!(sig)))
@@ -753,6 +850,10 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/.well-known/jwks.json", get(jwks))
         .route("/oauth/authorize", get(oidc::authorize))
         .route("/oauth/login", post(oidc::login))
+        .route("/oauth/consent", get(oidc::consent_page).post(oidc::consent))
+        .route("/oauth/register", post(oidc::register))
+        .route("/oauth/upstream/{id}/start", get(upstream::start))
+        .route("/oauth/upstream/{id}/callback", get(upstream::callback))
         .route("/oauth/token", post(token))
         .route("/oauth/userinfo", get(oidc::userinfo).post(oidc::userinfo))
         .route("/oauth/logout", get(oidc::logout))
@@ -781,6 +882,14 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/revocations/{org}", get(org::get_revocations).post(org::post_revocation))
         .route("/v1/revocations/{org}/heartbeat", get(org::get_heartbeat))
         .route("/v1/revocations/{org}/events", get(org::events))
+        .route("/v1/admin/stats", get(admin::stats))
+        .route("/v1/admin/sessions", get(admin::sessions))
+        .route("/v1/admin/sessions/{sid}", delete(admin::end_session))
+        .route("/v1/admin/identities/{did}/sessions", delete(admin::end_sessions_of))
+        .route("/v1/admin/clients", get(admin::clients))
+        .route("/v1/admin/clients/{id}", delete(admin::delete_client))
+        .route("/v1/admin/grants/{did}", get(admin::grants))
+        .route("/v1/admin/grants/{did}/{client_id}", delete(admin::revoke_grant))
         .with_state(hub)
 }
 
@@ -788,7 +897,25 @@ pub async fn serve(cfg: HubConfig, addr: &str) -> anyhow::Result<()> {
     let hub = Hub::open(cfg)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tokio::spawn(org::heartbeat_loop(hub.clone()));
-    eprintln!("kith hub listening on http://{addr} (issuer {}, rp id {}, {} OIDC clients)", hub.cfg.issuer, hub.cfg.rp_id, hub.cfg.clients.len());
-    axum::serve(listener, router(hub)).await?;
+    tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                if let Err(e) = hub.store.sweep(now()) {
+                    eprintln!("store sweep failed: {e}");
+                }
+            }
+        }
+    });
+    eprintln!(
+        "kith hub listening on http://{addr} (issuer {}, rp id {}, {} OIDC clients, {} upstream providers, state in {})",
+        hub.cfg.issuer,
+        hub.cfg.rp_id,
+        hub.cfg.clients.len(),
+        hub.cfg.upstreams.len(),
+        hub.cfg.data_dir.join(store::FILE).display()
+    );
+    axum::serve(listener, router(hub).into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }

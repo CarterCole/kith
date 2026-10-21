@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 
-use crate::keys::{PublicKey, SecretKey};
+use crate::keys::{KeyType, PublicKey, SecretKey};
 use crate::util::{b64u, b64u_decode, sha256};
 use crate::webauthn::{self, AssertionCheck, WebAuthnSigData};
 use crate::{Error, Result};
@@ -19,10 +19,17 @@ pub struct Jws {
     pub signature: Vec<u8>,
 }
 
-pub fn sign(mut header: Value, claims: &Value, key: &SecretKey) -> Result<String> {
-    header["alg"] = json!(key.kty().jws_alg());
+pub fn sign(header: Value, claims: &Value, key: &SecretKey) -> Result<String> {
+    sign_with(header, claims, key.kty(), &|input| Ok(key.sign(input)))
+}
+
+/// Sign with a key held outside this process (Secure Enclave, TPM, PKCS#11, an
+/// agent). `sign` must return the raw signature a `kty` key produces: 64 bytes,
+/// Ed25519 or ECDSA `r||s`.
+pub fn sign_with(mut header: Value, claims: &Value, kty: KeyType, sign: &dyn Fn(&[u8]) -> Result<Vec<u8>>) -> Result<String> {
+    header["alg"] = json!(kty.jws_alg());
     let input = format!("{}.{}", b64u(serde_json::to_vec(&header)?), b64u(serde_json::to_vec(claims)?));
-    let sig = key.sign(input.as_bytes());
+    let sig = sign(input.as_bytes())?;
     Ok(format!("{input}.{}", b64u(sig)))
 }
 

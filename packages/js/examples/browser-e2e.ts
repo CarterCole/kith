@@ -49,6 +49,12 @@ try {
   assert.ok(page.url().startsWith(`${ISSUER}/oauth/authorize`));
   await shot(page, "2-login");
   await page.click("#passkey");
+  // First time for this app: the hub asks before sharing anything.
+  await page.waitForSelector("#allow");
+  assert.ok(page.url().startsWith(`${ISSUER}/oauth/consent`));
+  assert.match(await page.textContent("#items") ?? "", /ada@acme\.test/);
+  await shot(page, "2b-consent");
+  await page.click("#allow");
   await page.waitForURL(`${RP}/`);
   const me = await (await page.request.get(`${RP}/me.json`)).json();
   assert.match(me.claims.sub, /^did:kith:/);
@@ -66,6 +72,7 @@ try {
   await page.goto(`${RP}/login`);
   await page.waitForURL(`${RP}/`);
   assert.ok(!(await page.$("#passkey")), "no login page on SSO");
+  assert.ok(seen.every((u) => !u.includes("/oauth/consent")), "consent is remembered");
   assert.ok(seen.every((u) => !u.startsWith(ISSUER) || !u.includes("/oauth/login")));
   step("SSO: second sign-in went straight through the hub");
 

@@ -68,6 +68,9 @@ The root block:
 }
 ```
 
+§9.6 (draft) adds two optional members, `attributes` and `schemas`, and an `audience`
+query (§8.5).
+
 A **policy block** holds one Cedar policy:
 
 ```json

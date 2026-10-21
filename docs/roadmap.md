@@ -32,6 +32,14 @@
   WebCrypto authenticator in tests.
 - **Vault.** Skip-ratchet group keyrings with join-later, skip-ahead, and re-key, sealed
   to devices' X25519 keys from the KEL.
+- **Keys at rest in the CLI** ([spec §1.3.3](../spec/01-identity.md)). On macOS every
+  private key is a login-keychain item keyed by DID and key id, and this device's key
+  is a P-256 key in the Secure Enclave that signs inside the chip, enrolled as a
+  `hardware` device. `kith init --keystore keychain|file`, `kith keys list`, `kith keys
+  migrate` (file → keychain), `kith keys forget`. Linux keeps the plaintext file (0600).
+  Checked by `scripts/cli-flows.sh` (Ada's whole flow runs from the keychain and the
+  Enclave; Bob migrates mid-run) and Rust tests that round-trip a key through the
+  keychain and through the Enclave's handle.
 - **Policy DAG, revocations, freshness** ([spec §8](../spec/08-policy-dag.md)).
   - Bundles become DAG-JSON blocks. The CIDs match `@ipld/dag-json` + `multiformats`.
   - A slice (one action, or one principal) decides exactly like the full bundle for
@@ -50,21 +58,49 @@
   - SSO cookie, `prompt`, `max_age`, `acr_values`.
   - RS256/EdDSA ID tokens, userinfo, rotating refresh tokens that die with the device,
     pairwise subjects, logout.
+  - A consent page with remembered grants, `prompt=consent`.
+  - Dynamic client registration behind a registration token.
+  - Back- and front-channel logout notices.
+  - ID tokens encrypted to the client (`RSA-OAEP-256`, `ECDH-ES`; checked against `jose`).
   - Browser passkey enrollment brokered by the hub (`kith passkey enroll`).
+  - Upstream OIDC providers as a login factor, starting with Telegram Login
+    ([spec §7.8](../spec/07-oidc.md)). Tested against a stand-in provider, not yet
+    against Telegram itself.
+  - Upstream attributes from the ID token and UserInfo, behind a per-provider
+    allowlist.
   - Verified in headless Chrome with a virtual authenticator against `openid-client`.
+- **Hub state and operations** ([spec §7.9–7.10](../spec/07-oidc.md)).
+  - One SQLite file holds sessions, codes, refresh tokens, pending sign-in requests,
+    consent, registered clients, TOTP enrollments and lockouts, co-signer keys, the
+    replay cache and rate-limit counters. A restart signs nobody out. Bearer secrets
+    are stored hashed.
+  - Rate limits on `/oauth/login` and `/oauth/register` per client address, with
+    `--behind-proxy` for the address a reverse proxy appends.
+  - An admin API (admin token, or any identity in the `hub-admin` role): list and end
+    sessions, sign an identity out everywhere, list and delete registered clients,
+    list and withdraw consent.
 
 ## Known gaps in the reference code (not production ready)
 
-- **Keys at rest.** The CLI stores keys in plaintext JSON (mode 0600). Next steps:
-  - OS keychain;
-  - Secure Enclave via `security-framework`;
-  - TPM;
+- **Keys at rest.** The macOS keychain and the Secure Enclave are done
+  ([spec §1.3.3](../spec/01-identity.md)). Still to do:
+  - Linux: a Secret Service (libsecret) backend, and a TPM for the device key. Today
+    `--keystore keychain` there warns and writes the plaintext file;
   - YubiKey PIV / FIDO;
-  - hardware wallets for manage keys.
-- **Hub durability.** Challenges, replay caches, TOTP lockouts and all OIDC state
-  (SSO sessions, codes, refresh tokens) live in memory, so a restart signs everyone out. There
-  is no TLS, no rate limiting beyond TOTP, no audit log, and no admin API. The bundle is
-  a hot-reloaded file.
+  - hardware wallets for manage keys;
+  - an Enclave key for a device enrolled later: `kith device add` makes portable
+    software keys, and `kith keys migrate` cannot move an existing key into the chip
+    (re-enroll the device instead);
+  - `kith init --touch-id` (a Touch ID prompt per signature, enrolled at AAL3) is
+    implemented but not exercised by the scripts, which cannot answer the prompt;
+  - keychain items are tied to the binary that created them, so a rebuilt or upgraded
+    `kith` gets one macOS prompt per item ("Always Allow" ends it). A signed binary with
+    a keychain access group would avoid that.
+- **Hub operations.** The hub speaks plain HTTP (terminate TLS in front of it). There
+  is no audit log, and the admin API only lists and deletes: no editing of clients,
+  no RFC 7592. Login challenges and passkey enrollments in progress are still in
+  memory (the page retries after a restart). The bundle is a hot-reloaded file, and
+  there is no rate limit on anything but login, registration and TOTP.
 - **Audiences.** The hub mints tokens for any `audience`. It needs a registry of
   resource servers and per-audience claim release (privacy, and smaller tokens).
 - **Signers still to do:**
@@ -82,9 +118,11 @@
     RSA code is a start.
   - Key purposes (`use`, `alg`) on device keys, and `keyAgreement` in the DID document.
     Specified as a draft ([spec §1.3.2](../spec/01-identity.md)), not implemented.
-- **OIDC gaps.** No consent screen, dynamic registration, PAR, back-channel logout, or
-  rate limiting on `/oauth/login`. The wallet button on the login page has not been
-  tested in a browser (the server path is tested). The Grafana config in §7.8 has not
+- **OIDC gaps.** No PAR, no user-facing page to withdraw consent (the admin API
+  can), and no open registration. Logout notices are best effort and only sent on
+  RP-initiated logout or from the admin API. The consent page is tested in Chrome;
+  the front-channel sign-out page is tested in process only. The wallet button on the login page has not been
+  tested in a browser (the server path is tested). The Grafana config in §7.9 has not
   been tried against a real Grafana.
 - **Co-signer safety.** A time delay plus device notification before co-signing
   `rotate`, as did:plc does with its 72-hour window.
@@ -93,7 +131,8 @@
   - Multi-hop delegation (UCAN 1.0 or Biscuit).
   - Session and access token revocation before expiry exists as `token {jti}`
     revocations (§8). The GraphQL middleware doesn't consult a revocation follower yet.
-  - Cedar schemas, for validation and policy analysis.
+  - Cedar schemas and audience namespaces, for validation and policy analysis.
+    Specified as a draft ([spec §9](../spec/09-schemas.md)), not implemented.
   - Partial-evaluation pushdown of row-level filters into SQL.
   - The vault uses an HPKE-shaped construction; move to RFC 9180 HPKE.
 
@@ -140,8 +179,8 @@
 | # | Milestone | Why |
 |---|-----------|-----|
 | ~~1~~ | ~~Hub as an OIDC provider and a passkey login page~~ | Done ([spec §7](../spec/07-oidc.md)) |
-| 1b | Durable hub state (SQLite): sessions, refresh tokens, clients; an admin API; rate limits | A hub restart shouldn't sign everyone out |
-| 2 | Secure key storage in the CLI (keychain and Secure Enclave) plus a mobile wallet app shell | Real devices, not demo keys |
+| ~~1b~~ | ~~Durable hub state (SQLite): sessions, refresh tokens, clients; an admin API; rate limits~~ | Done ([spec §7.9–7.10](../spec/07-oidc.md)) |
+| ~~2~~ | ~~Secure key storage in the CLI (keychain and Secure Enclave)~~ plus a mobile wallet app shell | Key storage done ([spec §1.3.3](../spec/01-identity.md)); the wallet app shell remains |
 | 3 | EIP-1271 ChainVerifier and a Safe/Coinbase Smart Wallet manage policy | "A signer could be an Ethereum contract" |
 | 4 | Digital Credentials API attribute source, then Self/ZKPassport proofs | Government-ID-backed attributes ([passports](passports.md)) |
 | 5 | Cedar partial evaluation to SQL/Prisma filters; DataLoader-friendly row checks | "Lock down the query" at scale |

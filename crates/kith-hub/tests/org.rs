@@ -103,7 +103,7 @@ async fn publish_slice_issue_revoke() {
     assert_eq!(slice.policy_ids(), vec!["read-invoices"]);
 
     // The hub issues tokens from the DAG.
-    let authn = Authn { st: ada.clone(), dev: Some("laptop".into()), aal: 1, amr: vec!["hwk".into()], auth_time: now() };
+    let authn = Authn { st: ada.clone(), dev: Some("laptop".into()), aal: 1, amr: vec!["hwk".into()], auth_time: now(), alias: None, attrs: Default::default() };
     let claims = hub.access_claims(&authn, "api://invoices", None).unwrap();
     assert_eq!(claims.groups, vec!["finance", "staff"]);
     assert_eq!(claims.roles, vec!["billing-reader"]);

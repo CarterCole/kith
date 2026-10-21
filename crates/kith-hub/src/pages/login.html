@@ -13,9 +13,13 @@
   <div class="stack">
     <button id="passkey" class="primary" type="button">Sign in with a passkey</button>
   </div>
+  <div id="upstreams" class="stack mt"></div>
   <div id="otp-box" class="hidden">
     <label for="otp">One-time code from your authenticator app</label>
     <input id="otp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" maxlength="8">
+  </div>
+  <div class="stack mt">
+    <button id="continue" class="primary hidden" type="button">Continue</button>
   </div>
   <div id="status" class="status" role="status" aria-live="polite"></div>
   <details id="more">
@@ -47,14 +51,45 @@ if (!webauthnSupported()) {
 $("show-otp").onclick = () => { $("otp-box").classList.remove("hidden"); $("otp").focus(); };
 
 function busy(on) {
-  for (const id of ["passkey", "wallet"]) $(id).disabled = on;
+  for (const id of ["passkey", "wallet", "continue"]) $(id).disabled = on;
+  for (const b of $("upstreams").children) b.disabled = on;
 }
 
-async function submit(did, factors) {
+// Upstream providers (Telegram, …): leave for the provider, come back signed in.
+for (const u of D.upstreams || []) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "secondary";
+  b.textContent = "Sign in with " + u.name;
+  b.onclick = () => {
+    const did = $("did").value.trim();
+    const hint = did.startsWith("did:kith:") ? "&did=" + encodeURIComponent(did) : "";
+    busy(true);
+    location.assign("/oauth/upstream/" + encodeURIComponent(u.id) + "/start?request_id=" + encodeURIComponent(D.request_id) + hint);
+  };
+  $("upstreams").append(b);
+}
+
+// Back from a provider, but this app needs more than it can give: add a one-time code.
+let federated = D.federated || null;
+if (federated) {
+  $("otp-box").classList.remove("hidden");
+  $("continue").classList.remove("hidden");
+  $("passkey").className = "secondary";
+  if (D.min_aal < 3) status("Signed in with " + federated.provider + ". Enter a one-time code to finish, or use a passkey instead.");
+  $("otp").focus();
+}
+$("continue").onclick = async () => {
+  if (!$("otp").value.trim()) { status("Enter a one-time code first.", "error"); $("otp").focus(); return; }
+  busy(true);
+  try { await submit(federated.did, [], federated.token); } finally { busy(false); }
+};
+
+async function submit(did, factors, federatedToken) {
   const code = $("otp").value.trim();
   if (code) factors.push({ type: "totp", code });
   status("Checking…");
-  const r = await postJSON("/oauth/login", { request_id: D.request_id, challenge_id: challenge.id, did, factors });
+  const r = await postJSON("/oauth/login", { request_id: D.request_id, challenge_id: challenge.id, did, factors, federated: federatedToken });
   if (r.ok) {
     try { localStorage.setItem("kith_did", did); } catch {}
     status("Signed in. Returning to " + D.client_name + "…", "ok");

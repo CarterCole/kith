@@ -102,6 +102,9 @@ pub enum DeviceSigner<'a> {
     Key(&'a SecretKey),
     /// A passkey: signs through WebAuthn (software authenticator here).
     Passkey { key: &'a SecretKey, rp_id: &'a str, origin: &'a str },
+    /// A key that never enters this process (Secure Enclave, TPM, PKCS#11, an
+    /// agent): `sign` returns the raw signature a `kty` key produces.
+    External { kty: KeyType, sign: &'a dyn Fn(&[u8]) -> Result<Vec<u8>> },
 }
 
 /// A session key certified by a device.
@@ -130,6 +133,7 @@ impl SessionKey {
         let grant = match signer {
             DeviceSigner::Key(k) => jws::sign(header, &claims, k)?,
             DeviceSigner::Passkey { key, rp_id, origin } => jws::sign_webauthn(header, &claims, key, rp_id, origin)?,
+            DeviceSigner::External { kty, sign } => jws::sign_with(header, &claims, kty, sign)?,
         };
         Ok(SessionKey { did: did.into(), secret, grant })
     }

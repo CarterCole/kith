@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Share with this app? · Kith</title>
+<style nonce="{{NONCE}}">{{STYLE}}</style>
+</head>
+<body>
+<main>
+  <div class="brand">Kith</div>
+  <h1><span id="client"></span> wants to know who you are</h1>
+  <p>If you allow it, <span id="host"></span> will receive:</p>
+  <ul id="items" class="items"></ul>
+  <div class="stack">
+    <button id="allow" class="primary" type="button">Allow</button>
+    <button id="deny" class="secondary" type="button">Deny</button>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+  <p class="note">Signed in as <code id="did"></code>. Kith remembers this choice for this app.</p>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+$("client").textContent = D.client_name;
+$("host").textContent = D.redirect_host || D.client_name;
+$("did").textContent = D.did;
+
+function item(label, value) {
+  const li = document.createElement("li");
+  li.append(label);
+  if (value !== undefined && value !== "") {
+    const v = document.createElement("span");
+    v.className = "value";
+    v.textContent = value;
+    li.append(v);
+  }
+  $("items").append(li);
+}
+const C = D.claims || {};
+const list = (v) => (Array.isArray(v) && v.length ? v.join(", ") : "none");
+const KNOWN = {
+  openid: () => (D.pairwise ? item("An identifier made only for this app") : item("Your Kith identity", D.did)),
+  profile: () => item("Your name", C.name || C.preferred_username || "not set"),
+  email: () => item("Your email address", C.email || "not set"),
+  groups: () => { item("Your groups", list(C.groups)); item("Your roles", list(C.roles)); },
+  offline_access: () => item("Access while you are away", "Ends when the device or account you signed in with is revoked"),
+};
+for (const s of D.scopes) (KNOWN[s] || (() => item("Scope", s)))();
+
+async function decide(allow) {
+  for (const id of ["allow", "deny"]) $(id).disabled = true;
+  const r = await postJSON("/oauth/consent", { request_id: D.request_id, allow });
+  if (r.ok) {
+    status("Returning to " + D.client_name + "…", "ok");
+    location.assign(r.body.redirect);
+    return;
+  }
+  status(r.body.error_description || "That didn't work. Go back to the app and try again.", "error");
+}
+$("allow").onclick = () => decide(true);
+$("deny").onclick = () => decide(false);
+</script>
+</body>
+</html>

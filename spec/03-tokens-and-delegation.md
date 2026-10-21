@@ -56,7 +56,8 @@ header { "typ": "kith-session+jwt" | "kith-delegation+jwt", "alg": "EdDSA", "kit
 7. The effective aal is `min(grant.aal, device.aal)`.
 
 **Capabilities** have the form `{ "action": "Query.invoices" | "Invoice.*" | "*",
-"resource": "Invoice::\"inv_1\"" | "*" }`. The `*` suffix is a prefix glob.
+"resource": "Invoice::\"inv_1\"" | "*" }`. The `*` suffix is a prefix glob. With a
+schema, capabilities are matched against namespaced names (§9.7, draft).
 
 Delegation **only attenuates**. A delegated request is allowed only if two things are
 true:

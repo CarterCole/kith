@@ -11,6 +11,7 @@
     "client_secret": "change-me",
     "name": "Grafana",
     "redirect_uris": ["http://localhost:3001/login/generic_oauth"],
-    "subject_type": "public"
+    "subject_type": "public",
+    "consent": "implied"
   }
 ]

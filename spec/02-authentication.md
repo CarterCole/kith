@@ -15,7 +15,8 @@ The hub turns that evidence into an access token that states how strong it was
 | Bitcoin wallet | asymmetric | signer via BIP-322 (planned) | yes |
 | SSH key / ssh-agent | asymmetric | device key (planned: `ssh-keygen -Y sign` format) | yes |
 | TOTP | **shared secret** | hub-side factor, optionally a co-signer (§2.6) | **no, only the secret holder** |
-| Upstream OIDC / SAML (Google, Okta, GitHub) | federated | hub-side factor, plus an attribute source (planned) | only via the upstream IdP |
+| Upstream OIDC (Telegram; any code + PKCE provider) | federated | hub-side factor, bound by an `alias_link` (§2.7) | only via the upstream IdP |
+| Upstream SAML | federated | planned | only via the upstream IdP |
 | Email / SMS link | shared channel | hub-side factor (planned, AAL1 at most) | no |
 | Passport / mDL | credential | **attributes**, not login (see [passports](../docs/passports.md)) | yes (issuer signature) |
 
@@ -66,7 +67,7 @@ Challenges are single-use and expire after 5 minutes. The `factors` array accept
 |------|--------|--------|
 | `signature` | `sig` (§1.3) | `sig.signer` is a device or manage signer of the identity, and the signature is over `message` |
 | `webauthn` | `device_id`, `authenticator_data`, `client_data_json`, `signature` | §2.4 with an origin allowlist and RP id |
-| `totp` | `code` | RFC 6238 ±1 step, no step reuse, lockout after 5 failures |
+| `totp` | `code` | RFC 6238 ±1 step, no step reuse; 5 wrong codes lock the factor for 15 minutes (`429 locked`, with `retry_after`), and the lockout survives a hub restart |
 
 ## 2.4 Passkeys
 
@@ -103,6 +104,7 @@ Enrollment from a browser:
 | passkey assertion without UV | at most 1 | `hwk` |
 | wallet signature | 2 | `wallet` |
 | TOTP | 1 | `otp` |
+| upstream OIDC login (Telegram, …) | 1 | `fed` |
 | two or more distinct factor types | at least 2 | `+ mfa` |
 | delegated | the **actor's** aal | `delegated` |
 
@@ -136,6 +138,13 @@ Hub requirements:
 - **Hub as an OIDC provider** (implemented, [§7](07-oidc.md)). Existing apps can
   "Sign in with Kith" through standard authorization code + PKCE, with a passkey login
   page, SSO and step-up.
-- **Upstream IdPs as factors** (planned). "Sign in with Google" becomes a factor plus an
-  attribute source (email, domain, org). It is linked to the identity once, by a
-  device-signed `alias_link` to the upstream subject.
+- **Upstream IdPs as factors** (implemented for OIDC, [§7.8](07-oidc.md)). "Sign in
+  with Telegram" is a factor. It is linked to the identity once, by an `alias_link` to
+  the upstream subject, `{iss}#{sub}` (§5.1).
+  - The evidence is an ID token only the hub checks, so it counts as AAL1 (`amr: fed`)
+    and can never sign a key event or a session grant.
+  - Adding TOTP makes it two factor types, so AAL2.
+  - Unlinking the alias ends the sessions that signed in through it.
+- **Upstream attributes** (implemented for OIDC, [§7.8](07-oidc.md)). The same login
+  can supply attributes (name, phone, email) from the ID token and UserInfo. The trust
+  policy is a per-provider allowlist of claims. The directory and the KEL always win.
