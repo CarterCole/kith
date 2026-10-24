@@ -76,7 +76,15 @@ fn generate() -> Value {
     };
     let e1 = entry(None, 1692806100, vec![Revocation::Member { id: "did:kith:ada".into(), set: "Group::finance".into() }]);
     let e2 = entry(Some(&e1), 1692806110, vec![Revocation::Token { jti: "tok-1".into() }]);
-    let e3 = entry(Some(&e2), 1692806120, vec![Revocation::Policy { id: "own-invoice".into() }, Revocation::Policy { id: "no-delegated-pay".into() }]);
+    let e3 = entry(
+        Some(&e2),
+        1692806120,
+        vec![
+            Revocation::Policy { id: "own-invoice".into() },
+            Revocation::Policy { id: "no-delegated-pay".into() },
+            Revocation::Device { did: "did:kith:bob".into(), device: "dev_stolen".into() },
+        ],
+    );
 
     // drand quicknet round 1000, published at 1692806364.
     let beacons: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/beacons.json")).unwrap();
@@ -103,30 +111,36 @@ fn generate() -> Value {
         resource: Value,
         context: Value,
         jti: Option<&'static str>,
+        device: Option<&'static str>,
         actor: Option<&'static str>,
         caps: Option<Value>,
         at: i64,
+        /// What a correct implementation decides. It is asserted below, so rewriting the
+        /// file with `KITH_WRITE_VECTORS` can never bless a changed decision.
+        allowed: bool,
     }
     let op = |a: &str| json!({"type": "Operation", "id": a});
-    let c = |name, principal, aal, action: &'static str, at| Case { name, principal, aal, action, resource: op(action), context: json!({}), jti: None, actor: None, caps: None, at };
+    let c = |name, principal, aal, action: &'static str, at, allowed| Case { name, principal, aal, action, resource: op(action), context: json!({}), jti: None, device: None, actor: None, caps: None, at, allowed };
     let cases = vec![
-        c("bob reads invoices", "did:kith:bob", 1, "Query.invoices", t + 10),
-        c("ada lost finance, and billing-reader with it", "did:kith:ada", 2, "Query.invoices", t + 10),
-        Case { jti: Some("tok-1"), ..c("a revoked token", "did:kith:bob", 1, "Query.invoices", t + 10) },
+        c("bob reads invoices", "did:kith:bob", 1, "Query.invoices", t + 10, true),
+        c("ada lost finance, and billing-reader with it", "did:kith:ada", 2, "Query.invoices", t + 10, false),
+        Case { jti: Some("tok-1"), ..c("a revoked token", "did:kith:bob", 1, "Query.invoices", t + 10, false) },
+        Case { device: Some("dev_stolen"), ..c("a revoked device", "did:kith:bob", 1, "Query.invoices", t + 10, false) },
+        Case { device: Some("dev_laptop"), ..c("another device of the same identity", "did:kith:bob", 1, "Query.invoices", t + 10, true) },
         Case {
             resource: json!({"type": "Invoice", "id": "inv_1", "attrs": {"ownerEmail": "ada@acme.test"}}),
-            ..c("own-invoice was revoked", "did:kith:ada", 1, "Invoice.read", t + 10)
+            ..c("own-invoice was revoked", "did:kith:ada", 1, "Invoice.read", t + 10, false)
         },
-        Case { context: json!({"amount": 5}), ..c("bob pays with a fresh view", "did:kith:bob", 2, "Mutation.payInvoice", t + 10) },
+        Case { context: json!({"amount": 5}), ..c("bob pays with a fresh view", "did:kith:bob", 2, "Mutation.payInvoice", t + 10, true) },
         Case {
             context: json!({"amount": 5}),
             actor: Some("did:kith:assistant"),
             caps: Some(json!([{"action": "Mutation.*"}])),
-            ..c("a forbid survives its revocation", "did:kith:bob", 2, "Mutation.payInvoice", t + 10)
+            ..c("a forbid survives its revocation", "did:kith:bob", 2, "Mutation.payInvoice", t + 10, false)
         },
-        Case { context: json!({"amount": 5}), ..c("degraded: payments need a view under 60 s", "did:kith:bob", 2, "Mutation.payInvoice", t + 300) },
-        c("degraded: reads still work", "did:kith:bob", 1, "Query.invoices", t + 300),
-        c("stale: everything is denied", "did:kith:bob", 1, "Query.invoices", t + 700),
+        Case { context: json!({"amount": 5}), ..c("degraded: payments need a view under 60 s", "did:kith:bob", 2, "Mutation.payInvoice", t + 300, false) },
+        c("degraded: reads still work", "did:kith:bob", 1, "Query.invoices", t + 300, true),
+        c("stale: everything is denied", "did:kith:bob", 1, "Query.invoices", t + 700, false),
     ];
     let decisions: Vec<Value> = cases
         .into_iter()
@@ -146,7 +160,8 @@ fn generate() -> Value {
                 r.attrs = a.clone();
             }
             let level = f.freshness(c.at).level;
-            let d = authorize(&slice, &mut f, &Request { principal: &p, jti: c.jti, action: c.action, resource: &r, context: &c.context }, c.at).unwrap();
+            let d = authorize(&slice, &mut f, &Request { principal: &p, jti: c.jti, device: c.device, action: c.action, resource: &r, context: &c.context }, c.at).unwrap();
+            assert_eq!(d.allowed, c.allowed, "{}: {:?}", c.name, d.reasons);
             let mut out = json!({
                 "name": c.name, "principal": c.principal, "attrs": attrs, "action": c.action,
                 "resource": c.resource, "context": c.context, "now": c.at,
@@ -154,6 +169,9 @@ fn generate() -> Value {
             });
             if let Some(j) = c.jti {
                 out["jti"] = json!(j);
+            }
+            if let Some(dev) = c.device {
+                out["device"] = json!(dev);
             }
             if let Some(a) = c.actor {
                 out["actor"] = json!(a);
@@ -203,8 +221,11 @@ fn policy_dag_vectors() {
         std::fs::write(PATH, serde_json::to_string_pretty(&fresh).unwrap() + "\n").unwrap();
     }
     let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(PATH).expect("run with KITH_WRITE_VECTORS=1 once")).unwrap();
-    // Everything is deterministic: same keys, same timestamps, same bytes.
+    // Everything is deterministic: same keys, same timestamps, same bytes, and no key
+    // on disk that the generator no longer produces.
     let keys: BTreeMap<&str, ()> = fresh.as_object().unwrap().keys().map(|k| (k.as_str(), ())).collect();
+    let on_disk_keys: BTreeMap<&str, ()> = on_disk.as_object().unwrap().keys().map(|k| (k.as_str(), ())).collect();
+    assert_eq!(keys, on_disk_keys, "policy-dag.json has different top-level keys than the generator");
     for k in keys.keys() {
         assert_eq!(fresh[*k], on_disk[*k], "policy-dag.json `{k}` is out of date; rerun with KITH_WRITE_VECTORS=1");
     }

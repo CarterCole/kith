@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import jwt
 
@@ -43,18 +45,39 @@ class AccessClaims:
         )
 
 
-class Verifier:
-    """Verifies tokens against the hub's JWKS (fetched and cached by PyJWT)."""
+def _number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
-    def __init__(self, issuer: str, audience: str, jwks_url: str | None = None, jwks: dict | None = None, leeway: int = 60):
+
+class Verifier:
+    """Verifies tokens against the hub's JWKS (fetched and cached by PyJWT).
+
+    The rules are spec 3.5 and the shared vectors in ``spec/test-vectors/tokens.json``:
+    ``typ`` is ``at+jwt``, ``alg`` is EdDSA, the token names its ``kid``, ``iss`` and
+    ``aud`` match (``aud`` is one string, not a list), and ``exp``, ``iat``, ``sub``,
+    ``jti`` and ``aal`` are all there. ``now`` is the clock, in seconds; tests pin it.
+    """
+
+    def __init__(
+        self,
+        issuer: str,
+        audience: str,
+        jwks_url: str | None = None,
+        jwks: dict | None = None,
+        leeway: int = 60,
+        now: Callable[[], float] = time.time,
+    ):
         self.issuer = issuer
         self.audience = audience
         self.leeway = leeway
+        self._now = now
         self._static = jwt.PyJWKSet.from_dict(jwks) if jwks else None
         self._client = None if jwks else jwt.PyJWKClient(jwks_url or f"{issuer.rstrip('/')}/.well-known/jwks.json", cache_keys=True)
 
     def _key(self, token: str):
         kid = jwt.get_unverified_header(token).get("kid")
+        if not kid:
+            raise KithAuthError("the token has no kid")
         if self._static is not None:
             for k in self._static.keys:
                 if k.key_id == kid:
@@ -64,7 +87,9 @@ class Verifier:
 
     def verify(self, token: str) -> AccessClaims:
         try:
-            if jwt.get_unverified_header(token).get("typ") != "at+jwt":
+            typ = jwt.get_unverified_header(token).get("typ")
+            # RFC 7515 4.1.9: media types are case-insensitive and "application/" may be left off.
+            if not isinstance(typ, str) or re.sub(r"^application/", "", typ.lower()) != "at+jwt":
                 raise KithAuthError("expected typ at+jwt")
             c = jwt.decode(
                 token,
@@ -72,9 +97,10 @@ class Verifier:
                 algorithms=["EdDSA"],
                 audience=self.audience,
                 issuer=self.issuer,
-                leeway=self.leeway,
-                options={"require": ["exp", "iat", "sub", "iss", "aud"]},
+                # Times are checked below, against the clock this verifier was given.
+                options={"require": ["exp", "iat", "sub", "iss", "aud", "jti", "aal"], "verify_exp": False, "verify_iat": False, "verify_nbf": False},
             )
+            self._check(c)
         except KithAuthError:
             raise
         except jwt.PyJWTError as e:
@@ -82,8 +108,27 @@ class Verifier:
         known = AccessClaims.__dataclass_fields__.keys()
         return AccessClaims(**{k: v for k, v in c.items() if k in known})
 
+    def _check(self, c: dict) -> None:
+        now = self._now()
+        if not isinstance(c["aud"], str):
+            raise KithAuthError('invalid token: "aud" must be a single string')
+        for name in ("sub", "jti"):
+            if not isinstance(c[name], str) or not c[name]:
+                raise KithAuthError(f'invalid token: "{name}" must be a non-empty string')
+        if type(c["aal"]) is not int or not 1 <= c["aal"] <= 3:
+            raise KithAuthError('invalid token: "aal" must be 1, 2 or 3')
+        if not _number(c["exp"]) or not _number(c["iat"]):
+            raise KithAuthError('invalid token: "exp" and "iat" must be numbers')
+        # RFC 7519: the time must be before exp, so a token is expired once exp + leeway is reached.
+        if c["exp"] + self.leeway <= now:
+            raise KithAuthError("invalid token: expired")
+        if c["iat"] - self.leeway > now:
+            raise KithAuthError('invalid token: "iat" is in the future')
+        if "nbf" in c and (not _number(c["nbf"]) or c["nbf"] - self.leeway > now):
+            raise KithAuthError("invalid token: not valid yet")
+
 
 def bearer_token(header: str | None) -> str | None:
-    if header and header.lower().startswith("bearer "):
-        return header[7:].strip()
-    return None
+    """The token from an ``Authorization: Bearer …`` header, with the same whitespace rules as the JS package."""
+    m = re.match(r"^Bearer\s+(.+)$", header or "", re.IGNORECASE)
+    return m.group(1) if m else None

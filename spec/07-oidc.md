@@ -62,12 +62,17 @@ Clients are registered in a JSON file, passed as `kith hub serve --clients clien
 ```
 
 Redirect URIs must be one of:
-- `https`;
+- `https`, with no userinfo (`https://good.example@evil.example` names evil.example);
 - loopback `http` (`localhost`, `127.0.0.1`, `[::1]`);
-- a private-use scheme (`com.example.app:/cb`).
+- a private-use scheme (`com.example.app:/cb`), but never `javascript`, `data`,
+  `vbscript`, `file`, `about`, `blob`, `ftp`, `ws` or `wss`.
 
-They are matched exactly and may not have a fragment. An unknown client or an
-unregistered redirect URI is shown as an error page, **never redirected**.
+Schemes are compared in lower case, so `HTTP://evil.example/cb` is plain http to a host
+that is not loopback, and is refused. URIs are matched exactly and may not have a
+fragment, whitespace or control characters. `post_logout_redirect_uris` follow the same
+rules, because the sign-out page sends the browser there. `backchannel_logout_uri` and
+`frontchannel_logout_uri` may be `https` or loopback `http` only. An unknown client or
+an unregistered redirect URI is shown as an error page, **never redirected**.
 
 **Dynamic registration** (RFC 7591, OpenID Connect Dynamic Client Registration 1.0).
 `POST {issuer}/oauth/register` with client metadata as JSON returns `201` with a new
@@ -195,6 +200,11 @@ Scoped claims (ID token and userinfo):
 `sid` identifies the hub session to the client, for logout (§7.6). It is a separate
 random value, never the session cookie.
 
+**Spent on sight.** A code is single use, and a code or refresh token shown by a client
+it was not issued to, or with the wrong PKCE verifier, is spent anyway (RFC 6749
+§4.1.2, §10.4). Presenting it elsewhere is a sign it leaked, so it must not stay good
+for the next try.
+
 **Encrypted ID tokens.** A client with `id_token_encrypted_response_alg` gets its ID
 token as a JWE (RFC 7516) around the signed JWT: signed first, then encrypted.
 - Key management is `RSA-OAEP-256` (RSA keys of 2048 bits or more) or `ECDH-ES` with
@@ -219,7 +229,7 @@ scoped claims.
 
 `GET /oauth/logout?post_logout_redirect_uri=…&state=…&client_id=…|id_token_hint=…`:
 - It ends the hub session and clears the cookie. Codes of that session that were not
-  redeemed yet stop working.
+  redeemed yet stop working, and so do its refresh tokens.
 - It redirects only to a URI registered for that client. Otherwise it shows a
   "signed out" page.
 
@@ -242,8 +252,13 @@ Limits:
   its tokens still expire.
 - RP-initiated logout and the admin API (§7.10) send notices. A session that expires,
   or ends because its device was revoked, does not.
-- Refresh tokens are all `offline_access` tokens, so logout leaves them valid, as the
-  back-channel specification says to. Revoking the device ends them (§7.5).
+- Signing out at the hub ends that session's refresh tokens, as the admin API does.
+  OpenID Connect lets `offline_access` tokens outlive the session, and an earlier
+  version of this hub left them valid. But every refresh token here is an
+  `offline_access` token with a 30-day life that rolls forward, and signing out of a
+  shared machine should mean it. A client that needs background access past a sign-out
+  needs a different design from this. Revoking the device ends them as well (§7.5), and
+  so does the admin API's sign-out-everywhere (§7.10).
 
 ## 7.7 Enrolling a browser passkey
 
@@ -262,6 +277,12 @@ CLI      polls; appends the proof-of-possession signature; publishes the KEL
 ```
 
 - The enrollment id is a 128-bit capability that expires after 10 minutes.
+- Whoever learns the id can submit a key first, and the hub is the one reporting the
+  key back, so neither is trusted to say which key to add. The page shows a
+  fingerprint of the key it made: the first six bytes of SHA-256 of the `did:key`, as
+  `xxxx-xxxx-xxxx`. The CLI prints the same code for the key the hub reports and asks
+  `[y/N]` before it signs; `--yes` skips the question. The person looking at both
+  screens is the check.
 - The passkey is stored as a `passkey` device with `rp_id` equal to the hub's RP id and
   AAL2.
 - Only the passkey is ever in the browser, and only the CLI ever holds the manage key.
@@ -403,8 +424,11 @@ Not yet run against Telegram itself.
   Behind one reverse proxy, start the hub with `--behind-proxy`: the client address
   is then the last `X-Forwarded-For` entry, the one your proxy appended (earlier
   entries are whatever the client sent). Without the flag that header is ignored.
-  TOTP has its own lockout per identity (§2.3). Counters live in the store, so a
-  restart does not reset them.
+  Every place a TOTP code is checked (`/v1/auth/verify`, `/v1/cosign`, and a token
+  exchange with `totp`) shares a third budget of 20 per minute per address
+  (`totp_limit`), and a reset with a code counts against it too. TOTP has its own
+  lockout per identity (§2.3). Counters live in the store, so a restart does not reset
+  them.
 - **TLS.** The hub speaks plain HTTP. Terminate TLS in front of it and set `--issuer`
   to the `https://` URL; cookies are then marked `Secure`.
 - **RP id.** WebAuthn only allows passkeys on the RP id's domain.
@@ -445,6 +469,7 @@ For the hub's operator, under `{issuer}/v1/admin/`. Two credentials open it:
 | `GET /v1/admin/sessions[?did=…]` | Live hub sessions: `sid`, `did`, `device`, `alias`, `aal`, `amr`, `auth_time`, `expires`, `clients`. Never the cookie. |
 | `DELETE /v1/admin/sessions/{sid}` | Ends that session. Its unredeemed codes and its refresh tokens die; clients that registered a logout URI are told (§7.6). |
 | `DELETE /v1/admin/identities/{did}/sessions` | Signs the identity out everywhere: every session, and every refresh token, including those whose session already expired. |
+| `DELETE /v1/admin/identities/{did}/totp` | Forgets the identity's authenticator, for an owner who lost it and has no strong sign-in. Sign-ins that rested on it alone end (§2.3). |
 | `GET /v1/admin/clients` | Configured and registered clients, with `source` and `has_secret` in place of the secret. |
 | `DELETE /v1/admin/clients/{id}` | Deletes a registered client with its grants and refresh tokens. A configured client answers `409`: edit the clients file. |
 | `GET /v1/admin/grants/{did}` | What the identity agreed to share, per client: scopes and when. |

@@ -152,7 +152,7 @@ async fn publish_slice_issue_revoke() {
     attrs.insert("aal".into(), json!(1));
     let p = Principal { id: ada.did.clone(), attrs, groups: claims.groups.clone(), roles: claims.roles.clone(), actor: None, caps: None };
     let op = Resource::new("Operation", "Query.invoices");
-    let req = revoke::Request { principal: &p, jti: None, action: "Query.invoices", resource: &op, context: &json!({}) };
+    let req = revoke::Request { principal: &p, jti: None, device: None, action: "Query.invoices", resource: &op, context: &json!({}) };
     assert!(!revoke::authorize(&slice, &mut f, &req, now()).unwrap().allowed, "her old token's roles don't matter");
 
     // The hub's own tokens reflect it immediately.
@@ -160,8 +160,18 @@ async fn publish_slice_issue_revoke() {
     assert_eq!(claims.groups, vec!["staff"]);
     assert!(claims.roles.is_empty());
 
+    // Revoking a device stops sign-ins from it ahead of her KEL, and only from it.
+    let mut e_dev = Entry::new(&org, Some(&e1), vec![Revocation::Device { did: ada.did.clone(), device: "laptop".into() }]).unwrap();
+    e_dev.sign(&admin).unwrap();
+    assert_eq!(call(&app, "POST", &format!("/v1/revocations/{org}"), Some(json!(e_dev))).await.0, StatusCode::OK);
+    assert!(hub.access_claims(&authn, "api://invoices", None).is_err(), "her laptop was revoked by the org");
+    let phone = Authn { dev: Some("phone".into()), ..authn.clone() };
+    assert!(hub.access_claims(&phone, "api://invoices", None).is_ok(), "another device is unaffected");
+    let no_device = Authn { dev: None, ..authn.clone() };
+    assert!(hub.access_claims(&no_device, "api://invoices", None).is_ok(), "a sign-in with no device is unaffected");
+
     // Revoking the principal stops token issuance altogether.
-    let mut e2 = Entry::new(&org, Some(&e1), vec![Revocation::Principal { id: ada.did.clone() }]).unwrap();
+    let mut e2 = Entry::new(&org, Some(&e_dev), vec![Revocation::Principal { id: ada.did.clone() }]).unwrap();
     e2.sign(&admin).unwrap();
     assert_eq!(call(&app, "POST", &format!("/v1/revocations/{org}"), Some(json!(e2))).await.0, StatusCode::OK);
     assert!(hub.access_claims(&authn, "api://invoices", None).is_err());

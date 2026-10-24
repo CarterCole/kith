@@ -107,11 +107,22 @@ has these claims:
 }
 ```
 
-A resource server MUST check:
-- `typ` is `at+jwt` and `alg` is `EdDSA`;
-- the signature against the hub JWKS;
-- `iss` and `aud`;
-- `exp` and `iat` (60 s leeway).
+A resource server MUST check all of these, and refuse the token if any fails:
+- `typ` is `at+jwt` and `alg` is `EdDSA`. `application/at+jwt` is the same type
+  (RFC 7515 §4.1.9), and media types ignore case.
+- The token names a `kid` that is in the hub's JWKS, and the signature verifies with
+  that key. A token with no `kid` is refused, even when the JWKS holds one key.
+- `iss` is the hub and `aud` is one string equal to this resource server's audience.
+  A list of audiences is refused: a token minted for several could be replayed
+  between them.
+- `exp`, `iat`, `sub`, `jti` and `aal` are present. `sub` and `jti` are non-empty
+  strings and `aal` is the integer 1, 2 or 3.
+- The times fit the clock, with 60 s of leeway each way. `iat` is not in the future.
+  A token is expired once `exp` plus the leeway is reached (RFC 7519 §4.1.4, "now must
+  be before `exp`"). `nbf`, if present, is not in the future.
+
+`test-vectors/tokens.json` has a case for each, with a fixed clock and keys. Every
+implementation runs it.
 
 It then builds the principal from these fields:
 - `id` = `sub`;

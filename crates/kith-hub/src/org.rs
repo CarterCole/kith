@@ -205,14 +205,18 @@ impl Hub {
         Ok((slice, blocks, head.revocations_through))
     }
 
-    /// Groups, roles and a revocation verdict for `did` from the configured policy
-    /// org, if there is one. `Ok(None)`: no org configured, use the bundle file.
-    pub(crate) fn org_memberships(&self, did: &str, attrs: &serde_json::Map<String, Value>) -> ApiResult<Option<(kith_core::authz::Memberships, serde_json::Map<String, Value>)>> {
+    /// Groups, roles and a revocation verdict for `did`, signing in from `device` (if
+    /// any), from the configured policy org, if there is one. `Ok(None)`: no org
+    /// configured, use the bundle file.
+    pub(crate) fn org_memberships(&self, did: &str, device: Option<&str>, attrs: &serde_json::Map<String, Value>) -> ApiResult<Option<(kith_core::authz::Memberships, serde_json::Map<String, Value>)>> {
         let Some(org) = &self.cfg.policy_org else { return Ok(None) };
         let (slice, _, through) = self.slice(org, &Query::Principal { id: did.into() })?;
         let revoked = self.orgs.active_revocations(org, through);
         if revoked.iter().any(|r| matches!(r, Revocation::Principal { id } if id == did)) {
             return Err(ApiError::unauthorized("principal revoked by the organization"));
+        }
+        if device.is_some_and(|dev| revoked.iter().any(|r| matches!(r, Revocation::Device { did: d, device: x } if d == did && x == dev))) {
+            return Err(ApiError::unauthorized("device revoked by the organization"));
         }
         let skip: BTreeSet<String> = revoked.iter().filter_map(|r| if let Revocation::Policy { id } = r { Some(id.clone()) } else { None }).collect();
         let excluded: BTreeSet<String> =

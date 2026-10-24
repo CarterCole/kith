@@ -55,7 +55,7 @@ type CedarValue = cedar.CedarValueJson;
 /** Cedar has no null or floats: drop nulls, stringify non-integers, drop functions. */
 export function cedarValue(v: unknown): CedarValue | undefined {
   if (v === null || v === undefined || typeof v === "function" || typeof v === "symbol") return undefined;
-  if (typeof v === "number") return Number.isInteger(v) ? v : String(v);
+  if (typeof v === "number") return Number.isSafeInteger(v) ? v : String(v);
   if (typeof v === "bigint") return Number(v);
   if (typeof v === "string" || typeof v === "boolean") return v;
   if (v instanceof Date) return v.toISOString();

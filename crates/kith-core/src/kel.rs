@@ -246,11 +246,13 @@ impl KeyState {
         self.manage.is_satisfied_by(signed) || self.devices.values().any(|d| d.has_cap("revoke") && signed.contains(&d.key))
     }
 
-    /// Every signer that may authenticate as this identity (device keys and the
-    /// manage policy's signers). The rotation keys are deliberately excluded: they
-    /// stay cold until a rotation.
+    /// Every signer that may authenticate as this identity: device keys that have the
+    /// `session` capability, and the manage policy's signers. The rotation keys are
+    /// deliberately excluded: they stay cold until a rotation. A device with only
+    /// `revoke` or `alias` (the hub's revoker, say) can do that one thing and cannot
+    /// sign in as the identity.
     pub fn is_authentication_signer(&self, signer: &str) -> bool {
-        self.devices.values().any(|d| d.key == signer) || self.manage.signers().contains(signer)
+        self.devices.values().any(|d| d.key == signer && d.has_cap("session")) || self.manage.signers().contains(signer)
     }
 
     /// A W3C DID Core document for this identity.
@@ -560,6 +562,23 @@ pub(crate) mod tests {
         ev.sign(&other).unwrap();
         f.log.push(ev);
         assert!(verify_log(&f.log, &VerifyOptions::default()).is_err());
+    }
+
+    #[test]
+    fn only_devices_with_the_session_cap_authenticate() {
+        let mut f = fixture();
+        let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
+        let relay = LocalSigner::generate(KeyType::Ed25519);
+        let dev = Device { id: "relay".into(), key: relay.id.clone(), name: "relay".into(), kind: DeviceKind::Software, aal: 1, caps: vec!["revoke".into()], rp_id: None, xkey: None };
+        let mut ev = next_event(&st, EventBody::AddDevice { device: dev });
+        ev.sign(&f.root).unwrap();
+        ev.sign(&relay).unwrap();
+        f.log.push(ev);
+        let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
+        assert!(st.is_authentication_signer(&f.device.id), "a device with the session cap");
+        assert!(st.is_authentication_signer(&f.root.id), "the manage key");
+        assert!(!st.is_authentication_signer(&relay.id), "a revoke-only device");
+        assert!(st.may_revoke(&BTreeSet::from([relay.id.clone()])), "which can still revoke");
     }
 
     #[test]

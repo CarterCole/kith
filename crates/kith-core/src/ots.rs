@@ -200,8 +200,12 @@ fn read_attestation(r: &mut Reader) -> Result<Attestation> {
     })
 }
 
+/// How many operations may be chained in a proof. Parsing refuses more, so building
+/// more would make a file this code cannot read back.
+const MAX_DEPTH: usize = 256;
+
 fn read_timestamp(r: &mut Reader, depth: usize) -> Result<Timestamp> {
-    if depth > 256 {
+    if depth > MAX_DEPTH {
         return Err(Error::Encoding("ots: proof too deep".into()));
     }
     let mut ts = Timestamp::default();
@@ -290,6 +294,11 @@ impl Timestamp {
             write_op(op, out);
             child.write(out);
         }
+    }
+
+    /// The longest chain of operations in the proof.
+    fn depth(&self) -> usize {
+        self.ops.iter().map(|(_, child)| 1 + child.depth()).max().unwrap_or(0)
     }
 
     /// Replay every path from `msg` and collect the attestations reached.
@@ -426,8 +435,14 @@ pub fn stamp_request(digest: [u8; 32], nonce: [u8; 16]) -> (DetachedFile, Vec<u8
 /// Add a calendar's response (a bare timestamp for `msg`) to a stamp request.
 pub fn add_calendar_response(file: &mut DetachedFile, msg: &[u8], response: &[u8]) -> Result<()> {
     let ts = Timestamp::parse(response)?;
-    let digest = file.digest;
-    file.timestamp.merge_at(&digest, msg, &ts)?;
+    // Graft onto a copy: a response that would make the proof too deep to parse again
+    // changes nothing.
+    let mut merged = file.timestamp.clone();
+    merged.merge_at(&file.digest, msg, &ts)?;
+    if merged.depth() > MAX_DEPTH {
+        return Err(Error::Encoding("ots: the calendar's proof would make the file too deep to read".into()));
+    }
+    file.timestamp = merged;
     Ok(())
 }
 
@@ -436,8 +451,9 @@ pub fn hex(b: &[u8]) -> String {
 }
 
 pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return Err(Error::Encoding("odd hex".into()));
+    // Byte offsets below are character offsets only for ASCII.
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
+        return Err(Error::Encoding("bad hex".into()));
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| Error::Encoding("bad hex".into()))).collect()
 }
@@ -512,5 +528,79 @@ mod vector_tests {
         }
         assert!(!may_follow("https://evil.example/calendar.opentimestamps.org"));
         assert!(!may_follow("http://alice.btc.calendar.opentimestamps.org"));
+    }
+
+    fn sample_file() -> DetachedFile {
+        let digest = crate::util::sha256(b"kith");
+        let (mut file, msg) = stamp_request(digest, [7; 16]);
+        let resp = Timestamp {
+            attestations: vec![],
+            ops: vec![(Op::Prepend(vec![1, 2, 3]), Timestamp { attestations: vec![], ops: vec![(Op::Sha256, Timestamp { attestations: vec![Attestation::Pending { uri: "https://a.pool.opentimestamps.org".into() }, Attestation::Bitcoin { height: 800_000 }], ops: vec![] })] })],
+        };
+        add_calendar_response(&mut file, &msg, &resp.to_bytes()).unwrap();
+        file
+    }
+
+    #[test]
+    fn hex_and_text_dates_with_wide_characters_are_errors_not_panics() {
+        for s in ["0é0", "é0", "0é", "é", "ab😀", "zz", "abc", "0g"] {
+            assert!(hex_decode(s).is_err(), "{s:?}");
+        }
+        assert_eq!(hex_decode("00ff").unwrap(), vec![0, 255]);
+        assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn malformed_proofs_are_errors() {
+        let good = sample_file().to_bytes();
+        assert_eq!(DetachedFile::parse(&good).unwrap(), sample_file());
+        // Cut anywhere: an error or a shorter proof, never a panic.
+        for n in 0..good.len() {
+            let _ = DetachedFile::parse(&good[..n]);
+            assert!(DetachedFile::parse(&good[..n.min(MAGIC.len() + 3)]).is_err());
+        }
+        let mut bad_magic = good.clone();
+        bad_magic[0] ^= 1;
+        assert!(DetachedFile::parse(&bad_magic).is_err());
+        let mut v2 = good.clone();
+        v2[MAGIC.len()] = 2;
+        assert!(matches!(DetachedFile::parse(&v2), Err(Error::Unsupported(_))));
+        let mut sha1 = good.clone();
+        sha1[MAGIC.len() + 1] = 0x02;
+        assert!(matches!(DetachedFile::parse(&sha1), Err(Error::Unsupported(_))));
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(DetachedFile::parse(&trailing).is_err());
+        // Unknown operation, a field longer than allowed, and a proof nested too deep.
+        assert!(Timestamp::parse(&[0xaa]).is_err());
+        let mut huge = vec![0x00];
+        huge.extend([0u8; 8]);
+        put_varuint(1 << 40, &mut huge);
+        assert!(Timestamp::parse(&huge).is_err());
+        assert!(Timestamp::parse(&vec![0xf2; 100_000]).is_err());
+        assert!(Timestamp::parse(&[]).is_err());
+    }
+
+    /// A calendar can answer with a proof as deep as the format allows. Grafting it in
+    /// must not produce a file that this code then refuses to read back.
+    #[test]
+    fn a_response_that_would_make_the_file_unreadable_is_refused() {
+        let digest = crate::util::sha256(b"kith");
+        let (mut file, msg) = stamp_request(digest, [7; 16]);
+        let mut deep = Timestamp { attestations: vec![Attestation::Bitcoin { height: 1 }], ops: vec![] };
+        for _ in 0..255 {
+            deep = Timestamp { attestations: vec![], ops: vec![(Op::Reverse, deep)] };
+        }
+        let before = file.clone();
+        let outcome = add_calendar_response(&mut file, &msg, &deep.to_bytes());
+        assert!(outcome.is_err(), "grafted in, to make a file nobody can parse");
+        assert_eq!(file, before, "a refused response changes nothing");
+        // A modest one is fine, and the file reads back.
+        let mut small = Timestamp { attestations: vec![Attestation::Bitcoin { height: 1 }], ops: vec![] };
+        for _ in 0..10 {
+            small = Timestamp { attestations: vec![], ops: vec![(Op::Reverse, small)] };
+        }
+        add_calendar_response(&mut file, &msg, &small.to_bytes()).unwrap();
+        assert_eq!(DetachedFile::parse(&file.to_bytes()).unwrap(), file);
     }
 }

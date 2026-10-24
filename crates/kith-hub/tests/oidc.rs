@@ -20,7 +20,7 @@ use tower::ServiceExt;
 use kith_core::kel::{new_inception, next_event, verify_log, Device, DeviceKind, EventBody, KeyState};
 use kith_core::keys::{KeyType, LocalSigner, PublicKey, VerifyOptions};
 use kith_core::policy::SignerPolicy;
-use kith_core::session::{DeviceSigner, SessionKey};
+use kith_core::session::{Capability, DeviceSigner, SessionKey};
 use kith_core::util::{b64u, b64u_decode, now, sha256};
 use kith_core::{jws, totp, webauthn};
 use kith_hub::oidc::{Client, Consent, SubjectType, BACKCHANNEL_LOGOUT_EVENT};
@@ -335,7 +335,7 @@ async fn code_flow_sso_refresh_and_revocation() {
     assert_eq!(q["state"], "st8");
     assert_eq!(q["iss"], ISSUER);
 
-    // 3. token: wrong verifier fails and burns nothing else; right verifier succeeds once
+    // 3. token: a wrong verifier fails and spends that code; the right verifier succeeds once, with a fresh code
     let code = q["code"].clone();
     let bad = post_form(&w.app, "/oauth/token", &[("grant_type", "authorization_code"), ("code", &code), ("redirect_uri", APP_CB), ("code_verifier", "wrong"), ("client_id", "app")], None).await;
     assert_eq!(bad.json()["error"], "invalid_grant");
@@ -993,3 +993,232 @@ async fn admin_api() {
     let elsewhere = post_json(&w.app, "/v1/auth/verify", json!({"challenge_id": ch["challenge_id"], "audience": "api://demo", "factors": [passkey_factor(&w.passkey, ch["message"].as_str().unwrap(), ORIGIN)]})).await.json();
     assert_eq!(call(&w.app, "GET", "/v1/admin/stats", &[(header::AUTHORIZATION, &format!("Bearer {}", elsewhere["access_token"].as_str().unwrap()))], None, None).await.status, StatusCode::UNAUTHORIZED);
 }
+
+/// Capabilities gate logins: a device that only has `revoke` (the hub's relay, say)
+/// cannot sign in as the identity by signature, by passkey, by session chain, or by
+/// minting a delegation. The same calls from a device with `session` still work.
+#[tokio::test]
+async fn devices_without_the_session_cap_cannot_log_in() {
+    let w = world();
+    let relay = LocalSigner::generate(KeyType::Ed25519);
+    let relay_pk = LocalSigner::generate(KeyType::P256);
+    let relay_dev = Device { caps: vec!["revoke".into()], ..device("relay", &relay, DeviceKind::Software, 1) };
+    let pk_dev = Device { caps: vec!["revoke".into()], ..device("relay-pk", &relay_pk, DeviceKind::Passkey, 2) };
+
+    let mut log = w.log.clone();
+    let mut ev = next_event(&w.st, EventBody::AddDevice { device: relay_dev.clone() });
+    ev.sign(&w.root).unwrap();
+    ev.sign(&relay).unwrap();
+    log.push(ev);
+    let st = verify_log(&log, &VerifyOptions::default()).unwrap();
+    let mut ev = next_event(&st, EventBody::AddDevice { device: pk_dev });
+    ev.sign(&w.root).unwrap();
+    let msg = ev.signing_message().unwrap();
+    ev.add_sig(webauthn::soft_sign_message(&relay_pk, "localhost", ORIGIN, &msg).unwrap());
+    log.push(ev);
+    w.hub.put_kel(&w.st.did, log).unwrap();
+
+    // Challenge login: a fresh challenge per attempt, because each is single use.
+    let attempt = |factor: Box<dyn Fn(&str) -> Value>| {
+        let app = w.app.clone();
+        let did = w.st.did.clone();
+        async move {
+            let ch = post_json(&app, "/v1/auth/challenge", json!({"did": did})).await.json();
+            let factor = factor(ch["message"].as_str().unwrap());
+            post_json(&app, "/v1/auth/verify", json!({"challenge_id": ch["challenge_id"], "audience": ISSUER, "factors": [factor]})).await
+        }
+    };
+    let sig_by = |k: LocalSigner| -> Box<dyn Fn(&str) -> Value> { Box::new(move |m| json!({"type": "signature", "sig": k.sign(m.as_bytes()).unwrap()})) };
+    let passkey_by = |k: LocalSigner| -> Box<dyn Fn(&str) -> Value> { Box::new(move |m| passkey_factor(&k, m, ORIGIN)) };
+
+    let r = attempt(sig_by(relay.clone())).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "revoke-only device signed in: {}", r.text());
+    let r = attempt(passkey_by(relay_pk.clone())).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "revoke-only passkey signed in: {}", r.text());
+    assert_eq!(attempt(sig_by(w.laptop.clone())).await.status, StatusCode::OK, "a device with the session cap signs in");
+    assert_eq!(attempt(passkey_by(w.passkey.clone())).await.status, StatusCode::OK, "a passkey with the session cap signs in");
+
+    // Session chain, and a delegation issued by the relay's grant, redeemed by a good device.
+    let sk = SessionKey::create(&w.st.did, &relay_dev, DeviceSigner::Key(&relay.secret), 3600).unwrap();
+    let tok = sk.session_token(ISSUER, json!({})).unwrap();
+    let r = post_form(&w.app, "/oauth/token", &[("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"), ("subject_token", &tok), ("subject_token_type", TT_SESSION)], None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+
+    let delegation = sk.delegate(&w.st.did, ISSUER, vec![Capability::new("*")], 600).unwrap();
+    let laptop = w.st.device("laptop").unwrap().clone();
+    let actor = SessionKey::create(&w.st.did, &laptop, DeviceSigner::Key(&w.laptop.secret), 3600).unwrap().session_token(ISSUER, json!({})).unwrap();
+    let r = post_form(
+        &w.app,
+        "/oauth/token",
+        &[("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"), ("subject_token", &delegation), ("subject_token_type", kith_hub::TT_DELEGATION), ("actor_token", &actor)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "a delegation signed through a revoke-only device was honoured: {}", r.text());
+}
+
+/// Redeem the code behind a login response and return the tokens.
+async fn tokens_from_login(w: &World, login: &Resp, verifier: &str) -> Value {
+    redeem(w, "app", login.json()["redirect"].as_str().unwrap(), verifier, None).await
+}
+
+async fn password_free_hub_token(w: &World) -> String {
+    let ch = post_json(&w.app, "/v1/auth/challenge", json!({"did": w.st.did})).await.json();
+    let r = post_json(&w.app, "/v1/auth/verify", json!({"challenge_id": ch["challenge_id"], "audience": ISSUER, "factors": [passkey_factor(&w.passkey, ch["message"].as_str().unwrap(), ORIGIN)]})).await.json();
+    format!("Bearer {}", r["access_token"].as_str().unwrap())
+}
+
+/// A session that rests on the authenticator code alone has no device to revoke, so
+/// resetting the authenticator is what ends it. Sessions that rest on anything else
+/// are untouched.
+#[tokio::test]
+async fn totp_only_sessions_end_when_totp_is_reset() {
+    let w = world_with(|cfg| cfg.admin_token = Some("ops-secret".into()));
+    let bearer = hub_bearer(&w, "laptop", &w.laptop).await;
+    let auth = [(header::AUTHORIZATION, bearer.as_str())];
+    let enrolled = call(&w.app, "POST", "/v1/totp/enroll", &auth, None, Some(json!({}))).await.json();
+    let secret = totp::from_base32(enrolled["secret"].as_str().unwrap()).unwrap();
+    assert_eq!(call(&w.app, "POST", "/v1/totp/confirm", &auth, None, Some(json!({"code": totp::code_at(&secret, now())}))).await.status, StatusCode::OK);
+
+    // A weak (AAL 1) bearer with no current code can't reset it.
+    let denied = call(&w.app, "DELETE", "/v1/totp", &auth, None, None).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.text());
+
+    // Sign in with the authenticator code alone, and, separately, with the passkey.
+    let (verifier, challenge) = pkce();
+    let page = get(&w.app, &authorize_url("app", APP_CB, &challenge, ""), None).await;
+    let d = page_data(&page.text());
+    let totp_login = post_json(&w.app, "/oauth/login", json!({"request_id": d["request_id"], "challenge_id": d["challenge_id"], "did": w.st.did, "factors": [{"type": "totp", "code": totp::code_at(&secret, now() + 30)}]})).await;
+    assert_eq!(totp_login.status, StatusCode::OK, "{}", totp_login.text());
+    let totp_cookie = totp_login.cookie().unwrap();
+    let refresh = tokens_from_login(&w, &totp_login, &verifier).await["refresh_token"].as_str().unwrap().to_string();
+    let page = get(&w.app, &authorize_url("app", APP_CB, &challenge, ""), None).await;
+    let passkey_cookie = login_with_passkey(&w, &page, &w.passkey).await.cookie().unwrap();
+
+    let sso = |cookie: String| {
+        let (app, url) = (w.app.clone(), authorize_url("app", APP_CB, &challenge, ""));
+        async move { get(&app, &url, Some(&cookie)).await }
+    };
+    assert!(sso(totp_cookie.clone()).await.location().starts_with(APP_CB), "SSO works while the authenticator is enrolled");
+
+    // The operator resets it.
+    let wrong = call(&w.app, "DELETE", "/v1/admin/identities/x/totp", &[(header::AUTHORIZATION, "Bearer nope")], None, None).await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    let reset = call(&w.app, "DELETE", &format!("/v1/admin/identities/{}/totp", w.st.did), &[(header::AUTHORIZATION, "Bearer ops-secret")], None, None).await;
+    assert_eq!(reset.status, StatusCode::OK, "{}", reset.text());
+    assert_eq!(reset.json()["reset"], true);
+
+    assert_eq!(sso(totp_cookie).await.status, StatusCode::OK, "the TOTP-only session is gone: back to the login page");
+    let r = post_form(&w.app, "/oauth/token", &[("grant_type", "refresh_token"), ("refresh_token", &refresh), ("client_id", "app")], None).await;
+    assert_eq!(r.json()["error"], "invalid_grant", "{}", r.text());
+    assert!(sso(passkey_cookie).await.location().starts_with(APP_CB), "the passkey session is untouched");
+
+    // The authenticator can be enrolled again.
+    let again = call(&w.app, "POST", "/v1/totp/enroll", &auth, None, Some(json!({}))).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text());
+}
+
+/// Whoever holds the authenticator, or a strong sign-in, may reset it.
+#[tokio::test]
+async fn totp_reset_needs_the_current_code_or_a_strong_sign_in() {
+    let w = world();
+    let weak = hub_bearer(&w, "laptop", &w.laptop).await;
+    let weak = [(header::AUTHORIZATION, weak.as_str())];
+    let enroll = || async { call(&w.app, "POST", "/v1/totp/enroll", &weak, None, Some(json!({}))).await.json() };
+    let secret = totp::from_base32(enroll().await["secret"].as_str().unwrap()).unwrap();
+    assert_eq!(call(&w.app, "POST", "/v1/totp/confirm", &weak, None, Some(json!({"code": totp::code_at(&secret, now())}))).await.status, StatusCode::OK);
+
+    let wrong = call(&w.app, "DELETE", "/v1/totp", &weak, None, Some(json!({"code": "000000"}))).await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED, "{}", wrong.text());
+    let ok = call(&w.app, "DELETE", "/v1/totp", &weak, None, Some(json!({"code": totp::code_at(&secret, now() + 30)}))).await;
+    assert_eq!((ok.status, ok.json()["reset"].as_bool()), (StatusCode::OK, Some(true)), "{}", ok.text());
+
+    // New authenticator; this time a passkey sign-in (AAL 2) resets it with no code.
+    let secret = totp::from_base32(enroll().await["secret"].as_str().unwrap()).unwrap();
+    assert_eq!(call(&w.app, "POST", "/v1/totp/confirm", &weak, None, Some(json!({"code": totp::code_at(&secret, now())}))).await.status, StatusCode::OK);
+    let strong = password_free_hub_token(&w).await;
+    let r = call(&w.app, "DELETE", "/v1/totp", &[(header::AUTHORIZATION, strong.as_str())], None, None).await;
+    assert_eq!((r.status, r.json()["reset"].as_bool()), (StatusCode::OK, Some(true)), "{}", r.text());
+    // Nothing left to reset.
+    let r = call(&w.app, "DELETE", "/v1/totp", &[(header::AUTHORIZATION, strong.as_str())], None, None).await;
+    assert_eq!((r.status, r.json()["reset"].as_bool()), (StatusCode::OK, Some(false)));
+}
+
+async fn post_form_from(app: &Router, ip: &str, uri: &str, form: &[(&str, &str)]) -> Resp {
+    let body = form.iter().map(|(k, v)| format!("{k}={}", enc(v))).collect::<Vec<_>>().join("&");
+    let req = Request::post(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .extension(ConnectInfo(SocketAddr::new(ip.parse().unwrap(), 4000)))
+        .body(Body::from(body))
+        .unwrap();
+    send(app, req).await
+}
+
+/// Every place a TOTP code is checked counts against one budget per address.
+#[tokio::test]
+async fn totp_attempts_are_rate_limited_per_address() {
+    let w = world_with(|cfg| cfg.totp_limit = RateLimit { max: 3, window_secs: 60 });
+    let verify = |ip: &'static str| {
+        let (app, did) = (w.app.clone(), w.st.did.clone());
+        async move {
+            let ch = post_json(&app, "/v1/auth/challenge", json!({"did": did})).await.json();
+            call(&app, "POST", "/v1/auth/verify", &[], Some(ip), Some(json!({"challenge_id": ch["challenge_id"], "audience": ISSUER, "factors": [{"type": "totp", "code": "000000"}]}))).await
+        }
+    };
+    let exchange = |ip: &'static str| {
+        let (app, did, laptop, key) = (w.app.clone(), w.st.did.clone(), w.st.device("laptop").unwrap().clone(), w.laptop.clone());
+        async move {
+            let tok = SessionKey::create(&did, &laptop, DeviceSigner::Key(&key.secret), 3600).unwrap().session_token(ISSUER, json!({})).unwrap();
+            post_form_from(&app, ip, "/oauth/token", &[("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"), ("subject_token", &tok), ("subject_token_type", TT_SESSION), ("totp", "000000")]).await
+        }
+    };
+    let ip = "203.0.113.9";
+    assert_eq!(verify(ip).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(exchange(ip).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(verify(ip).await.status, StatusCode::UNAUTHORIZED);
+    let limited = verify(ip).await;
+    assert_eq!((limited.status, limited.json()["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")), "{}", limited.text());
+    assert!(limited.json()["retry_after"].as_i64().is_some_and(|s| s > 0 && s <= 60), "{}", limited.text());
+    assert_eq!(exchange(ip).await.status, StatusCode::TOO_MANY_REQUESTS, "token exchange shares the budget");
+    assert_eq!(exchange("203.0.113.10").await.status, StatusCode::UNAUTHORIZED, "another address has its own");
+
+    // Requests that carry no TOTP code don't spend it.
+    let tok = SessionKey::create(&w.st.did, &w.st.device("laptop").unwrap().clone(), DeviceSigner::Key(&w.laptop.secret), 3600).unwrap().session_token(ISSUER, json!({})).unwrap();
+    let plain = post_form_from(&w.app, ip, "/oauth/token", &[("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"), ("subject_token", &tok), ("subject_token_type", TT_SESSION)]).await;
+    assert_eq!(plain.status, StatusCode::OK, "{}", plain.text());
+}
+
+/// Registration applies the same rules to logout redirects as to sign-in redirects:
+/// they end up in `location.replace` on the sign-out page.
+#[tokio::test]
+async fn registration_refuses_script_urls_in_logout_redirects() {
+    let w = world_with(|cfg| cfg.registration_token = Some("let-me-in".into()));
+    let register = |meta: Value| {
+        let app = w.app.clone();
+        async move { post_json_with(&app, "/oauth/register", meta, &[(header::AUTHORIZATION, "Bearer let-me-in")]).await }
+    };
+    for bad in ["javascript://example.com/%0Aalert(1)", "HTTP://evil.example/", "data://text/html,x"] {
+        let r = register(json!({"redirect_uris": [APP_CB], "post_logout_redirect_uris": [bad]})).await;
+        assert_eq!((r.status, r.json()["error"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_client_metadata")), "{bad}: {}", r.text());
+    }
+    let r = register(json!({"redirect_uris": [APP_CB], "post_logout_redirect_uris": ["https://app.example/"]})).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+}
+
+/// Signing out at the hub ends offline access too, not just the cookie.
+#[tokio::test]
+async fn rp_initiated_logout_also_ends_offline_access() {
+    let w = world();
+    let (verifier, challenge) = pkce();
+    let page = get(&w.app, &authorize_url("app", APP_CB, &challenge, ""), None).await;
+    let login = login_with_passkey(&w, &page, &w.passkey).await;
+    let cookie = login.cookie().unwrap();
+    let tok = tokens_from_login(&w, &login, &verifier).await;
+    let rt = tok["refresh_token"].as_str().unwrap().to_string();
+
+    let out = get(&w.app, "/oauth/logout?client_id=app", Some(&cookie)).await;
+    assert_eq!(out.status, StatusCode::OK, "{}", out.text());
+    let r = post_form(&w.app, "/oauth/token", &[("grant_type", "refresh_token"), ("refresh_token", &rt), ("client_id", "app")], None).await;
+    assert_eq!(r.json()["error"], "invalid_grant", "a refresh token outlived the sign-out: {}", r.text());
+}
+

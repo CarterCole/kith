@@ -348,26 +348,38 @@ impl Store {
     // ------------------------------------------------------------ TOTP, co-signers
 
     pub(crate) fn totp(&self, did: &str) -> anyhow::Result<Option<TotpRecord>> {
-        self.with(|c| {
-            let row: Option<(String, bool, i64, u32, i64)> = c
-                .query_row("SELECT secret, confirmed, last_step, failures, locked_until FROM totp WHERE did = ?1", params![did], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-                .optional()?;
-            Ok(match row {
-                Some((secret, confirmed, last_step, failures, locked_until)) => Some(TotpRecord { secret: b64u_decode(&secret)?, confirmed, last_step, failures, locked_until }),
-                None => None,
-            })
-        })
+        self.with(|c| read_totp(c, did))
     }
 
     pub(crate) fn put_totp(&self, did: &str, r: &TotpRecord) -> anyhow::Result<()> {
+        self.with(|c| write_totp(c, did, r))
+    }
+
+    /// Read `did`'s TOTP record, let `f` change it, and write it back, all while
+    /// holding the connection. Two attempts at once therefore can't both see the
+    /// old failure count or the old last step. `None`: nothing is enrolled.
+    pub(crate) fn update_totp<R>(&self, did: &str, f: impl FnOnce(&mut TotpRecord) -> R) -> anyhow::Result<Option<R>> {
         self.with(|c| {
-            Ok(c.execute(
-                "INSERT INTO totp (did, secret, confirmed, last_step, failures, locked_until) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(did) DO UPDATE SET secret = excluded.secret, confirmed = excluded.confirmed, last_step = excluded.last_step, failures = excluded.failures, locked_until = excluded.locked_until",
-                params![did, b64u(&r.secret), r.confirmed, r.last_step, r.failures, r.locked_until],
-            )
-            .map(drop)?)
+            let Some(mut rec) = read_totp(c, did)? else { return Ok(None) };
+            let out = f(&mut rec);
+            write_totp(c, did, &rec)?;
+            Ok(Some(out))
         })
+    }
+
+    /// Forget `did`'s authenticator and remember when, so that sign-ins which rested
+    /// on it alone (no device to revoke) stop working. `true` if one was enrolled.
+    pub(crate) fn delete_totp(&self, did: &str, t: i64) -> anyhow::Result<bool> {
+        self.with(|c| {
+            let had = c.execute("DELETE FROM totp WHERE did = ?1", params![did])? > 0;
+            c.execute("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![format!("totp_reset|{did}"), t.to_string()])?;
+            Ok(had)
+        })
+    }
+
+    /// When `did`'s authenticator was last reset, if ever.
+    pub(crate) fn totp_reset_at(&self, did: &str) -> anyhow::Result<Option<i64>> {
+        self.with(|c| Ok(c.query_row("SELECT value FROM meta WHERE key = ?1", params![format!("totp_reset|{did}")], |r| r.get::<_, String>(0)).optional()?.and_then(|v| v.parse().ok())))
     }
 
     pub(crate) fn cosigner(&self, did: &str) -> anyhow::Result<Option<LocalSigner>> {
@@ -414,6 +426,25 @@ impl Store {
             Ok((count > i64::from(limit.max)).then(|| (start + limit.window_secs - t).max(1)))
         })
     }
+}
+
+fn read_totp(c: &Connection, did: &str) -> anyhow::Result<Option<TotpRecord>> {
+    let row: Option<(String, bool, i64, u32, i64)> = c
+        .query_row("SELECT secret, confirmed, last_step, failures, locked_until FROM totp WHERE did = ?1", params![did], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .optional()?;
+    Ok(match row {
+        Some((secret, confirmed, last_step, failures, locked_until)) => Some(TotpRecord { secret: b64u_decode(&secret)?, confirmed, last_step, failures, locked_until }),
+        None => None,
+    })
+}
+
+fn write_totp(c: &Connection, did: &str, r: &TotpRecord) -> anyhow::Result<()> {
+    c.execute(
+        "INSERT INTO totp (did, secret, confirmed, last_step, failures, locked_until) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(did) DO UPDATE SET secret = excluded.secret, confirmed = excluded.confirmed, last_step = excluded.last_step, failures = excluded.failures, locked_until = excluded.locked_until",
+        params![did, b64u(&r.secret), r.confirmed, r.last_step, r.failures, r.locked_until],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

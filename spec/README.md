@@ -106,7 +106,7 @@ An implementation claims one or more profiles:
 
 | Profile | Must implement |
 |---------|----------------|
-| **Resource server** | Verify access tokens against a JWKS (§3.5). Pass `test-vectors/authz.json` (§4). |
+| **Resource server** | Verify access tokens against a JWKS (§3.5). Pass `test-vectors/tokens.json` (§3.5) and `test-vectors/authz.json` (§4). |
 | **Slice reader** | The above, plus load slices and follow revocations (§8). Pass `test-vectors/policy-dag.json` and `test-vectors/beacons.json`. |
 | **Verifier** | The above, plus KEL replay (§1.6), session-chain verification (§3.3), and alias proofs (§5). |
 | **Hub** | The above, plus the endpoints of §2, §3.4 and §7. |

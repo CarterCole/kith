@@ -25,7 +25,7 @@ test("revocation vectors: decisions in order", async () => {
   await f.applyHeartbeat(r.org, r.heartbeat, await Verifiers.create(), r.heartbeat_received_at);
   for (const d of r.decisions) {
     assert.equal(f.freshness(d.now).level, d.level, d.name);
-    const got = authorize(slice, f, { principal: { id: d.principal, attrs: d.attrs, groups: [], roles: [], actor: d.actor, caps: d.caps }, jti: d.jti, action: d.action, resource: d.resource, context: d.context }, d.now);
+    const got = authorize(slice, f, { principal: { id: d.principal, attrs: d.attrs, groups: [], roles: [], actor: d.actor, caps: d.caps }, jti: d.jti, device: d.device, action: d.action, resource: d.resource, context: d.context }, d.now);
     assert.equal(got.allowed, d.allowed, `${d.name}: ${JSON.stringify(got)}`);
     if (d.reasons) assert.deepEqual(got.reasons, d.reasons, d.name);
   }

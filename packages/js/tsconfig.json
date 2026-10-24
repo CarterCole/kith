@@ -12,5 +12,5 @@
     "lib": ["es2022", "dom"],
     "types": ["node"]
   },
-  "include": ["src"]
+  "include": ["src", "examples"]
 }

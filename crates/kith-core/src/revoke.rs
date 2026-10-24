@@ -371,6 +371,8 @@ pub struct Request<'a> {
     pub principal: &'a Principal,
     /// The token's `jti`, if the principal came from a token.
     pub jti: Option<&'a str>,
+    /// The token's `dev` claim: the device the principal signed in from, if any.
+    pub device: Option<&'a str>,
     pub action: &'a str,
     pub resource: &'a Resource,
     pub context: &'a Value,
@@ -379,13 +381,13 @@ pub struct Request<'a> {
 /// Decide with revocations and freshness applied (spec §8.9):
 ///
 /// 1. a stale, behind or forked view denies everything;
-/// 2. a revoked principal or token is denied;
+/// 2. a revoked principal, token or device is denied;
 /// 3. memberships are recomputed from the slice with revoked memberships excluded
 ///    (so anything that came through them goes too), whatever the token claimed;
 /// 4. revoked permit policies are dropped;
 /// 5. policies see `context.kith = {sync_age, degraded, revocation_seq}`.
 pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64) -> Result<AuthzDecision> {
-    let Request { principal, jti, action, resource, context } = *req;
+    let Request { principal, jti, device, action, resource, context } = *req;
     let deny = |why: &str| Ok(AuthzDecision { allowed: false, reasons: vec![why.to_string()], errors: vec![] });
     let f = follower.freshness(now);
     if !f.allows_decisions() {
@@ -396,6 +398,9 @@ pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64
     }
     if jti.is_some_and(|j| follower.is_token_revoked(j)) {
         return deny("revoked:token");
+    }
+    if device.is_some_and(|d| follower.is_device_revoked(&principal.id, d)) {
+        return deny("revoked:device");
     }
     let engine = slice.engine_without(&follower.revoked_policies())?;
     let attrs = engine.attributes(&principal.id, &principal.attrs);
@@ -550,13 +555,13 @@ mod tests {
         let (o, slice, mut f) = setup();
         f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000).unwrap();
         let op = Resource::new("Operation", "Query.invoices");
-        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &op, context: &json!({}) }, 1000).unwrap().allowed);
+        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, device: None, action: "Query.invoices", resource: &op, context: &json!({}) }, 1000).unwrap().allowed);
 
         // Removing ada from finance also removes billing-reader (via group:finance),
         // even though her token still says billing-reader.
         let e1 = entry(&o, None, vec![Revocation::Member { id: "did:kith:ada".into(), set: "Group::finance".into() }]);
         f.apply_entry(&o.state, &e1).unwrap();
-        let d = authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &op, context: &json!({}) }, 1001).unwrap();
+        let d = authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, device: None, action: "Query.invoices", resource: &op, context: &json!({}) }, 1001).unwrap();
         assert!(!d.allowed, "{d:?}");
     }
 
@@ -567,13 +572,13 @@ mod tests {
         let e1 = entry(&o, None, vec![Revocation::Policy { id: "read-invoices".into() }, Revocation::Policy { id: "no-delegated-pay".into() }]);
         f.apply_entry(&o.state, &e1).unwrap();
         let op = Resource::new("Operation", "Query.invoices");
-        assert!(!authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &op, context: &json!({}) }, 1000).unwrap().allowed);
+        assert!(!authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, device: None, action: "Query.invoices", resource: &op, context: &json!({}) }, 1000).unwrap().allowed);
         // The forbid on delegated payments survives its "revocation".
         let mut delegated = ada();
         delegated.actor = Some("did:kith:assistant".into());
         let pay = Resource::new("Operation", "Mutation.payInvoice");
-        assert!(!authorize(&slice, &mut f, &Request { principal: &delegated, jti: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1000).unwrap().allowed);
-        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1000).unwrap().allowed);
+        assert!(!authorize(&slice, &mut f, &Request { principal: &delegated, jti: None, device: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1000).unwrap().allowed);
+        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, device: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1000).unwrap().allowed);
     }
 
     #[test]
@@ -582,19 +587,19 @@ mod tests {
         f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000).unwrap();
         let pay = Resource::new("Operation", "Mutation.payInvoice");
         let read = Resource::new("Operation", "Query.invoices");
-        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1010).unwrap().allowed);
+        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, device: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1010).unwrap().allowed);
         // 10 minutes without a heartbeat: degraded. Reads still work; the payment
         // policy wants a view younger than 60 s.
         assert_eq!(f.freshness(1600).level, Level::Degraded);
-        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &read, context: &json!({}) }, 1600).unwrap().allowed);
-        assert!(!authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1600).unwrap().allowed);
+        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, device: None, action: "Query.invoices", resource: &read, context: &json!({}) }, 1600).unwrap().allowed);
+        assert!(!authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, device: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1600).unwrap().allowed);
         // Past the verifier's own budget: nothing.
-        let d = authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &read, context: &json!({}) }, 5000).unwrap();
+        let d = authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, device: None, action: "Query.invoices", resource: &read, context: &json!({}) }, 5000).unwrap();
         assert_eq!(d.reasons, vec!["freshness:stale"]);
         // Principal and token revocations.
         f.apply_heartbeat(&o.state, &heartbeat(&o, None, 5000), &ClockBeacon, 5000).unwrap();
         let e1 = entry(&o, None, vec![Revocation::Token { jti: "t1".into() }]);
         f.apply_entry(&o.state, &e1).unwrap();
-        assert_eq!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: Some("t1"), action: "Query.invoices", resource: &read, context: &json!({}) }, 5000).unwrap().reasons, vec!["revoked:token"]);
+        assert_eq!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: Some("t1"), device: None, action: "Query.invoices", resource: &read, context: &json!({}) }, 5000).unwrap().reasons, vec!["revoked:token"]);
     }
 }

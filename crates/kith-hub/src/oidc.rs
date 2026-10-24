@@ -83,6 +83,35 @@ fn default_enc() -> String {
     "A256GCM".into()
 }
 
+/// Schemes that must never be a redirect or logout target, whatever else they look like.
+const BAD_SCHEMES: &[&str] = &["javascript", "data", "vbscript", "file", "about", "blob", "ftp", "ws", "wss"];
+
+/// May `u` be a redirect or logout target? https, plain http to loopback, or, when
+/// `private_use` is set, a private-use scheme as native apps use (RFC 8252 section 7.1,
+/// `com.example.app:/cb`). Schemes are case-insensitive, so they are compared in lower
+/// case: `HTTP://evil.example` is neither https nor loopback. No fragments, no
+/// whitespace or control characters, and no userinfo in an https authority, where
+/// `https://good.example@evil.example` would name evil.example.
+fn uri_ok(u: &str, private_use: bool) -> bool {
+    if u.contains('#') || u.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let Some((scheme, rest)) = u.split_once(':') else { return false };
+    let scheme = scheme.to_ascii_lowercase();
+    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)) {
+        return false;
+    }
+    match scheme.as_str() {
+        "https" => rest.strip_prefix("//").is_some_and(|a| {
+            let authority = a.split(['/', '?']).next().unwrap_or_default();
+            !authority.is_empty() && !authority.contains('@')
+        }),
+        "http" => loopback(&format!("http:{rest}")),
+        s if private_use && !BAD_SCHEMES.contains(&s) => rest.starts_with('/'),
+        _ => false,
+    }
+}
+
 fn loopback(u: &str) -> bool {
     ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter().any(|p| u.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/', '?'])))
 }
@@ -156,8 +185,14 @@ impl Client {
             anyhow::bail!("client {} has no redirect_uris", self.client_id);
         }
         for u in &self.redirect_uris {
-            if u.contains('#') || !(u.starts_with("https://") || loopback(u) || (!u.starts_with("http:") && u.contains(":/"))) {
+            if !uri_ok(u, true) {
                 anyhow::bail!("client {}: redirect_uri {u} must be https, loopback http, or a private-use scheme, with no fragment", self.client_id);
+            }
+        }
+        // The sign-out page sends the browser to these.
+        for u in &self.post_logout_redirect_uris {
+            if !uri_ok(u, true) {
+                anyhow::bail!("client {}: post_logout_redirect_uri {u} must be https, loopback http, or a private-use scheme, with no fragment", self.client_id);
             }
         }
         if !["RS256", "EdDSA"].contains(&self.id_token_signed_response_alg.as_str()) {
@@ -165,7 +200,7 @@ impl Client {
         }
         // The hub (back channel) or the user's browser (front channel) calls these.
         for u in self.backchannel_logout_uri.iter().chain(&self.frontchannel_logout_uri) {
-            if u.contains('#') || !(u.starts_with("https://") || loopback(u)) {
+            if !uri_ok(u, false) {
                 anyhow::bail!("client {}: logout URI {u} must be https or loopback http, with no fragment", self.client_id);
             }
         }
@@ -492,7 +527,7 @@ pub async fn authorize(State(h): State<Arc<Hub>>, headers: HeaderMap, Query(q): 
             let st = h.resolve(&a.st.did).ok();
             let device_ok = a.dev.as_ref().is_none_or(|d| st.as_ref().is_some_and(|st| st.device(d).is_some()));
             let alias_ok = a.alias.as_ref().is_none_or(|al| st.as_ref().is_some_and(|st| st.aliases.contains(al)));
-            if fresh && device_ok && alias_ok && a.aal >= min_aal {
+            if fresh && device_ok && alias_ok && h.totp_session_alive(&a) && a.aal >= min_aal {
                 if !h.needs_consent(&client, &a.st.did, &req) {
                     return match issue_code(&h, req, a, &sid) {
                         Ok(url) => Redirect::to(&url).into_response(),
@@ -813,6 +848,9 @@ fn issue_tokens(h: &Hub, client: &Client, scope: &str, authn: &Authn, nonce: Opt
 pub(crate) fn code_grant(h: &Hub, headers: &HeaderMap, req: &TokenReq) -> ApiResult<Value> {
     let client = authenticate_client(h, headers, req)?;
     let code = req.code.as_deref().ok_or_else(|| ApiError::bad("invalid_request", "code required"))?;
+    // Spent before anything is compared, on purpose: a code shown by the wrong client
+    // or with the wrong verifier is a sign it leaked (RFC 6749 section 4.1.2), so it
+    // must not stay usable for whoever tries next.
     let grant = h.store.take_code(code)?.ok_or_else(|| ApiError::grant("unknown, expired or already used code"))?;
     if grant.req.client_id != client.client_id {
         return Err(ApiError::grant("code was issued to another client"));
@@ -833,7 +871,8 @@ pub(crate) fn code_grant(h: &Hub, headers: &HeaderMap, req: &TokenReq) -> ApiRes
 pub(crate) fn refresh_grant(h: &Hub, headers: &HeaderMap, req: &TokenReq) -> ApiResult<Value> {
     let client = authenticate_client(h, headers, req)?;
     let rt = req.refresh_token.as_deref().ok_or_else(|| ApiError::bad("invalid_request", "refresh_token required"))?;
-    // Rotating: every refresh token is single use.
+    // Rotating: every refresh token is single use, and spent even if the client turns
+    // out to be the wrong one (a token shown by another client has leaked).
     let g = h.store.take_refresh(rt)?.ok_or_else(|| ApiError::grant("unknown or used refresh token"))?;
     if g.client_id != client.client_id || g.expires < now() {
         return Err(ApiError::grant("refresh token invalid for this client"));
@@ -846,6 +885,9 @@ pub(crate) fn refresh_grant(h: &Hub, headers: &HeaderMap, req: &TokenReq) -> Api
     }
     if g.authn.alias.as_ref().is_some_and(|al| !st.aliases.contains(al)) {
         return Err(ApiError::grant("the account this session signed in with has been unlinked"));
+    }
+    if !h.totp_session_alive(&g.authn) {
+        return Err(ApiError::grant("the authenticator this session signed in with has been reset"));
     }
     let scope = match &req.scope {
         Some(s) if s.split_whitespace().all(|x| scope_has(&g.scope, x)) => s.clone(),
@@ -875,6 +917,12 @@ pub async fn userinfo(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResul
 /// for each `frontchannel_logout_uri`.
 pub async fn logout(State(h): State<Arc<Hub>>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     let ended = cookie(&headers, SESSION_COOKIE).and_then(|sid| h.store.take_session(&sid).ok().flatten());
+    // Offline access ends with the session, as it does when an operator ends it.
+    if let Some(s) = &ended {
+        if let Err(e) = h.store.revoke_refresh(None, None, Some(&s.id)) {
+            eprintln!("logout: could not revoke refresh tokens of session {}: {e}", s.id);
+        }
+    }
     let client_id = q.get("client_id").cloned().or_else(|| {
         q.get("id_token_hint").and_then(|t| jws::decode(t).ok()).and_then(|t| t.claims["aud"].as_str().map(String::from))
     });
@@ -1082,6 +1130,34 @@ mod tests {
         c.redirect_uris = vec!["http://evil.example/cb".into()];
         assert!(c.validate().is_err());
         c.redirect_uris = vec!["com.example.app:/cb".into()];
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn uris_are_checked_the_same_way_whatever_the_case_or_scheme() {
+        let with = |redirect: &str, logout: &str| Client { client_id: "app".into(), redirect_uris: vec![redirect.into()], post_logout_redirect_uris: vec![logout.into()], ..Default::default() };
+        let ok = "https://app.example/cb";
+        // Scheme case doesn't turn a plain-http host into a private-use scheme.
+        for bad in ["HTTP://evil.example/cb", "Http://localhost.evil.example/cb", "javascript://example.com/%0Aalert(1)", "JavaScript://example.com/x", "data://text/html,x", "vbscript://x/y", "file:///etc/passwd", "https://good.example@evil.example/cb", "https://app.example/cb#frag", "https://app.example/ cb"] {
+            assert!(with(bad, "https://app.example/").validate().is_err(), "redirect_uri {bad} was accepted");
+            assert!(with(ok, bad).validate().is_err(), "post_logout_redirect_uri {bad} was accepted");
+        }
+        // The same goes for the logout notices the hub or the browser sends.
+        for bad in ["HTTP://evil.example/logout", "javascript://example.com/%0Aalert(1)", "myapp:/logout"] {
+            let mut c = with(ok, "https://app.example/");
+            c.backchannel_logout_uri = Some(bad.into());
+            assert!(c.validate().is_err(), "backchannel_logout_uri {bad} was accepted");
+            let mut c = with(ok, "https://app.example/");
+            c.frontchannel_logout_uri = Some(bad.into());
+            assert!(c.validate().is_err(), "frontchannel_logout_uri {bad} was accepted");
+        }
+        // What is meant to work still does, with a mixed-case scheme too.
+        for good in ["https://app.example/cb", "HTTPS://app.example/cb", "http://localhost:3000/cb", "http://127.0.0.1:8080/", "com.example.app:/cb", "myapp://callback"] {
+            with(good, good).validate().unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        let mut c = with(ok, "https://app.example/");
+        c.backchannel_logout_uri = Some("https://app.example/bc".into());
+        c.frontchannel_logout_uri = Some("http://localhost:3000/fc".into());
         c.validate().unwrap();
     }
 }

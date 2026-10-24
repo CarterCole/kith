@@ -12,6 +12,7 @@
 //! | `GET /v1/admin/sessions[?did=…]`               | live hub sessions (never their cookies)                              |
 //! | `DELETE /v1/admin/sessions/{sid}`              | end one session: its codes and refresh tokens die, clients are told |
 //! | `DELETE /v1/admin/identities/{did}/sessions`   | sign an identity out everywhere                                      |
+//! | `DELETE /v1/admin/identities/{did}/totp`       | forget an identity's authenticator; sign-ins resting on it alone end |
 //! | `GET /v1/admin/clients`                        | configured and registered clients, without secrets                   |
 //! | `DELETE /v1/admin/clients/{id}`                | delete a registered client (configured ones live in the clients file)|
 //! | `GET /v1/admin/grants/{did}`                   | what an identity agreed to share, per client                         |
@@ -155,3 +156,9 @@ pub async fn revoke_grant(State(h): State<Arc<Hub>>, headers: HeaderMap, Path((d
     let revoked = h.store.revoke_refresh(Some(&did), Some(&client_id), None)?;
     Ok(ok(json!({"revoked": scopes > 0, "refresh_tokens_revoked": revoked})))
 }
+
+pub async fn reset_totp(State(h): State<Arc<Hub>>, headers: HeaderMap, Path(did): Path<String>) -> ApiResult<Response> {
+    authorize(&h, &headers)?;
+    Ok(ok(json!({"reset": h.store.delete_totp(&did, now())?})))
+}
+

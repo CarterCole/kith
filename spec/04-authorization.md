@@ -62,7 +62,15 @@ The portable unit that hubs and resource servers load:
 | `context` | request data: field arguments, `operationType`, `field`, and `actor` when delegated. |
 
 Cedar has no `null` and no floats. Implementations MUST drop nulls and stringify
-non-integer numbers when building entities and context.
+non-integer numbers when building entities and context. A number with no fractional
+part (`2.0`) is the integer it says: JavaScript cannot tell the two apart, so the
+others must not either.
+
+Ids reach Cedar as text, so any character may appear in one: non-ASCII, quotes,
+backslashes, control characters. An implementation MUST NOT let such an id break the
+request or change what it names. The text that capabilities are matched against
+(`Type::"id"`, §3.3) is the JSON string of the id with non-ASCII left as it is, the
+same in every implementation.
 
 ## 4.3 Membership semantics (normative)
 
@@ -113,6 +121,11 @@ same way.
 - Lists of row-level types are filtered. A denied single object returns null plus a
   `FORBIDDEN` error.
 - No principal gives `UNAUTHENTICATED`, unless an `anonymous` principal is configured.
+- `__typename` is always allowed. Client libraries add it to every selection set, and it
+  reveals only a name the client already has.
+- Introspection (`__schema`, `__type`) is open by default. With `introspection:
+  "authenticated"` (JS) or `introspection="authenticated"` (Python) it needs a
+  principal, or the `anonymous` one. The other introspection types follow from those two.
 
 ```graphql
 directive @auth(action: String) on FIELD_DEFINITION | OBJECT

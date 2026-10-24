@@ -33,6 +33,11 @@ use crate::{Error, Result};
 
 const X25519_CODEC: [u8; 2] = [0xec, 0x01];
 
+/// How many revisions ahead of the one it was given a key will derive. Revisions come
+/// from stored envelopes, and the ratchet recurses once per 65,536 steps, so an envelope
+/// that says it is revision 2^63 would otherwise overflow the stack.
+pub const MAX_REVISION_GAP: u64 = 1 << 26;
+
 /// A device's X25519 key-agreement key.
 #[derive(Clone)]
 pub struct ExchangeKey(x25519_dalek::StaticSecret);
@@ -205,13 +210,12 @@ impl GroupKeyring {
 }
 
 impl TemporalKey {
-    /// Key for `revision` of this lineage, or `None` if it is before our access began.
+    /// Key for `revision` of this lineage, or `None` if it is before our access began or
+    /// more than [`MAX_REVISION_GAP`] after it.
     pub fn key_at(&self, revision: u64) -> Option<[u8; 32]> {
-        if revision < self.revision {
-            return None;
-        }
+        let gap = revision.checked_sub(self.revision).filter(|g| *g <= MAX_REVISION_GAP)?;
         let mut r = self.ratchet.clone();
-        r.inc_by((revision - self.revision) as usize);
+        r.inc_by(gap as usize);
         Some(r.derive_key(&dsi(&self.group, self.lineage)).finalize().into())
     }
 
@@ -219,7 +223,7 @@ impl TemporalKey {
         if env.group != self.group || env.lineage != self.lineage {
             return Err(Error::Authz("envelope is from a lineage this key cannot read".into()));
         }
-        let key = self.key_at(env.revision).ok_or_else(|| Error::Authz("revision predates access".into()))?;
+        let key = self.key_at(env.revision).ok_or_else(|| Error::Authz("revision is outside what this key can derive".into()))?;
         ChaCha20Poly1305::new(&key.into())
             .decrypt(&nonce_of(&b64u_decode(&env.nonce)?)?, Payload { msg: &b64u_decode(&env.ct)?, aad: &aad(&env.group, env.lineage, env.revision) })
             .map_err(|_| Error::Signature("decryption failed".into()))
@@ -283,5 +287,19 @@ mod tests {
         let env = ring.encrypt(b"hello").unwrap();
         assert_eq!(tk.decrypt(&env).unwrap(), b"hello");
         assert!(TemporalKey::open_share(&ExchangeKey::generate(), "finance", &member.did, &boxes[0]).is_err());
+    }
+
+    #[test]
+    fn an_absurd_revision_is_refused_not_chased() {
+        let mut ring = GroupKeyring::new("finance");
+        let tk = ring.temporal_key();
+        let mut env = ring.encrypt(b"x").unwrap();
+        env.revision = u64::MAX;
+        assert!(tk.decrypt(&env).is_err());
+        assert!(tk.key_at(u64::MAX).is_none());
+        assert!(tk.key_at(tk.revision + MAX_REVISION_GAP + 1).is_none());
+        assert!(tk.key_at(tk.revision + MAX_REVISION_GAP).is_some(), "the limit itself works");
+        ring.advance();
+        assert_eq!(tk.decrypt(&ring.encrypt(b"y").unwrap()).unwrap(), b"y");
     }
 }

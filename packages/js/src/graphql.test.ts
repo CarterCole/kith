@@ -72,3 +72,29 @@ test("delegated principal: caps narrow access and mutations are forbidden", asyn
   const pay = await run('mutation { payInvoice(id: "inv_1", amount: 5) { status } }', ada);
   assert.equal(pay.errors?.[0].extensions?.code, "FORBIDDEN");
 });
+
+test("__typename is always allowed: client libraries add it to every selection set", async () => {
+  const r = await run("{ __typename }");
+  assert.deepEqual(JSON.parse(JSON.stringify(r.data)), { __typename: "Query" });
+  const rows = await run("{ __typename invoices { __typename id } }", principal("did:kith:ada", 1));
+  assert.equal(rows.errors, undefined);
+  assert.deepEqual([...new Set((rows.data as any).invoices.map((i: any) => i.__typename))], ["Invoice"]);
+});
+
+test("introspection is open by default and can require a principal", async () => {
+  const open = await run("{ __schema { queryType { name } } }");
+  assert.equal(open.errors, undefined);
+  assert.equal((open.data as any).__schema.queryType.name, "Query");
+
+  const guarded = buildSchema(readFileSync(new URL("graphql/schema.graphql", root), "utf8"));
+  kithGraphQL(guarded, { engine, introspection: "authenticated" });
+  const ask = (source: string, p?: Principal) => graphql({ schema: guarded, source, contextValue: p ? { kith: { principal: p } } : {} });
+  for (const q of ["{ __schema { queryType { name } } }", '{ __type(name: "Invoice") { name } }']) {
+    assert.equal((await ask(q)).errors?.[0].extensions?.code, "UNAUTHENTICATED", q);
+    assert.equal((await ask(q, principal("did:kith:bob", 1))).errors, undefined, q);
+  }
+  assert.deepEqual(JSON.parse(JSON.stringify((await ask("{ __typename }")).data)), { __typename: "Query" });
+  // The other schema, built before, is unaffected.
+  assert.equal((await run("{ __schema { queryType { name } } }")).errors, undefined);
+});
+

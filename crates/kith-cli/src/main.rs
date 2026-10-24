@@ -242,6 +242,12 @@ enum AliasCmd {
         file: PathBuf,
         #[arg(long)]
         aud: Option<String>,
+        /// The nonce you gave the prover. Without one, the proof must still be recent.
+        #[arg(long)]
+        nonce: Option<String>,
+        /// Seconds a proof may be old, by its own `iat`.
+        #[arg(long, default_value_t = kith_core::alias::ALIAS_PROOF_MAX_AGE)]
+        max_age: i64,
     },
     /// Publicly link an alias (mailto:, https:, did:web:, eip155:…).
     Link { alias: String },
@@ -252,6 +258,14 @@ enum TotpCmd {
     /// Enroll TOTP at the hub; prints the otpauth URI for your authenticator app.
     Enroll,
     Confirm { code: String },
+    /// Forget the authenticator so a new one can be enrolled. Needs a current code, or
+    /// a strong (AAL 2) sign-in such as a passkey. Sign-ins that rested on the
+    /// authenticator alone end. An operator can also do it: `DELETE /v1/admin/identities/{did}/totp`.
+    Reset {
+        /// A current code from the authenticator being replaced.
+        #[arg(long)]
+        code: Option<String>,
+    },
     /// Compute the current code for a base32 secret (acts as an authenticator app).
     Code { secret: String },
 }
@@ -266,6 +280,10 @@ enum PasskeyCmd {
         /// Don't try to open the browser; just print the link.
         #[arg(long)]
         no_open: bool,
+        /// Add the passkey without asking. Otherwise you compare the fingerprint the
+        /// browser shows with the one printed here, and answer y.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -380,7 +398,7 @@ impl DeviceKey {
     fn grant_session(&self, did: &str, dev: &Device, ttl: i64) -> Result<SessionKey> {
         Ok(match self {
             DeviceKey::Software(s) if dev.kind == DeviceKind::Passkey => {
-                SessionKey::create(did, dev, DeviceSigner::Passkey { key: &s.secret, rp_id: "localhost", origin: "http://localhost" }, ttl)?
+                SessionKey::create(did, dev, DeviceSigner::Passkey { key: &s.secret, rp_id: "localhost", origin: "http://localhost", user_verified: true }, ttl)?
             }
             DeviceKey::Software(s) => SessionKey::create(did, dev, DeviceSigner::Key(&s.secret), ttl)?,
             #[cfg(target_os = "macos")]
@@ -1095,10 +1113,10 @@ fn main() -> Result<()> {
             let alias = PrivateAlias { label: label.clone(), signer: home.signer_from_json(&a["signer"])?, salt: a["salt"].as_str().unwrap_or_default().into() };
             print(&serde_json::to_value(alias.prove(&did, a["seq"].as_u64().unwrap_or(0), aud, nonce)?)?);
         }
-        Cmd::Alias(AliasCmd::Verify { file, aud }) => {
+        Cmd::Alias(AliasCmd::Verify { file, aud, nonce, max_age }) => {
             let proof: AliasProof = serde_json::from_str(&std::fs::read_to_string(file)?)?;
             let st = fetch_state(&home.hub()?, &proof.root)?;
-            verify_alias_proof(&proof, &st, aud.as_deref(), None)?;
+            verify_alias_proof(&proof, &st, aud.as_deref(), nonce.as_deref(), now(), max_age)?;
             println!("valid: {} is an alias of {}", proof.alias, proof.root);
         }
         Cmd::Alias(AliasCmd::Link { alias }) => {
@@ -1142,7 +1160,7 @@ fn main() -> Result<()> {
             let auth = bearer(&mut home)?;
             print(&check(http().post(format!("{hub}/v1/totp/confirm")).header("authorization", auth).json(&json!({"code": code})).send()?)?);
         }
-        Cmd::Passkey(PasskeyCmd::Enroll { name, no_open }) => {
+        Cmd::Passkey(PasskeyCmd::Enroll { name, no_open, yes }) => {
             let hub = home.hub()?;
             let auth = bearer(&mut home)?;
             let e = check(http().post(format!("{hub}/v1/enroll")).header("authorization", &auth).json(&json!({"name": name})).send()?)?;
@@ -1169,7 +1187,14 @@ fn main() -> Result<()> {
             };
             let s = poll("key")?;
             let key = s["key"].as_str().unwrap_or_default().to_string();
-            eprintln!("browser created passkey {key}; approving with your manage key");
+            // The link is a bearer secret and the hub reports the key, so look before signing.
+            // The page shows the same code, computed in the browser from the key it made.
+            eprintln!("browser created passkey {key}");
+            eprintln!("fingerprint {}  (the enrollment page shows the same code)", kith_core::util::key_fingerprint(&key));
+            if !confirm("Add it as a device of your identity?", yes, &mut std::io::stdin().lock(), &mut std::io::stderr())? {
+                bail!("not approved; nothing was added (pass --yes to skip the question)");
+            }
+            eprintln!("approving with your manage key");
             let st = home.state()?;
             let dev = Device {
                 id: format!("dev_{}", &random_id()[..8]),
@@ -1192,6 +1217,15 @@ fn main() -> Result<()> {
             home.append(ev)?;
             publish(&home)?;
             eprintln!("enrolled passkey as device {} ({name})", dev.id);
+        }
+        Cmd::Totp(TotpCmd::Reset { code }) => {
+            let hub = home.hub()?;
+            let auth = bearer(&mut home)?;
+            let mut req = http().delete(format!("{hub}/v1/totp")).header("authorization", auth);
+            if let Some(code) = code {
+                req = req.json(&json!({"code": code}));
+            }
+            print(&check(req.send()?)?);
         }
         Cmd::Totp(TotpCmd::Code { secret }) => println!("{}", totp::code_at(&totp::from_base32(&secret)?, now())),
         Cmd::Cosigner => {
@@ -1226,3 +1260,45 @@ fn kind_str(k: DeviceKind) -> &'static str {
         DeviceKind::Wallet => "wallet",
     }
 }
+
+/// Ask a yes/no question. `yes` answers it without asking; otherwise only a line that
+/// starts with y or Y counts, so end of input, an empty line or anything else is no.
+fn confirm(question: &str, yes: bool, input: &mut impl std::io::BufRead, out: &mut impl std::io::Write) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    write!(out, "{question} [y/N] ")?;
+    out.flush()?;
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    Ok(line.trim_start().starts_with(['y', 'Y']))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ask(yes: bool, typed: &str) -> bool {
+        confirm("ok?", yes, &mut typed.as_bytes(), &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn only_an_explicit_yes_approves() {
+        assert!(ask(true, ""), "--yes needs no answer");
+        assert!(ask(false, "y\n") && ask(false, "Y\n") && ask(false, "yes\n") && ask(false, "  yes\n"));
+        for no in ["", "\n", "n\n", "no\n", "maybe\n", "x y\n"] {
+            assert!(!ask(false, no), "{no:?} was taken as a yes");
+        }
+    }
+
+    #[test]
+    fn the_question_is_asked_on_the_given_output() {
+        let mut out = Vec::new();
+        confirm("Add it?", false, &mut "n\n".as_bytes(), &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "Add it? [y/N] ");
+        let mut out = Vec::new();
+        confirm("Add it?", true, &mut "".as_bytes(), &mut out).unwrap();
+        assert!(out.is_empty(), "--yes asks nothing");
+    }
+}
+

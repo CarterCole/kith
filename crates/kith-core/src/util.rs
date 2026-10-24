@@ -33,3 +33,23 @@ pub fn random_id() -> String {
     rand::rngs::OsRng.fill_bytes(&mut b);
     b64u(b)
 }
+
+/// A short code for a public key, for people to compare across two screens: the first
+/// six bytes of SHA-256 of its `did:key` string, as `xxxx-xxxx-xxxx`. The passkey
+/// enrollment page computes the same thing in the browser.
+pub fn key_fingerprint(key: &str) -> String {
+    let h = sha256(key.as_bytes());
+    let hex: String = h[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}", &hex[0..4], &hex[4..8], &hex[8..12])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_is_a_short_stable_code() {
+        assert_eq!(key_fingerprint("did:key:zDnaerDaTF5BXEavCrfRZEk316dpbLsfPDZ3WJ5hRTPFU2169"), "b473-c406-6da7");
+        assert_ne!(key_fingerprint("did:key:zDnaerDaTF5BXEavCrfRZEk316dpbLsfPDZ3WJ5hRTPFU2160"), "b473-c406-6da7");
+    }
+}

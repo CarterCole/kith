@@ -24,7 +24,8 @@
     { "id": "did:kith:ada", "attrs": { "aal": 1 }, "groups": ["finance", "staff"], "roles": ["billing-reader"] },
     { "id": "did:kith:bob", "attrs": { "aal": 3 }, "groups": ["contractors", "finance", "strong", "vip"], "roles": ["billing-admin", "billing-reader"] },
     { "id": "did:kith:eve", "attrs": { "aal": 3, "email": "eve@acme.test" }, "groups": ["staff", "strong"], "roles": [] },
-    { "id": "did:kith:mallory", "attrs": {}, "groups": [], "roles": [] }
+    { "id": "did:kith:mallory", "attrs": {}, "groups": [], "roles": [] },
+    { "id": "did:kith:ada", "attrs": { "aal": 2.0 }, "groups": ["finance", "staff", "strong", "vip"], "roles": ["billing-admin", "billing-reader"] }
   ],
   "decisions": [
     { "name": "reader lists invoices", "principal": "did:kith:ada", "attrs": { "aal": 1 }, "action": "Query.invoices", "resource": { "type": "Operation", "id": "Query.invoices" }, "context": {}, "allowed": true },
@@ -36,6 +37,10 @@
     { "name": "row level: someone else's invoice", "principal": "did:kith:bob", "attrs": { "aal": 1 }, "action": "Invoice.read", "resource": { "type": "Invoice", "id": "inv_1", "attrs": { "ownerEmail": "ada@acme.test" } }, "context": {}, "allowed": false },
     { "name": "delegated: cap allows query", "principal": "did:kith:ada", "attrs": { "aal": 2 }, "actor": "did:kith:agent", "caps": [{ "action": "Query.*" }], "action": "Query.invoices", "resource": { "type": "Operation", "id": "Query.invoices" }, "context": {}, "allowed": true },
     { "name": "delegated: cap missing", "principal": "did:kith:ada", "attrs": { "aal": 2 }, "actor": "did:kith:agent", "caps": [{ "action": "Query.*" }], "action": "Invoice.read", "resource": { "type": "Invoice", "id": "inv_1", "attrs": { "ownerEmail": "ada@acme.test" } }, "context": {}, "allowed": false },
-    { "name": "delegated: cap present but policy forbids", "principal": "did:kith:ada", "attrs": { "aal": 2 }, "actor": "did:kith:agent", "caps": [{ "action": "*" }], "action": "Mutation.payInvoice", "resource": { "type": "Operation", "id": "Mutation.payInvoice" }, "context": { "amount": 5 }, "allowed": false }
+    { "name": "delegated: cap present but policy forbids", "principal": "did:kith:ada", "attrs": { "aal": 2 }, "actor": "did:kith:agent", "caps": [{ "action": "*" }], "action": "Mutation.payInvoice", "resource": { "type": "Operation", "id": "Mutation.payInvoice" }, "context": { "amount": 5 }, "allowed": false },
+    { "name": "an integral float is an integer", "principal": "did:kith:ada", "attrs": { "aal": 2.0 }, "action": "Mutation.payInvoice", "resource": { "type": "Operation", "id": "Mutation.payInvoice" }, "context": { "amount": 500.0 }, "allowed": true },
+    { "name": "a resource id with non-ASCII, quotes, a backslash and an emoji", "principal": "did:kith:ada", "attrs": { "aal": 1 }, "action": "Invoice.read", "resource": { "type": "Invoice", "id": "inv_\u00fc \"1\" \\ \ud83d\ude00", "attrs": { "ownerEmail": "ada@acme.test" } }, "context": {}, "allowed": true },
+    { "name": "delegated: a cap on a non-ASCII resource prefix allows it", "principal": "did:kith:ada", "attrs": { "aal": 1 }, "actor": "did:kith:agent", "caps": [{ "action": "Invoice.*", "resource": "Invoice::\"inv_\u00fc*" }], "action": "Invoice.read", "resource": { "type": "Invoice", "id": "inv_\u00fc1", "attrs": { "ownerEmail": "ada@acme.test" } }, "context": {}, "allowed": true },
+    { "name": "delegated: the ASCII look-alike prefix does not", "principal": "did:kith:ada", "attrs": { "aal": 1 }, "actor": "did:kith:agent", "caps": [{ "action": "Invoice.*", "resource": "Invoice::\"inv_u*" }], "action": "Invoice.read", "resource": { "type": "Invoice", "id": "inv_\u00fc1", "attrs": { "ownerEmail": "ada@acme.test" } }, "context": {}, "allowed": false }
   ]
 }

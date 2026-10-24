@@ -227,6 +227,10 @@ thresholds. A policy is satisfied by a set of signer ids that each produced a va
 signature over the same message. Invalid signatures make the event invalid; they are
 never just ignored. A policy's digest is `digest(policy)`.
 
+A signer id appears **at most once** in a policy, at any depth. A repeat would let one
+key fill two seats, so that `2 of [A, A]` is met by A alone. A policy that repeats one is
+invalid.
+
 Future work: timelocks (`after(72h)`) and signer weights, so policies can express
 "recovery keys can override within 72 hours" as did:plc does.
 
@@ -238,6 +242,12 @@ Future work: timelocks (`after(72h)`) and signer weights, so policies can expres
 | **L1 manage** | `manage` policy | `add_device`, `revoke_device`, `alias_link`, `alias_unlink`, `alias_commit` |
 | **L2 device** | active device keys | sign session grants (`session` cap), commit private aliases (`alias` cap), revoke itself |
 | **L3 session** | ephemeral keys certified by a device | sign session tokens and delegations; never appear in the KEL |
+
+**A device acts only within its `caps`.** Without `session` it cannot authenticate the
+identity at all: a challenge signed by its key (§2.3), a passkey assertion from it, a
+session grant it signs and a delegation made through that grant are all refused. A
+device with only `revoke`, such as the hub's relay (§8.6), can sign revocations and
+heartbeats and nothing else. Manage signers can always authenticate.
 
 **Pre-rotation** comes from KERI. The rotation keys are published only as a hash (`next`)
 and are revealed only when they are used. An attacker who steals every *current* key

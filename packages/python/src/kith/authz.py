@@ -34,7 +34,8 @@ class Resource:
 
     @property
     def uid(self) -> str:
-        return f"{self.type}::{json.dumps(self.id)}"
+        """``Type::"id"`` as capabilities are matched against it, the same text as in Rust and JS."""
+        return f"{self.type}::{json.dumps(self.id, ensure_ascii=False)}"
 
 
 @dataclass
@@ -45,13 +46,17 @@ class Decision:
 
 
 def cedar_value(v: Any) -> Any:
-    """Cedar has no null or floats: drop ``None``, stringify non-integers."""
+    """Cedar has no null or floats: drop ``None``, stringify non-integers.
+
+    A float with no fractional part (``2.0``) is the integer it says, as in JavaScript,
+    where the two cannot be told apart.
+    """
     if v is None:
         return None
     if isinstance(v, bool) or isinstance(v, (int, str)):
         return v
     if isinstance(v, float):
-        return str(v)
+        return int(v) if v.is_integer() and abs(v) <= 2**53 - 1 else str(v)
     if isinstance(v, (list, tuple, set)):
         return [c for c in (cedar_value(x) for x in v) if c is not None]
     if isinstance(v, Mapping):
@@ -67,8 +72,30 @@ def caps_allow(caps: Iterable[Mapping[str, str]], action: str, resource: str) ->
     return any(_glob(c["action"], action) and _glob(c.get("resource", "*"), resource) for c in caps)
 
 
+def _cedar_string(s: str) -> str:
+    """A Cedar string literal. JSON's escapes are not Cedar's: ``\\u00fc`` is not valid,
+    ``\\u{fc}`` is, and non-ASCII text can simply stand."""
+    out = ['"']
+    for ch in s:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append("\\u{%x}" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
 def _uid(kind: str, id: str) -> str:
-    return f"{kind}::{json.dumps(id)}"
+    """``Type::"id"`` as policy source. Requests use :func:`_ref` instead."""
+    return f"{kind}::{_cedar_string(id)}"
+
+
+def _ref(kind: str, id: str) -> dict:
+    """An entity reference in cedarpy's structured form. The string form has to be exactly
+    Cedar's canonical text, which not every id has a simple spelling in (newlines, NUL)."""
+    return {"type": kind, "id": id}
 
 
 def _entity(kind: str, id: str, attrs: Mapping[str, Any], parents: Iterable[tuple[str, str]]) -> dict:
@@ -96,7 +123,7 @@ class Engine:
                     continue
                 src = (
                     f'permit(principal, action == Action::"{MEMBER_ACTION}", '
-                    f"resource == {kind}::{json.dumps(name)}) when {{ {rule} }};"
+                    f"resource == {_uid(kind, name)}) when {{ {rule} }};"
                 )
                 # Exactly one policy per rule: rejects rules that smuggle in extra policies.
                 if len(json.loads(cedarpy.policies_to_json_str(src))["staticPolicies"]) != 1:
@@ -139,7 +166,7 @@ class Engine:
                     dynamic = False
                     if not explicit and (kind, name) in self._membership:
                         r = cedarpy.is_authorized(
-                            {"principal": _uid("User", id), "action": _uid("Action", MEMBER_ACTION), "resource": _uid(kind, name), "context": {}},
+                            {"principal": _ref("User", id), "action": _ref("Action", MEMBER_ACTION), "resource": _ref(kind, name), "context": {}},
                             self._membership[(kind, name)],
                             entities,
                         )
@@ -169,7 +196,7 @@ class Engine:
             _entity(resource.type, resource.id, resource.attrs, []),
         ]
         r = cedarpy.is_authorized(
-            {"principal": _uid("User", principal.id), "action": _uid("Action", action), "resource": resource.uid, "context": ctx},
+            {"principal": _ref("User", principal.id), "action": _ref("Action", action), "resource": _ref(resource.type, resource.id), "context": ctx},
             self._policies,
             entities,
         )

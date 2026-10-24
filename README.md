@@ -60,7 +60,7 @@ scripts/demo.sh        # hub + JS API + Python API, CLI logins, TOTP step-up, de
 scripts/cli-flows.sh   # devices, passkeys, aliases, delegation, revocation, TOTP co-signed recovery
 scripts/oidc-demo.sh   # real Chrome + virtual passkey: enroll from the browser, OIDC sign-in, SSO, step-up, logout
 scripts/policy-dag-demo.sh  # org publishes a policy DAG, provable slices, revocation push, drand-verified freshness
-scripts/test-all.sh    # unit tests (Rust, JS, Python) incl. shared conformance vectors
+scripts/test-all.sh    # unit tests (Rust, JS, Python) incl. shared conformance vectors; CI runs it too
 ```
 
 You need a recent stable Rust, Node 23.6+ (it runs TypeScript directly) and uv. The demo
@@ -91,7 +91,8 @@ kith name add ada mailto:ada@acme.test       # follow her WebFinger (or DNS) bac
 kith delegate --to ada --action 'Query.*'    # a name works wherever a DID does
 kith resolve https://acme.test               # just look: both directions checked, and exactly one root must pass
 kith name check                              # re-resolve pinned names; report any that moved or became ambiguous
-kith passkey enroll                          # create a passkey in your browser, approve it here
+kith passkey enroll                          # create a passkey in your browser; compare its fingerprint, answer y
+kith totp reset [--code 123456]              # forget the authenticator (a current code, or a passkey sign-in)
 ```
 
 **Any existing app, through OpenID Connect** ([spec](spec/07-oidc.md))
@@ -123,7 +124,7 @@ kithGraphQL(schema, { engine: new Engine(bundle) });   // root fields default-de
 createYoga({ schema, context: kithContextFactory(createVerifier({ issuer: HUB, audience: "api://invoices" })) });
 ```
 
-**GraphQL server, Python** (Ariadne, Strawberry, Graphene, anything on graphql-core)
+**GraphQL server, Python** (Ariadne, Graphene, anything that takes graphql-core middleware)
 
 ```python
 from kith import Engine, Verifier
@@ -187,3 +188,6 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 ready. On Linux the CLI stores keys in plaintext (macOS uses the keychain and Secure
 Enclave), and the hub has no TLS of its own. See
 [the roadmap](docs/roadmap.md#known-gaps-in-the-reference-code-not-production-ready).
+
+Licensed under the [Apache License 2.0](LICENSE). To report a security problem, see
+[`SECURITY.md`](SECURITY.md).

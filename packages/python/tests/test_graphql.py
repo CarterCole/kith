@@ -62,3 +62,29 @@ def test_delegated_mutation_forbidden():
     r = run("{ me { actor } }", ada)
     assert r.data["me"]["actor"] == "did:kith:assistant"
     assert run('mutation { payInvoice(id: "inv_1", amount: 5) { status } }', ada).errors[0].extensions["code"] == "FORBIDDEN"
+
+
+def test_typename_is_always_allowed():
+    """Apollo, urql and Relay add __typename to every selection set."""
+    assert run("{ __typename }").data == {"__typename": "Query"}, "even with no principal"
+    ada = ENGINE.principal("did:kith:ada", {"aal": 1})
+    r = run("{ __typename invoices { __typename id } }", ada)
+    assert r.errors is None, r.errors
+    assert r.data["__typename"] == "Query"
+    assert {i["__typename"] for i in r.data["invoices"]} == {"Invoice"}
+    assert run('mutation { __typename }', ada).data == {"__typename": "Mutation"}
+
+
+def test_introspection_is_open_by_default():
+    r = run("{ __schema { queryType { name } } }")
+    assert r.errors is None and r.data["__schema"]["queryType"]["name"] == "Query"
+    r = run('{ __type(name: "Invoice") { name fields { name } } }')
+    assert r.errors is None and r.data["__type"]["name"] == "Invoice"
+
+
+def test_introspection_can_require_a_principal():
+    guarded = lambda q, p=None: graphql_sync(SCHEMA, q, root_value=Root(), context_value={"kith": p}, middleware=[KithMiddleware(ENGINE, introspection="authenticated")])
+    for q in ("{ __schema { queryType { name } } }", '{ __type(name: "Invoice") { name } }'):
+        assert guarded(q).errors[0].extensions["code"] == "UNAUTHENTICATED", q
+        assert guarded(q, ENGINE.principal("did:kith:bob", {"aal": 1})).errors is None, q
+    assert guarded("{ __typename }").data == {"__typename": "Query"}, "__typename reveals nothing"

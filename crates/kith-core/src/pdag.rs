@@ -272,7 +272,14 @@ impl Reader<'_> {
     }
 
     fn policies(&self, index: &str, key: &str, out: &mut BTreeMap<String, PolicyEntry>) -> Result<()> {
-        for l in self.lookup(index, key)?.and_then(|v| v.as_array().cloned()).unwrap_or_default() {
+        // Absent is "no policies filed here". Present but not a list is a lie, and read as
+        // empty it would drop policies, forbids included.
+        let list = match self.lookup(index, key)? {
+            None => return Ok(()),
+            Some(Value::Array(a)) => a,
+            Some(other) => return Err(Error::Encoding(format!("policy index {index}[{key}] is not a list: {other}"))),
+        };
+        for l in list {
             let cid = as_link(&l).ok_or_else(|| Error::Encoding("policy index entry is not a link".into()))?;
             let e: PolicyEntry = serde_json::from_value(get_verified(self.store, cid)?)?;
             out.insert(e.id.clone(), e);
@@ -327,8 +334,13 @@ pub fn load(store: &dyn BlockGet, root: &str, query: &Query) -> Result<Slice> {
         Query::Principal { id } => {
             // Every set the principal could be in: the ones that list it, every rule
             // set, and everything that depends on those.
-            let direct: Vec<String> = r.lookup("members", id)?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
-            let rules: Vec<String> = serde_json::from_value(r.root["rules"].clone()).unwrap_or_default();
+            // A set that is missing would leave a principal out of a group, which can
+            // let a forbid that names the group miss them, so malformed means an error.
+            let direct: Vec<String> = match r.lookup("members", id)? {
+                None => vec![],
+                Some(v) => serde_json::from_value(v).map_err(|e| Error::Encoding(format!("members[{id}]: {e}")))?,
+            };
+            let rules: Vec<String> = serde_json::from_value(r.root["rules"].clone()).map_err(|e| Error::Encoding(format!("policy dag rules: {e}")))?;
             r.closure(direct.into_iter().chain(rules), true, &mut sets)?;
             let candidates: Vec<String> = sets.keys().cloned().collect();
             for key in candidates.iter().map(String::as_str).chain([ANY, format!("User::{id}").as_str()]) {
@@ -345,7 +357,7 @@ pub fn load(store: &dyn BlockGet, root: &str, query: &Query) -> Result<Slice> {
             directory.insert(id, serde_json::from_value(d)?);
         }
     }
-    let version = r.root["version"].as_u64().unwrap_or(0) as u32;
+    let version = r.root["version"].as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| Error::Encoding(format!("policy dag version {}", r.root["version"])))?;
     let mut policies: Vec<PolicyEntry> = policies.into_values().collect();
     policies.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Slice { root: root.to_string(), version, sets, policies, directory })
@@ -494,5 +506,55 @@ mod tests {
         let forbid = proof.iter().find(|(_, b)| String::from_utf8_lossy(b).contains("\"effect\":\"forbid\"")).map(|(c, _)| c.clone()).unwrap();
         proof.remove(&forbid);
         assert!(load(&MemStore::from_blocks(proof), &root, &q).is_err());
+    }
+
+    /// The DAG for the conformance bundle with its root changed by `change`, which also
+    /// gets the store to put new blocks in.
+    fn tampered(change: impl FnOnce(&MemStore, &mut Value)) -> (MemStore, String) {
+        let bundle: Bundle = serde_json::from_value(vectors()["bundle"].clone()).unwrap();
+        let store = MemStore::new();
+        let root = build(&store, &bundle).unwrap();
+        let mut root_v = get_verified(&store, &root).unwrap();
+        change(&store, &mut root_v);
+        let new_root = put_value(&store, &root_v).unwrap();
+        (store, new_root)
+    }
+
+    /// Set one entry of one of the root's index maps.
+    fn set_entry(store: &MemStore, root_v: &mut Value, index: &str, key: &str, value: Value) {
+        let old = as_link(&root_v[index]).unwrap().to_string();
+        let mut entries = dag::map_entries(store, &old).unwrap();
+        entries.insert(key.into(), value);
+        root_v[index] = link(&map_build(store, &entries).unwrap());
+    }
+
+    fn ada() -> Query {
+        Query::Principal { id: "did:kith:ada".into() }
+    }
+
+    /// Anything that is not what the builder writes is an error. Read as "nothing here",
+    /// a malformed index would drop policies, and a dropped forbid is an open door.
+    #[test]
+    fn malformed_dags_fail_closed() {
+        type Change = Box<dyn FnOnce(&MemStore, &mut Value)>;
+        let cases: Vec<(&str, Query, Change)> = vec![
+            ("rules is a string", ada(), Box::new(|_, r| r["rules"] = json!("Group::staff"))),
+            ("rules holds numbers", ada(), Box::new(|_, r| r["rules"] = json!([1, 2]))),
+            ("no rules", ada(), Box::new(|_, r| drop(r.as_object_mut().unwrap().remove("rules")))),
+            ("members is a string", ada(), Box::new(|s, r| set_entry(s, r, "members", "did:kith:ada", json!("Group::finance")))),
+            ("members holds numbers", ada(), Box::new(|s, r| set_entry(s, r, "members", "did:kith:ada", json!([1])))),
+            ("a policy list is a string", Query::Actions { actions: vec!["Query.invoices".into()], principals: vec![] }, Box::new(|s, r| set_entry(s, r, "actions", "Query.invoices", json!("nope")))),
+            ("the any-action policy list is an object", Query::Actions { actions: vec!["Query.invoices".into()], principals: vec![] }, Box::new(|s, r| set_entry(s, r, "actions", ANY, json!({"oops": 1})))),
+            ("a principal policy list is a number", ada(), Box::new(|s, r| set_entry(s, r, "principals", ANY, json!(7)))),
+            ("a version that does not fit", ada(), Box::new(|_, r| r["version"] = json!(u64::MAX))),
+            ("a version that is text", ada(), Box::new(|_, r| r["version"] = json!("1"))),
+        ];
+        for (name, query, change) in cases {
+            let (store, root) = tampered(change);
+            assert!(load(&store, &root, &query).is_err(), "{name}: loaded without complaint");
+        }
+        // And the untouched DAG still loads.
+        let (store, root) = tampered(|_, _| {});
+        load(&store, &root, &ada()).unwrap();
     }
 }

@@ -10,6 +10,7 @@
   <div class="brand">Kith</div>
   <h1>Add a passkey to your identity</h1>
   <p>This passkey becomes a device of<code id="did" class="block"></code>Your terminal approves it with your manage key.</p>
+  <p id="check" class="hidden">Your terminal asks you to approve a passkey. Check that it shows this code:<code id="fingerprint" class="block"></code></p>
   <div class="stack">
     <button id="create" class="primary" type="button">Create passkey</button>
     <button id="confirm" class="primary hidden" type="button">Confirm with your passkey</button>
@@ -38,6 +39,11 @@ function p256DidKey(spki) {
   return "did:key:z" + base58(new Uint8Array([0x80, 0x24, ...compressed]));
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The first six bytes of SHA-256(did:key), as xxxx-xxxx-xxxx. `kith` prints the same.
+async function fingerprint(k) {
+  const hex = Array.from((await sha256(k)).slice(0, 6), (b) => b.toString(16).padStart(2, "0")).join("");
+  return hex.match(/.{4}/g).join("-");
+}
 
 if (!webauthnSupported()) { $("create").disabled = true; status("This browser doesn't support passkeys.", "error"); }
 if (D.state !== "waiting_for_passkey") { $("create").disabled = true; status("This link has already been used.", "error"); }
@@ -59,9 +65,11 @@ $("create").onclick = async () => {
     if (!spki) throw new Error("the authenticator did not return a public key");
     key = p256DidKey(spki);
     rawId = cred.rawId;
+    $("fingerprint").textContent = await fingerprint(key);
+    $("check").classList.remove("hidden");
     const r = await postJSON(`/v1/enroll/${D.id}/key`, { key, credential_id: b64u(rawId) });
     if (!r.ok) throw new Error(r.body.error_description || "could not submit the passkey");
-    status("Passkey created. Waiting for your terminal to approve it…");
+    status("Passkey created. Check the code above against your terminal, then approve it there…");
     for (;;) {
       const s = await (await fetch(`/v1/enroll/${D.id}`)).json();
       if (s.message) { D.message = s.message; break; }

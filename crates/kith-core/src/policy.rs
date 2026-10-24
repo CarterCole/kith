@@ -32,15 +32,37 @@ impl SignerPolicy {
         SignerPolicy::Threshold { threshold: k, of }
     }
 
+    /// A policy is well formed if every signer id parses, every threshold can be met,
+    /// and no signer appears twice anywhere in it. A repeat would let one key count
+    /// for two seats, so that `2 of [A, A]` is satisfied by A alone.
     pub fn validate(&self) -> Result<()> {
+        self.validate_shape()?;
+        let mut seen = BTreeSet::new();
+        self.check_distinct(&mut seen)
+    }
+
+    fn validate_shape(&self) -> Result<()> {
         match self {
             SignerPolicy::Signer(id) => crate::keys::SignerRef::parse(id).map(|_| ()),
             SignerPolicy::Threshold { threshold, of } => {
                 if *threshold == 0 || *threshold > of.len() {
                     return Err(Error::Kel(format!("threshold {threshold} of {} is unsatisfiable", of.len())));
                 }
-                of.iter().try_for_each(|p| p.validate())
+                of.iter().try_for_each(|p| p.validate_shape())
             }
+        }
+    }
+
+    fn check_distinct(&self, seen: &mut BTreeSet<String>) -> Result<()> {
+        match self {
+            SignerPolicy::Signer(id) => {
+                if seen.insert(id.clone()) {
+                    Ok(())
+                } else {
+                    Err(Error::Kel(format!("signer {id} appears more than once in the policy")))
+                }
+            }
+            SignerPolicy::Threshold { of, .. } => of.iter().try_for_each(|p| p.check_distinct(seen)),
         }
     }
 
@@ -102,6 +124,22 @@ mod tests {
         assert_eq!(p.signers().len(), 4);
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(serde_json::from_str::<SignerPolicy>(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn a_signer_counts_once_however_it_is_listed() {
+        let a = LocalSigner::generate(KeyType::Ed25519).id;
+        let b = LocalSigner::generate(KeyType::Ed25519).id;
+        let (sa, sb) = (SignerPolicy::single(&a), SignerPolicy::single(&b));
+        // "2 of [A, A]" would be satisfied by A alone.
+        let twice = SignerPolicy::threshold(2, vec![sa.clone(), sa.clone()]);
+        assert!(twice.is_satisfied_by(&BTreeSet::from([a.clone()])), "the shape is the problem");
+        assert!(twice.validate().is_err());
+        // The same goes for a repeat in a nested policy.
+        let nested = SignerPolicy::threshold(2, vec![sa.clone(), SignerPolicy::threshold(1, vec![sa.clone(), sb.clone()])]);
+        assert!(nested.validate().is_err());
+        // Distinct signers are fine.
+        SignerPolicy::threshold(2, vec![sa, sb]).validate().unwrap();
     }
 
     #[test]

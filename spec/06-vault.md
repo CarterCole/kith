@@ -36,6 +36,11 @@ revision number, and a ratchet.
   (ChaCha20-Poly1305, with AAD = `group|lineage|revision`).
 - **Join at revision n**: the member receives the temporal key at `n`. They get
   forward access and no history, matching a dynamic group's "member since".
+- **Revisions are bounded.** A reader derives at most 2^26 revisions past the temporal
+  key it holds, and refuses an envelope that claims a later one. The revision comes
+  from storage nobody vouches for, and the ratchet recurses once per 65,536 steps: an
+  envelope claiming revision 2^63 would otherwise overflow the stack and abort the
+  process.
 - **Leave or remove**: **re-key**. Start a new lineage with a fresh ratchet and seal it
   to the remaining members only. A ratchet cannot be un-shared, so removal always means
   a new lineage. The removed member keeps what they already had, as with any

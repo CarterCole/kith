@@ -123,11 +123,16 @@ fn uid(kind: &str, id: &str) -> Result<EntityUid> {
     Ok(EntityUid::from_type_name_and_id(t, EntityId::new(id)))
 }
 
-/// Cedar has no null or floating point: drop nulls, stringify non-integers.
+/// Cedar has no null or floating point: drop nulls, stringify non-integers. A float with
+/// no fractional part (`2.0`) is the integer it says, as it already is in JavaScript,
+/// where the two cannot be told apart.
 pub fn cedar_value(v: &Value) -> Option<Value> {
     match v {
         Value::Null => None,
-        Value::Number(n) if n.is_f64() => Some(Value::String(n.to_string())),
+        Value::Number(n) if n.is_f64() => match n.as_f64() {
+            Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 => Some(Value::from(f as i64)),
+            _ => Some(Value::String(n.to_string())),
+        },
         Value::Array(a) => Some(Value::Array(a.iter().filter_map(cedar_value).collect())),
         Value::Object(o) => Some(Value::Object(o.iter().filter_map(|(k, v)| cedar_value(v).map(|v| (k.clone(), v))).collect())),
         other => Some(other.clone()),

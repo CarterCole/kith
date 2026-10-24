@@ -233,14 +233,41 @@ pub fn nist2_serialize(p: &Value) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// `YYYY-MM-DDTHH:MM:SS(.fff)Z` → Unix seconds.
+/// `YYYY-MM-DDTHH:MM:SS(.fff)Z` → Unix seconds. Every field is checked: a month 13 or a
+/// second 61 is an error, not a date some days away.
 pub fn parse_utc(s: &str) -> Result<i64> {
     let bad = || Error::Encoding(format!("timestamp {s:?}"));
-    let n = |a: usize, b: usize| s.get(a..b).and_then(|x| x.parse::<i64>().ok()).ok_or_else(bad);
-    if s.len() < 20 || !s.ends_with('Z') || &s[4..5] != "-" || &s[10..11] != "T" {
+    let b = s.as_bytes();
+    // All ASCII, so the byte offsets below are character offsets.
+    if !s.is_ascii() || b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
         return Err(bad());
     }
+    // After the seconds: `Z`, or a fraction and then `Z`.
+    let tail = &s[19..];
+    let fraction_ok = tail == "Z" || tail.strip_prefix('.').and_then(|f| f.strip_suffix('Z')).is_some_and(|f| !f.is_empty() && f.bytes().all(|c| c.is_ascii_digit()));
+    if !fraction_ok {
+        return Err(bad());
+    }
+    let n = |a: usize, z: usize| -> Result<i64> {
+        let t = &s[a..z];
+        if t.bytes().all(|c| c.is_ascii_digit()) {
+            t.parse::<i64>().map_err(|_| bad())
+        } else {
+            Err(bad())
+        }
+    };
     let (y, m, d, hh, mm, ss) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err(bad()),
+    };
+    if !(1..=days).contains(&d) || hh > 23 || mm > 59 || ss > 59 {
+        return Err(bad());
+    }
     // Days from civil (Howard Hinnant).
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -351,5 +378,28 @@ mod tests {
         assert_eq!(parse_utc("1970-01-01T00:00:00.000Z").unwrap(), 0);
         assert_eq!(parse_utc("2026-09-27T19:49:00.000Z").unwrap(), 1790538540);
         assert_eq!(parse_utc("2000-02-29T12:00:00Z").unwrap(), 951825600);
+    }
+
+    #[test]
+    fn timestamps_are_checked_and_wide_characters_are_errors() {
+        assert_eq!(parse_utc("2026-10-21T00:00:00Z").unwrap(), 1792540800);
+        assert_eq!(parse_utc("2026-10-21T00:00:00.250Z").unwrap(), 1792540800);
+        assert_eq!(parse_utc("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(parse_utc("2028-02-29T23:59:59Z").unwrap(), 1835481599, "a leap day");
+        for bad in [
+            "2026é10-21T00:00:00Z", "2026-10-21é00:00:00Z", "2026-10-21T00:00:0é", "é026-10-21T00:00:00Z", "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+            "2026-13-01T00:00:00Z", "2026-00-01T00:00:00Z", "2026-02-30T00:00:00Z", "2027-02-29T00:00:00Z", "2026-10-00T00:00:00Z", "2026-10-32T00:00:00Z",
+            "2026-10-21T24:00:00Z", "2026-10-21T00:60:00Z", "2026-10-21T00:00:61Z", "2026-10-21T-1:00:00Z", "2026-10-21T00:00:00", "", "Z",
+        ] {
+            assert!(parse_utc(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_drand_signature_that_is_not_hex_is_an_error() {
+        let chain = DrandChain::quicknet();
+        for bad in ["0é0", "é", "zz", "abc", "", "00"] {
+            assert!(chain.verify(1000, bad).is_err(), "{bad:?}");
+        }
     }
 }

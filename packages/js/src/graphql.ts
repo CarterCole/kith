@@ -9,10 +9,15 @@
  * - Row level: for types marked `@auth` at the type level (or listed in `rowLevel`),
  *   every object is checked with `"<Type>.read"`; lists are filtered, single objects
  *   are denied.
+ * - Meta-fields: `__typename` is always allowed, since client libraries add it to every
+ *   selection set. `__schema` and `__type` (introspection) are open unless
+ *   `introspection: "authenticated"`, which asks for a principal.
  */
 import {
   GraphQLError,
   GraphQLObjectType,
+  SchemaMetaFieldDef,
+  TypeMetaFieldDef,
   defaultFieldResolver,
   getNamedType,
   isObjectType,
@@ -44,6 +49,11 @@ export interface KithGraphQLOptions {
   toResource?: (typeName: string, obj: any) => Resource;
   /** "error" (default) adds a FORBIDDEN error; "null" silently returns null. */
   onDeny?: "error" | "null";
+  /**
+   * Who may introspect the schema (`__schema`, `__type`). "open" (default) lets anyone;
+   * "authenticated" needs a principal, or `anonymous`. `__typename` is always allowed.
+   */
+  introspection?: "open" | "authenticated";
   onDecision?: (e: { principal: Principal; action: string; resource: Resource; allowed: boolean; reasons: string[] }) => void;
 }
 
@@ -66,6 +76,24 @@ export function defaultToResource(typeName: string, obj: any): Resource {
   return { type: typeName, id: String(obj?.id ?? obj?._id ?? "?"), attrs };
 }
 
+// graphql-js resolves `__schema` and `__type` through two shared definitions, not
+// through the schema's own fields. Their resolvers are wrapped once, and a schema that
+// asks for authenticated introspection registers its check here.
+const introspectionGuards = new WeakMap<GraphQLSchema, (ctx: any) => void>();
+let introspectionPatched = false;
+function guardIntrospection(schema: GraphQLSchema, guard: (ctx: any) => void) {
+  introspectionGuards.set(schema, guard);
+  if (introspectionPatched) return;
+  introspectionPatched = true;
+  for (const def of [SchemaMetaFieldDef, TypeMetaFieldDef]) {
+    const original = def.resolve!;
+    def.resolve = (source, args, ctx, info) => {
+      introspectionGuards.get(info.schema)?.(ctx);
+      return original(source, args, ctx, info);
+    };
+  }
+}
+
 function forbidden(action: string) {
   return new GraphQLError(`Not authorized: ${action}`, { extensions: { code: "FORBIDDEN", action } });
 }
@@ -76,6 +104,12 @@ export function kithGraphQL(schema: GraphQLSchema, opts: KithGraphQLOptions): Gr
   const rowTypes = new Set(opts.rowLevel ?? []);
   const fieldSet = new Set(opts.fields ?? []);
   const roots = new Set([schema.getQueryType(), schema.getMutationType(), schema.getSubscriptionType()].filter(Boolean).map((t) => t!.name));
+
+  if (opts.introspection === "authenticated") {
+    guardIntrospection(schema, (ctx) => {
+      if (!getPrincipal(ctx) && !opts.anonymous) throw new GraphQLError("Authentication required", { extensions: { code: "UNAUTHENTICATED" } });
+    });
+  }
 
   for (const type of Object.values(schema.getTypeMap())) {
     if (isObjectType(type) && !type.name.startsWith("__") && authDirective([type.astNode ?? {}, ...(type.extensionASTNodes ?? [])])) {
