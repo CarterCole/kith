@@ -307,7 +307,7 @@ mod tests {
     }
 
     /// An app accepts "this is that account" if and only if the vector says so (spec
-    /// 7.8.1, `attestations.json`).
+    /// 7.8.1 and 7.8.2, `attestations.json`).
     #[test]
     fn shared_attestation_vectors() {
         let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/attestations.json")).unwrap();
@@ -315,6 +315,7 @@ mod tests {
         let (now, iss, aud) = (v["now"].as_i64().unwrap(), v["issuer"].as_str().unwrap(), v["audience"].as_str().unwrap());
         for c in v["cases"].as_array().unwrap() {
             let name = c["name"].as_str().unwrap();
+            let aud = c["audience"].as_str().unwrap_or(aud);
             match (c["valid"].as_bool().unwrap(), verify_account_attestation(c["token"].as_str().unwrap(), &v["jwks"], iss, aud, now)) {
                 (true, Ok(got)) => {
                     let got = serde_json::to_value(got).unwrap();

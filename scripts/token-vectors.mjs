@@ -107,6 +107,7 @@ console.log(`${cases.length} cases (${cases.filter((c) => c.valid).length} valid
 // in. Same keys and clock. The audience is the OAuth client it was issued to.
 const ATTEST_OUT = join(dirname(OUT), "attestations.json");
 const CLIENT = "app";
+const PUBLIC = "urn:kith:public";
 const attHeader = { typ: "kith-account+jwt", alg: "EdDSA", kid: "k1" };
 const att = {
   iss: ISSUER, aud: CLIENT, sub: "did:kith:ada", iat: NOW - 10, exp: NOW + 890, jti: "att-1",
@@ -142,6 +143,21 @@ const attestations = [
   { name: "no kid", token: mint(att, { typ: attHeader.typ, alg: "EdDSA" }), valid: false },
   { name: "signed by another key under the right kid", token: mint(att, attHeader, stranger), valid: false },
   { name: "another account swapped in after signing", token: `${ah0}.${enc({ ...att, account: "1" })}.${as0}`, valid: false },
+  // Verified contacts (spec section 7.8.2): the hub checked a code itself, so it is the provider.
+  ...[
+    ["an email address the hub verified", { provider: "email", account: "mailto:ada@example.com" }],
+    ["a phone number the hub verified", { provider: "phone", account: "tel:+15555550100" }],
+  ].map(([name, c]) => {
+    const claims = { ...att, ...c, provider_iss: ISSUER, jti: "att-c" };
+    return { name, token: mint(claims, attHeader), valid: true, claims: { ...attExpect, ...c, provider_iss: ISSUER, jti: "att-c" } };
+  }),
+  // A public lookup's answer: anyone may check it, with the audience urn:kith:public.
+  (() => {
+    const pub = { ...att, aud: PUBLIC, provider: "email", provider_iss: ISSUER, account: "mailto:ada@example.com", jti: "att-p" };
+    return { name: "a public attestation, checked as public", audience: PUBLIC, token: mint(pub, attHeader), valid: true, claims: { ...attExpect, provider: "email", provider_iss: ISSUER, account: pub.account, jti: "att-p" } };
+  })(),
+  { name: "a public attestation is not an app's", token: mint({ ...att, aud: PUBLIC }, attHeader), valid: false },
+  { name: "an app's attestation is not public", audience: PUBLIC, token: attGood, valid: false },
 ];
 
 writeFileSync(
@@ -149,7 +165,7 @@ writeFileSync(
   JSON.stringify(
     {
       description:
-        "Account attestation vectors (spec 7.8.1). Verify `token` against `jwks` as of `now` for `issuer` and `audience` (the client id), with `leeway` seconds of clock tolerance. Accept if and only if `valid`; for accepted tokens, `claims` are values the verifier must return.",
+        "Account attestation vectors (spec 7.8.1, 7.8.2). Verify `token` against `jwks` as of `now` for `issuer` and `audience` (the client id; a case's own `audience` replaces it), with `leeway` seconds of clock tolerance. Accept if and only if `valid`; for accepted tokens, `claims` are values the verifier must return.",
       now: NOW,
       leeway: LEEWAY,
       issuer: ISSUER,

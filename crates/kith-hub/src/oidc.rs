@@ -443,8 +443,8 @@ pub async fn discovery(State(h): State<Arc<Hub>>) -> Json<Value> {
         "id_token_encryption_enc_values_supported": jwe::ENCS,
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
         "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": ["openid", "profile", "email", "groups", "offline_access", "linked_account"],
-        "claims_supported": ["sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "acr", "amr", "azp", "sid", "name", "preferred_username", "email", "email_verified", "groups", "roles"],
+        "scopes_supported": ["openid", "profile", "email", "phone", "groups", "offline_access", "linked_account"],
+        "claims_supported": ["sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "acr", "amr", "azp", "sid", "name", "preferred_username", "email", "email_verified", "phone_number", "phone_number_verified", "groups", "roles"],
         "acr_values_supported": [format!("{ACR_PREFIX}1"), format!("{ACR_PREFIX}2"), format!("{ACR_PREFIX}3")],
         "prompt_values_supported": ["none", "login", "consent"],
         "authorization_response_iss_parameter_supported": true,
@@ -645,6 +645,14 @@ pub async fn consent_page(State(h): State<Arc<Hub>>, headers: HeaderMap, Query(q
     if scope_has(&ar.scope, "linked_account") {
         claims.insert("linked_account".into(), json!(a.alias));
     }
+    // Verified contacts the scopes would release, and the attestations that go with them.
+    if h.add_contact_claims(&a.st.did, &ar.scope, &mut claims).is_err() {
+        return expired();
+    }
+    let attested: Vec<String> = h.attested_contacts(&a.st.did, &ar.scope).unwrap_or_default().into_iter().map(|c| c.address).collect();
+    if !attested.is_empty() {
+        claims.insert("contact_attestations".into(), json!(attested));
+    }
     pages::consent(json!({
         "request_id": request_id,
         "client_name": client.display_name(),
@@ -824,7 +832,9 @@ fn issue_tokens(h: &Hub, client: &Client, scope: &str, authn: &Authn, nonce: Opt
     if let Some(sid) = sid {
         id["sid"] = json!(sid);
     }
-    for (k, v) in scoped_claims(scope, &at) {
+    let mut claims = scoped_claims(scope, &at);
+    h.add_contact_claims(&authn.st.did, scope, &mut claims)?;
+    for (k, v) in claims {
         id[k] = v;
     }
     let mut id_token = h.sign_for(client, "JWT", &id)?;
@@ -844,6 +854,10 @@ fn issue_tokens(h: &Hub, client: &Client, scope: &str, authn: &Authn, nonce: Opt
         if let Some(att) = h.account_attestation(&client.client_id, &at.sub, authn)? {
             resp["account_attestation"] = json!(att);
         }
+    }
+    let contacts = h.contact_attestations(&client.client_id, &at.sub, &authn.st.did, scope)?;
+    if !contacts.is_empty() {
+        resp["contact_attestations"] = json!(contacts);
     }
     if scope_has(scope, "offline_access") {
         let rt = random_id();
@@ -913,8 +927,13 @@ pub async fn userinfo(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResul
     if c.client_id.is_none() {
         return Err(ApiError::unauthorized("not an OpenID Connect access token"));
     }
+    let scope = c.scope.as_deref().unwrap_or_default();
+    let mut claims = scoped_claims(scope, &c);
+    if let Some(did) = h.did_for(&c) {
+        h.add_contact_claims(&did, scope, &mut claims)?;
+    }
     let mut out = json!({"sub": c.sub});
-    for (k, v) in scoped_claims(c.scope.as_deref().unwrap_or_default(), &c) {
+    for (k, v) in claims {
         out[k] = v;
     }
     Ok(Json(out))

@@ -56,11 +56,11 @@ ATTESTATIONS = json.loads((Path(__file__).parents[3] / "spec/test-vectors/attest
 
 @pytest.mark.parametrize("case", ATTESTATIONS["cases"], ids=lambda c: c["name"])
 def test_attestation_vectors(case):
-    """An app accepts "this is that Facebook account" if and only if the vector says so (spec 7.8.1)."""
+    """An app accepts "this is that account" if and only if the vector says so (spec 7.8.1, 7.8.2)."""
     from kith import AttestationVerifier
 
     v = ATTESTATIONS
-    verifier = AttestationVerifier(v["issuer"], v["audience"], jwks=v["jwks"], leeway=v["leeway"], now=lambda: v["now"])
+    verifier = AttestationVerifier(v["issuer"], case.get("audience", v["audience"]), jwks=v["jwks"], leeway=v["leeway"], now=lambda: v["now"])
     if not case["valid"]:
         with pytest.raises(KithAuthError):
             verifier.verify(case["token"])

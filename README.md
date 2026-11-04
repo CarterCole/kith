@@ -94,6 +94,10 @@ kith resolve https://acme.test               # just look: both directions checke
 kith name check                              # re-resolve pinned names; report any that moved or became ambiguous
 kith passkey enroll                          # create a passkey in your browser; compare its fingerprint, answer y
 kith totp reset [--code 123456]              # forget the authenticator (a current code, or a passkey sign-in)
+kith contact add ada@example.com             # the hub sends a code; private unless you publish it
+kith contact confirm ada@example.com 123456  # apps with scope email (or phone) get it, with a signed attestation
+kith contact publish ada@example.com         # anyone can `kith contact lookup` it; `unpublish` withdraws
+kith hub serve --email-from no-reply@example.com --sms-from +15555550199   # send codes with SES and End User Messaging (build with --features aws)
 ```
 
 **Any existing app, through OpenID Connect** ([spec](spec/07-oidc.md))
@@ -178,7 +182,7 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 |------|------|
 | `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
 | `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
-| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, OpenID Connect provider with passkey login and enrollment pages, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
+| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email and phone contacts, OpenID Connect provider with passkey login and enrollment pages, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
 | `crates/kith-cli` | `kith` binary |
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |

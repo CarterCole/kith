@@ -194,7 +194,8 @@ Scoped claims (ID token and userinfo):
 | Scope | Claims |
 |-------|--------|
 | `profile` | `name`, `preferred_username` |
-| `email` | `email`, `email_verified` |
+| `email` | `email`, `email_verified` (from a verified contact if nothing else gives one, §7.8.2) |
+| `phone` | `phone_number`, `phone_number_verified` (from a verified contact, §7.8.2) |
 | `groups` | `groups`, `roles` (computed from the policy bundle, §4.3) |
 
 `sid` identifies the hub session to the client, for logout (§7.6). It is a separate
@@ -464,6 +465,103 @@ Register `{hub issuer}/oauth/upstream/facebook/callback` as a redirect URI.
 
 Tested against a stand-in that exchanges codes the same way. Not yet run against
 Facebook itself. Providers without ID tokens (GitHub, X, Discord) are not supported.
+
+### 7.8.2 Verified contacts (email and phone)
+
+An identity can prove to its hub that it receives mail at an address, or texts at a
+phone number. The hub then attests it the way it attests an upstream account
+(§7.8.1), with itself as the provider. Nothing an app does not need is public:
+
+- **Private by default.** A verified contact goes to an app only when the user has
+  agreed to that app's `email` or `phone` scope, and to nobody else. It never goes into
+  the KEL, the DID document or an access token's `attrs`.
+- **Public if wanted.** The user can publish a contact. The hub then answers lookups
+  for it with a signed attestation anyone can check. Unpublishing ends that.
+- **Checked again.** A verification has an age, and past `max_age` the hub stops
+  attesting the contact until the user proves control again. Anyone who proves control
+  of an address takes it over: it is one identity's at a time.
+
+The hub keeps a contact as it was verified; an address that only needs comparing would
+be hashed, but this one is shown to apps, so it is stored as it is. Codes are hashed.
+
+**Addresses.** Contacts are URIs:
+
+| Input | Contact |
+|-------|---------|
+| `ada@Example.COM`, `mailto:ada@example.com` | `mailto:ada@example.com` (lower case; one `@`, a dot in the domain, at most 254 characters) |
+| `+1 (555) 555-0100`, `tel:+15555550100` | `tel:+15555550100` (E.164: `+`, 8 to 15 digits; spaces, dots, dashes and brackets are dropped) |
+
+A number without its `+` country code is refused, not guessed at. A hub MAY limit
+phone numbers to some prefixes (`phone_prefixes`, e.g. `+1`), which is the cheapest
+defence against SMS pumping fraud.
+
+**Proving control.** All of these take a hub bearer token (`aud` = issuer):
+
+| Request | Effect |
+|---------|--------|
+| `POST /v1/contacts` `{"address"}` | Sends a 6-digit code to the address. It lasts 10 minutes and allows 5 wrong tries. A new request replaces the code. Rate limited per identity, per address and per client address (`contact_limit`, default 5 an hour each) |
+| `POST /v1/contacts/confirm` `{"address", "code"}` | Verifies the contact: `verified_at` is now. If another identity held the address, it no longer does |
+| `GET /v1/contacts` | The caller's contacts: `address`, `kind` (`email` or `phone`), `verified_at`, `fresh_until`, `fresh`, `public` |
+| `PUT /v1/contacts/public` `{"address", "public"}` | Publish or withdraw. Publishing needs a fresh contact, and a device with the `alias` cap (or no device: a manage key) |
+| `DELETE /v1/contacts` `{"address"}` | Forget it |
+
+The message says what the code is for and which hub sent it. A text ends with the
+origin-bound line `@{rp_id} #{code}`, so phones that support it offer the code only on
+that site. Checking again is the same request and confirmation. Until it is confirmed,
+the old verification stands, if it is still fresh.
+
+**Freshness.** A contact is fresh until `verified_at + max_age`: by default 365 days for
+email and 90 days for phone numbers, because carriers give numbers to new subscribers
+after a few months. A stale contact stays listed, so the user can check it again, but
+nothing is released or published for it. An app that wants more recent proof than the
+hub's `max_age` compares `verified_at` itself.
+
+**What apps receive.** With the `email` scope, an app whose user has no email from the
+directory or an upstream provider gets the most recently verified fresh email as
+`email`, with `email_verified: true`. With the `phone` scope it gets `phone_number` and
+`phone_number_verified: true` the same way. The ID token and userinfo carry them, and
+so does the consent page before anything is released. The token response also carries
+`contact_attestations`: one `kith-account+jwt` (§7.8.1) per fresh contact of a granted
+kind, with
+
+```json
+{ "provider": "email",                    // or "phone"
+  "provider_iss": "https://hub.example",  // this hub: it checked the code itself
+  "account": "mailto:ada@example.com",    // or "tel:+15555550100"
+  "verified_at": 1799999970, … }          // when the code was confirmed
+```
+
+Apps verify it exactly as §7.8.1 says. A refresh looks the contacts up again, so a
+contact that was removed, went stale or was taken over drops out.
+
+**Public lookups.** `GET /v1/contacts/lookup?address=…` needs no token. For a published,
+fresh contact it answers
+
+```json
+{ "address": "mailto:ada@example.com", "did": "did:kith:…", "verified_at": 1799999970,
+  "attestation": "<kith-account+jwt, aud urn:kith:public, sub the DID>" }
+```
+
+and `404` otherwise, the same for a private contact as for one that does not exist. The
+attestation verifies as in §7.8.1 with `urn:kith:public` as the audience. It lasts 15
+minutes, so a copy shows what the hub said then, not that the contact is still held.
+Trust it only from a hub you trust to check codes: anyone can run a hub. Publishing
+puts nothing in the KEL, so withdrawing really withdraws, apart from copies already
+fetched. An address the user wants permanently on record belongs in an `alias_link`
+with a back-link from its own domain (§5.1) instead.
+
+**Delivery.** The reference hub sends through Amazon SES (email) and AWS End User
+Messaging SMS (texts), built with the `aws` feature, or appends each message to an
+outbox file for tests and development. With neither configured, the contact
+endpoints answer `501`. AWS credentials come from the usual chain (environment,
+profile, instance role).
+
+Not yet implemented:
+- `kith resolve` following public contacts. Today a resolver asks the hub's lookup
+  itself.
+- An app asking the hub to check a contact again during sign-in, and verification from
+  the browser (CLI only today).
+- Voice calls, and delivery receipts.
 
 ## 7.9 Deployment notes
 

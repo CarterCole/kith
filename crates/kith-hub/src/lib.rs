@@ -15,7 +15,7 @@
 //! | `GET, POST /oauth/consent`                | consent page, and its Allow / Deny decision     |
 //! | `POST /oauth/register`                    | dynamic client registration (RFC 7591), if enabled |
 //! | `GET  /oauth/upstream/{id}/start`, `…/callback` | sign in through Telegram or another upstream OIDC provider (see [`upstream`]) |
-//! | `POST /oauth/token`                       | code, refresh and RFC 8693 token exchange; `account_attestation` with the `linked_account` scope |
+//! | `POST /oauth/token`                       | code, refresh and RFC 8693 token exchange; `account_attestation` with the `linked_account` scope, `contact_attestations` with `email` or `phone` |
 //! | `GET  /oauth/userinfo`                    | OIDC userinfo                                   |
 //! | `GET  /oauth/logout`                      | RP-initiated logout                             |
 //! | `GET/PUT /v1/kel/{did}`                   | fetch / append a key event log                  |
@@ -24,6 +24,8 @@
 //! | `POST /v1/totp/enroll`, `/v1/totp/confirm`| TOTP factor (bearer)                            |
 //! | `DELETE /v1/totp`                         | forget the authenticator: a current code, or an AAL 2 sign-in |
 //! | `POST /v1/cosigner`, `/v1/cosign`         | TOTP-gated co-signer                            |
+//! | `POST, GET, DELETE /v1/contacts`, `POST /v1/contacts/confirm`, `PUT /v1/contacts/public` | verified email and phone contacts (bearer; see [`contacts`]) |
+//! | `GET  /v1/contacts/lookup`                | who holds a published contact, signed           |
 //! | `POST /v1/enroll`, `GET /enroll/{id}`     | enroll a browser passkey as a device            |
 //! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
 //! | `/v1/admin/…`                             | sessions, consent, clients and TOTP resets, for the operator (see [`admin`]) |
@@ -35,6 +37,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod admin;
+pub mod contacts;
 pub mod enroll;
 pub mod jwe;
 pub mod oidc;
@@ -115,6 +118,9 @@ pub struct HubConfig {
     /// Hub access tokens (`aud` = issuer) whose roles include this one may use the
     /// admin API too. The policy bundle decides who is in the role.
     pub admin_role: Option<String>,
+    /// Verified email addresses and phone numbers (spec 7.8.2): how codes are sent,
+    /// how long a verification lasts, and limits.
+    pub contacts: contacts::ContactConfig,
 }
 
 impl HubConfig {
@@ -141,6 +147,7 @@ impl HubConfig {
             behind_proxy: false,
             admin_token: None,
             admin_role: Some("hub-admin".into()),
+            contacts: contacts::ContactConfig::default(),
         }
     }
 }
@@ -192,6 +199,8 @@ pub struct Hub {
     pub(crate) http: reqwest::Client,
     pub orgs: org::Orgs,
     pub started: i64,
+    #[cfg(feature = "aws")]
+    pub(crate) aws: contacts::aws::Clients,
 }
 
 #[derive(Debug)]
@@ -350,6 +359,7 @@ impl Hub {
                 anyhow::bail!("duplicate upstream id {}", u.id);
             }
         }
+        cfg.contacts.validate()?;
         let cfg_dir = cfg.data_dir.clone();
         let hub = Hub {
             cfg,
@@ -365,6 +375,8 @@ impl Hub {
             http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?,
             orgs: org::Orgs::open(&cfg_dir)?,
             started: now(),
+            #[cfg(feature = "aws")]
+            aws: Default::default(),
         };
         hub.engine()?;
         Ok(Arc::new(hub))
@@ -950,6 +962,10 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/totp", delete(totp_reset))
         .route("/v1/cosigner", post(cosigner))
         .route("/v1/cosign", post(cosign))
+        .route("/v1/contacts", post(contacts::request_code).get(contacts::list).delete(contacts::remove))
+        .route("/v1/contacts/confirm", post(contacts::confirm))
+        .route("/v1/contacts/public", axum::routing::put(contacts::set_public))
+        .route("/v1/contacts/lookup", get(contacts::lookup))
         .route("/v1/enroll", post(enroll::start))
         .route("/v1/enroll/{id}", get(enroll::status))
         .route("/v1/enroll/{id}/key", post(enroll::submit_key))

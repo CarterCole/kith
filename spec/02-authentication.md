@@ -17,7 +17,7 @@ The hub turns that evidence into an access token that states how strong it was
 | TOTP | **shared secret** | hub-side factor, optionally a co-signer (§2.6) | **no, only the secret holder** |
 | Upstream OIDC (Telegram; any code + PKCE provider) | federated | hub-side factor, bound by an `alias_link` (§2.7) | only via the upstream IdP |
 | Upstream SAML | federated | planned | only via the upstream IdP |
-| Email / SMS link | shared channel | hub-side factor (planned, AAL1 at most) | no |
+| Email / SMS code | shared channel | a verified contact the hub attests ([§7.8.2](07-oidc.md)); as a login factor, planned (AAL1 at most) | only via the hub's attestation |
 | Passport / mDL | credential | **attributes**, not login (see [passports](../docs/passports.md)) | yes (issuer signature) |
 
 The key distinction is between asymmetric and shared-secret authenticators.

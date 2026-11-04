@@ -22,6 +22,13 @@ p256 = { workspace = true, features = ["ecdh"] }
 reqwest.workspace = true
 tokio-stream = { version = "0.1", features = ["sync"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Sending verification codes through Amazon SES and AWS End User Messaging SMS.
+aws-config = { version = "1.13", optional = true, features = ["behavior-version-latest"] }
+aws-sdk-sesv2 = { version = "1", optional = true }
+aws-sdk-pinpointsmsvoicev2 = { version = "1", optional = true }
+
+[features]
+aws = ["dep:aws-config", "dep:aws-sdk-sesv2", "dep:aws-sdk-pinpointsmsvoicev2"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

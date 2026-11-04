@@ -13,6 +13,14 @@ behaviour, not a promise about compatibility. Versions follow the workspace vers
   §7.8.1), with verifiers in Rust, JS and Python and shared vectors.
 - **Facebook as an upstream provider**: `Upstream::facebook`, and `token_request: "get"`
   for its code exchange. Not yet run against Facebook itself.
+- **Verified contacts** (spec §7.8.2). `kith contact add` and `confirm` prove an email
+  address or phone number with a six-digit code. Contacts are private by default and go
+  to an app only with its `email` or `phone` scope, as claims and as hub-signed
+  `contact_attestations`. `kith contact publish` makes the hub answer
+  `GET /v1/contacts/lookup` for one, with an attestation for `urn:kith:public`.
+  Verifications go stale after 365 days (email) or 90 days (phone) until checked again,
+  and whoever proves an address last holds it. Codes are sent through Amazon SES and AWS
+  End User Messaging SMS (`--features aws`), or to an outbox file. New `phone` scope.
 
 An audit of all three implementations, and the fixes that came out of it. Each fix has a
 test that failed before it. The audit items that are still open are listed in

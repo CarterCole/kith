@@ -1,5 +1,5 @@
 {
-  "description": "Account attestation vectors (spec 7.8.1). Verify `token` against `jwks` as of `now` for `issuer` and `audience` (the client id), with `leeway` seconds of clock tolerance. Accept if and only if `valid`; for accepted tokens, `claims` are values the verifier must return.",
+  "description": "Account attestation vectors (spec 7.8.1, 7.8.2). Verify `token` against `jwks` as of `now` for `issuer` and `audience` (the client id; a case's own `audience` replaces it), with `leeway` seconds of clock tolerance. Accept if and only if `valid`; for accepted tokens, `claims` are values the verifier must return.",
   "now": 1800000000,
   "leeway": 60,
   "issuer": "https://hub.example",
@@ -240,6 +240,57 @@
     {
       "name": "another account swapped in after signing",
       "token": "eyJ0eXAiOiJraXRoLWFjY291bnQrand0IiwiYWxnIjoiRWREU0EiLCJraWQiOiJrMSJ9.eyJpc3MiOiJodHRwczovL2h1Yi5leGFtcGxlIiwiYXVkIjoiYXBwIiwic3ViIjoiZGlkOmtpdGg6YWRhIiwiaWF0IjoxNzk5OTk5OTkwLCJleHAiOjE4MDAwMDA4OTAsImp0aSI6ImF0dC0xIiwicHJvdmlkZXIiOiJmYWNlYm9vayIsInByb3ZpZGVyX2lzcyI6Imh0dHBzOi8vd3d3LmZhY2Vib29rLmNvbSIsImFjY291bnQiOiIxIiwidmVyaWZpZWRfYXQiOjE3OTk5OTk5NzB9.TdizIKpbPsEVL6lBFWvxsnV_f8uTX3RtN_R5SeAm-5xca5wC5gOT_m-5sSUFBFAE3jtB-277e-wlHKaWCOqBDg",
+      "valid": false
+    },
+    {
+      "name": "an email address the hub verified",
+      "token": "eyJ0eXAiOiJraXRoLWFjY291bnQrand0IiwiYWxnIjoiRWREU0EiLCJraWQiOiJrMSJ9.eyJpc3MiOiJodHRwczovL2h1Yi5leGFtcGxlIiwiYXVkIjoiYXBwIiwic3ViIjoiZGlkOmtpdGg6YWRhIiwiaWF0IjoxNzk5OTk5OTkwLCJleHAiOjE4MDAwMDA4OTAsImp0aSI6ImF0dC1jIiwicHJvdmlkZXIiOiJlbWFpbCIsInByb3ZpZGVyX2lzcyI6Imh0dHBzOi8vaHViLmV4YW1wbGUiLCJhY2NvdW50IjoibWFpbHRvOmFkYUBleGFtcGxlLmNvbSIsInZlcmlmaWVkX2F0IjoxNzk5OTk5OTcwfQ.ffzhf_U1-JbOW-05nCF90FtRnnJsOafBcyRPS8sJ3dNwUp4aLZlGTikaPVf5X6s6vijoihN52rhFUQcuc2WADA",
+      "valid": true,
+      "claims": {
+        "sub": "did:kith:ada",
+        "provider": "email",
+        "provider_iss": "https://hub.example",
+        "account": "mailto:ada@example.com",
+        "verified_at": 1799999970,
+        "jti": "att-c"
+      }
+    },
+    {
+      "name": "a phone number the hub verified",
+      "token": "eyJ0eXAiOiJraXRoLWFjY291bnQrand0IiwiYWxnIjoiRWREU0EiLCJraWQiOiJrMSJ9.eyJpc3MiOiJodHRwczovL2h1Yi5leGFtcGxlIiwiYXVkIjoiYXBwIiwic3ViIjoiZGlkOmtpdGg6YWRhIiwiaWF0IjoxNzk5OTk5OTkwLCJleHAiOjE4MDAwMDA4OTAsImp0aSI6ImF0dC1jIiwicHJvdmlkZXIiOiJwaG9uZSIsInByb3ZpZGVyX2lzcyI6Imh0dHBzOi8vaHViLmV4YW1wbGUiLCJhY2NvdW50IjoidGVsOisxNTU1NTU1MDEwMCIsInZlcmlmaWVkX2F0IjoxNzk5OTk5OTcwfQ.HqaqljCPAIM7muuUlT3xBQDkd6qfrDvX3jTjydAwMQXYdLUU4zZv6in7FAoRao6WJrPRSNw9gfdmzFBSppoLDw",
+      "valid": true,
+      "claims": {
+        "sub": "did:kith:ada",
+        "provider": "phone",
+        "provider_iss": "https://hub.example",
+        "account": "tel:+15555550100",
+        "verified_at": 1799999970,
+        "jti": "att-c"
+      }
+    },
+    {
+      "name": "a public attestation, checked as public",
+      "audience": "urn:kith:public",
+      "token": "eyJ0eXAiOiJraXRoLWFjY291bnQrand0IiwiYWxnIjoiRWREU0EiLCJraWQiOiJrMSJ9.eyJpc3MiOiJodHRwczovL2h1Yi5leGFtcGxlIiwiYXVkIjoidXJuOmtpdGg6cHVibGljIiwic3ViIjoiZGlkOmtpdGg6YWRhIiwiaWF0IjoxNzk5OTk5OTkwLCJleHAiOjE4MDAwMDA4OTAsImp0aSI6ImF0dC1wIiwicHJvdmlkZXIiOiJlbWFpbCIsInByb3ZpZGVyX2lzcyI6Imh0dHBzOi8vaHViLmV4YW1wbGUiLCJhY2NvdW50IjoibWFpbHRvOmFkYUBleGFtcGxlLmNvbSIsInZlcmlmaWVkX2F0IjoxNzk5OTk5OTcwfQ.veuJWEWnCrfzBi0WfoZsPgfCxeYq16b2eC7C4ra7_hS3fMioiYl3Q9wYSO_H4SADkR-FtoACwl_MyNbtxuF6Aw",
+      "valid": true,
+      "claims": {
+        "sub": "did:kith:ada",
+        "provider": "email",
+        "provider_iss": "https://hub.example",
+        "account": "mailto:ada@example.com",
+        "verified_at": 1799999970,
+        "jti": "att-p"
+      }
+    },
+    {
+      "name": "a public attestation is not an app's",
+      "token": "eyJ0eXAiOiJraXRoLWFjY291bnQrand0IiwiYWxnIjoiRWREU0EiLCJraWQiOiJrMSJ9.eyJpc3MiOiJodHRwczovL2h1Yi5leGFtcGxlIiwiYXVkIjoidXJuOmtpdGg6cHVibGljIiwic3ViIjoiZGlkOmtpdGg6YWRhIiwiaWF0IjoxNzk5OTk5OTkwLCJleHAiOjE4MDAwMDA4OTAsImp0aSI6ImF0dC0xIiwicHJvdmlkZXIiOiJmYWNlYm9vayIsInByb3ZpZGVyX2lzcyI6Imh0dHBzOi8vd3d3LmZhY2Vib29rLmNvbSIsImFjY291bnQiOiIxMDI5Mzg0NzU2IiwidmVyaWZpZWRfYXQiOjE3OTk5OTk5NzB9.CLKEI2MNDLmE3aE0jNwEIXwhVvAMVFopWoVC-my7v5VoN_xwu3Q-nk-R08CoGZ-uEfx0nk79irRHvvusY6Q8CA",
+      "valid": false
+    },
+    {
+      "name": "an app's attestation is not public",
+      "audience": "urn:kith:public",
+      "token": "eyJ0eXAiOiJraXRoLWFjY291bnQrand0IiwiYWxnIjoiRWREU0EiLCJraWQiOiJrMSJ9.eyJpc3MiOiJodHRwczovL2h1Yi5leGFtcGxlIiwiYXVkIjoiYXBwIiwic3ViIjoiZGlkOmtpdGg6YWRhIiwiaWF0IjoxNzk5OTk5OTkwLCJleHAiOjE4MDAwMDA4OTAsImp0aSI6ImF0dC0xIiwicHJvdmlkZXIiOiJmYWNlYm9vayIsInByb3ZpZGVyX2lzcyI6Imh0dHBzOi8vd3d3LmZhY2Vib29rLmNvbSIsImFjY291bnQiOiIxMDI5Mzg0NzU2IiwidmVyaWZpZWRfYXQiOjE3OTk5OTk5NzB9.TdizIKpbPsEVL6lBFWvxsnV_f8uTX3RtN_R5SeAm-5xca5wC5gOT_m-5sSUFBFAE3jtB-277e-wlHKaWCOqBDg",
       "valid": false
     }
   ]

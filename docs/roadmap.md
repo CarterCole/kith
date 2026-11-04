@@ -73,6 +73,16 @@
     the hub vouches for the upstream account a login really came through, with shared
     vectors (`attestations.json`) in Rust, JS and Python. A Facebook preset uses its OIDC
     code + PKCE flow. Tested against a stand-in provider, not yet against Facebook.
+  - Verified contacts ([spec §7.8.2](../spec/07-oidc.md)): an identity proves an email
+    address or phone number with a six-digit code (`kith contact add`, `confirm`).
+    Private by default: an app gets it only with the user's agreement to its `email`
+    or `phone` scope, as a claim and a signed `kith-account+jwt` in
+    `contact_attestations`. Publishing it makes the hub answer a public lookup with an
+    attestation for `urn:kith:public`, and withdrawing it ends that. Verifications go
+    stale (365 days for email, 90 for phone numbers) until checked again, and whoever
+    proves an address last holds it. Codes go out through Amazon SES and AWS End User
+    Messaging SMS (the `aws` feature) or to an outbox file. Tested in process and with
+    the CLI through the outbox; not yet sent through AWS.
   - Verified in headless Chrome with a virtual authenticator against `openid-client`.
 - **Hub state and operations** ([spec §7.9–7.10](../spec/07-oidc.md)).
   - One SQLite file holds sessions, codes, refresh tokens, pending sign-in requests,
@@ -171,6 +181,18 @@
   go to the client that asked; there is no form a third party can check (`aud` is the
   client). Linking still happens from the CLI, so a user first has to fail a login to
   learn their per-app Facebook id.
+- **Verified contacts.**
+  - The AWS path builds and is not yet tested against AWS: no SES identity or SMS
+    origination number has been set up for it.
+  - A takeover is only as quick as the new holder: a recycled number or a domain that
+    changed owners keeps attesting for the old holder until someone else proves it or
+    it goes stale.
+  - No continuity proof yet. A chain of verifications, each also signed by the
+    identity, could show "held without a break since T", and a new holder would start
+    from zero.
+  - `kith resolve` does not follow public contacts, an app cannot ask for a check
+    during sign-in, and verification is CLI only.
+  - Userinfo finds a pairwise client's identity by scanning every KEL.
 - **Co-signer safety.** A time delay plus device notification before co-signing
   `rotate`, as did:plc does with its 72-hour window.
 - **Other.**

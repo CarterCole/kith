@@ -38,10 +38,10 @@ for (const c of vectors.cases as { name: string; token: string; valid: boolean; 
 
 const attestations = JSON.parse(readFileSync(new URL("../../../spec/test-vectors/attestations.json", import.meta.url), "utf8"));
 
-// An app accepts "this is that Facebook account" if and only if the vector says so (spec 7.8.1).
-for (const c of attestations.cases as { name: string; token: string; valid: boolean; claims?: Record<string, unknown> }[]) {
+// An app accepts "this is that account" if and only if the vector says so (spec 7.8.1, 7.8.2).
+for (const c of attestations.cases as { name: string; token: string; valid: boolean; audience?: string; claims?: Record<string, unknown> }[]) {
   test(`attestation vectors: ${c.name}`, async () => {
-    const verify = createAttestationVerifier({ issuer: attestations.issuer, audience: attestations.audience, jwks: attestations.jwks, clockTolerance: attestations.leeway, now: () => attestations.now });
+    const verify = createAttestationVerifier({ issuer: attestations.issuer, audience: c.audience ?? attestations.audience, jwks: attestations.jwks, clockTolerance: attestations.leeway, now: () => attestations.now });
     if (!c.valid) {
       await assert.rejects(verify(c.token), KithAuthError);
       return;

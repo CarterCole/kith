@@ -37,6 +37,8 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Parsed once per run, so the size of the hub's many flags costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Create a new root identity with a device, a manage key and 2-of-3 recovery keys.
@@ -137,6 +139,10 @@ enum Cmd {
     Totp(TotpCmd),
     #[command(subcommand)]
     Passkey(PasskeyCmd),
+    /// Email addresses and phone numbers the hub has verified for you. Private unless
+    /// you publish them; apps get them only with your agreement.
+    #[command(subcommand)]
+    Contact(ContactCmd),
     /// Get the hub's TOTP-gated co-signer id for your identity.
     Cosigner,
     /// Decode a JWT (no verification).
@@ -271,6 +277,25 @@ enum TotpCmd {
 }
 
 #[derive(Subcommand)]
+enum ContactCmd {
+    /// Send a code to an email address or a phone number (with its + country code).
+    /// Run it again later to check a contact again before it goes stale.
+    Add { address: String },
+    /// Confirm with the code that was sent.
+    Confirm { address: String, code: String },
+    /// Your contacts, whether each is still fresh, and whether it is public.
+    List,
+    /// Let anyone look the contact up and get a signed statement that you hold it.
+    Publish { address: String },
+    /// Stop answering lookups for it.
+    Unpublish { address: String },
+    /// Forget the contact.
+    Remove { address: String },
+    /// Who holds a published contact (no sign-in needed).
+    Lookup { address: String },
+}
+
+#[derive(Subcommand)]
 enum PasskeyCmd {
     /// Create a passkey in your browser (on the hub's origin) and add it as a device.
     /// It can then sign in to any app that uses the hub for OpenID Connect.
@@ -331,6 +356,27 @@ enum HubCmd {
         /// Seconds between heartbeats.
         #[arg(long, default_value_t = 15)]
         heartbeat: u64,
+        /// Verified contacts: append codes to this file instead of sending them
+        /// (development and tests).
+        #[arg(long)]
+        contact_outbox: Option<PathBuf>,
+        /// Verified contacts: send email through Amazon SES from this verified identity.
+        /// Needs a build with the `aws` feature.
+        #[arg(long, env = "KITH_EMAIL_FROM")]
+        email_from: Option<String>,
+        /// Verified contacts: send texts through AWS End User Messaging SMS from this
+        /// origination identity (a phone number, sender id or pool, by id or ARN).
+        #[arg(long, env = "KITH_SMS_FROM")]
+        sms_from: Option<String>,
+        /// End User Messaging configuration set for texts (protect settings, events).
+        #[arg(long)]
+        sms_configuration_set: Option<String>,
+        /// AWS region for SES and End User Messaging (default: the AWS environment).
+        #[arg(long)]
+        aws_region: Option<String>,
+        /// Only text numbers starting with this E.164 prefix, e.g. +1 (repeatable).
+        #[arg(long = "phone-prefix")]
+        phone_prefixes: Vec<String>,
     },
 }
 
@@ -840,7 +886,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let dir = cli.home.clone().unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".kith"));
 
-    if let Cmd::Hub(HubCmd::Serve { addr, issuer, data, bundle, rp_id, origins, clients, upstreams, registration_token, admin_token, behind_proxy, policy_org, beacon, heartbeat }) = cli.cmd {
+    if let Cmd::Hub(HubCmd::Serve { addr, issuer, data, bundle, rp_id, origins, clients, upstreams, registration_token, admin_token, behind_proxy, policy_org, beacon, heartbeat, contact_outbox, email_from, sms_from, sms_configuration_set, aws_region, phone_prefixes }) = cli.cmd {
         // Browsers only allow passkeys on "localhost", not "127.0.0.1", so default to it.
         let port = addr.rsplit(':').next().unwrap_or("7777");
         let local = ["127.0.0.1", "0.0.0.0", "localhost", "[::1]"].iter().any(|h| addr.starts_with(h));
@@ -868,6 +914,13 @@ fn main() -> Result<()> {
         if let Some(path) = upstreams {
             cfg.upstreams = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?)?;
         }
+        cfg.contacts.phone_prefixes = phone_prefixes;
+        cfg.contacts.delivery = match (contact_outbox, email_from.is_some() || sms_from.is_some()) {
+            (Some(_), true) => bail!("--contact-outbox and AWS delivery (--email-from, --sms-from) exclude each other"),
+            (Some(path), false) => kith_hub::contacts::Delivery::Outbox(path),
+            (None, true) => kith_hub::contacts::Delivery::Aws(kith_hub::contacts::AwsDelivery { region: aws_region, email_from, sms_from, sms_configuration_set }),
+            (None, false) => kith_hub::contacts::Delivery::None,
+        };
         return tokio::runtime::Runtime::new()?.block_on(kith_hub::serve(cfg, &addr));
     }
 
@@ -1159,6 +1212,30 @@ fn main() -> Result<()> {
             let hub = home.hub()?;
             let auth = bearer(&mut home)?;
             print(&check(http().post(format!("{hub}/v1/totp/confirm")).header("authorization", auth).json(&json!({"code": code})).send()?)?);
+        }
+        Cmd::Contact(cmd) => {
+            let hub = home.hub()?;
+            let out = match cmd {
+                ContactCmd::Lookup { address } => check(http().get(format!("{hub}/v1/contacts/lookup")).query(&[("address", address)]).send()?)?,
+                cmd => {
+                    let auth = bearer(&mut home)?;
+                    let (method, path, body) = match cmd {
+                        ContactCmd::Add { address } => (reqwest::Method::POST, "", json!({"address": address})),
+                        ContactCmd::Confirm { address, code } => (reqwest::Method::POST, "/confirm", json!({"address": address, "code": code})),
+                        ContactCmd::List => (reqwest::Method::GET, "", Value::Null),
+                        ContactCmd::Publish { address } => (reqwest::Method::PUT, "/public", json!({"address": address, "public": true})),
+                        ContactCmd::Unpublish { address } => (reqwest::Method::PUT, "/public", json!({"address": address, "public": false})),
+                        ContactCmd::Remove { address } => (reqwest::Method::DELETE, "", json!({"address": address})),
+                        ContactCmd::Lookup { .. } => unreachable!(),
+                    };
+                    let mut req = http().request(method, format!("{hub}/v1/contacts{path}")).header("authorization", auth);
+                    if !body.is_null() {
+                        req = req.json(&body);
+                    }
+                    check(req.send()?)?
+                }
+            };
+            print(&out);
         }
         Cmd::Passkey(PasskeyCmd::Enroll { name, no_open, yes }) => {
             let hub = home.hub()?;

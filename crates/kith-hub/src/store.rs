@@ -2,7 +2,8 @@
 //!
 //! Everything a restart used to lose lives here: OpenID Connect sessions, codes,
 //! refresh tokens and pending sign-in requests, remembered consent, dynamically
-//! registered clients, TOTP enrollments with their lockouts, co-signer keys, the
+//! registered clients, TOTP enrollments with their lockouts, co-signer keys, verified
+//! contacts and the codes sent for them (hashed), the
 //! token replay cache and rate-limit counters. Bearer secrets (session cookies,
 //! codes, refresh tokens, request ids) are stored as their SHA-256, so a copy of the
 //! file does not let anyone replay them. KELs stay as files under `kels/` (anyone
@@ -24,6 +25,7 @@ use serde_json::{json, Value};
 use kith_core::keys::{KeyType, LocalSigner};
 use kith_core::util::{b64u, b64u_decode, now, sha256};
 
+use crate::contacts::{ContactRecord, CODE_TRIES};
 use crate::oidc::{AuthRequest, Client, CodeGrant, RefreshGrant, SsoSession};
 use crate::{read_json, RateLimit};
 
@@ -44,6 +46,9 @@ CREATE TABLE IF NOT EXISTS oidc_clients (client_id TEXT PRIMARY KEY, created INT
 CREATE TABLE IF NOT EXISTS totp (did TEXT PRIMARY KEY, secret TEXT NOT NULL, confirmed INTEGER NOT NULL, last_step INTEGER NOT NULL, failures INTEGER NOT NULL, locked_until INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cosigners (did TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS seen_jti (jti TEXT PRIMARY KEY, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS contacts (address TEXT PRIMARY KEY, did TEXT NOT NULL, verified_at INTEGER NOT NULL, public INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS contacts_did ON contacts (did);
+CREATE TABLE IF NOT EXISTS contact_codes (did TEXT NOT NULL, address TEXT NOT NULL, code TEXT NOT NULL, expires INTEGER NOT NULL, failures INTEGER NOT NULL, PRIMARY KEY (did, address));
 CREATE TABLE IF NOT EXISTS rate_limits (bucket TEXT PRIMARY KEY, window_start INTEGER NOT NULL, window_secs INTEGER NOT NULL, count INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
 ";
@@ -149,6 +154,7 @@ impl Store {
             c.execute("DELETE FROM oidc_sessions WHERE expires <= ?1", params![t])?;
             c.execute("DELETE FROM oidc_refresh WHERE expires <= ?1", params![t])?;
             c.execute("DELETE FROM seen_jti WHERE expires <= ?1", params![t])?;
+            c.execute("DELETE FROM contact_codes WHERE expires <= ?1", params![t])?;
             c.execute("DELETE FROM rate_limits WHERE window_start + window_secs <= ?1", params![t])?;
             Ok(())
         })
@@ -167,6 +173,7 @@ impl Store {
                 "registered_clients": count("oidc_clients")?,
                 "totp_enrollments": count("totp")?,
                 "cosigners": count("cosigners")?,
+                "contacts": count("contacts")?,
             }))
         })
     }
@@ -408,6 +415,82 @@ impl Store {
         })
     }
 
+    // ------------------------------------------------------------ contacts (spec 7.8.2)
+
+    /// Remember a code sent to `address` for `did`, replacing any earlier one. Only
+    /// its hash is kept.
+    pub(crate) fn put_contact_code(&self, did: &str, address: &str, code: &str, expires: i64) -> anyhow::Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO contact_codes (did, address, code, expires, failures) VALUES (?1, ?2, ?3, ?4, 0)
+                 ON CONFLICT(did, address) DO UPDATE SET code = excluded.code, expires = excluded.expires, failures = 0",
+                params![did, address, contact_code_hash(did, address, code), expires],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn drop_contact_code(&self, did: &str, address: &str) -> anyhow::Result<()> {
+        self.with(|c| Ok(c.execute("DELETE FROM contact_codes WHERE did = ?1 AND address = ?2", params![did, address]).map(drop)?))
+    }
+
+    /// Check a code. The right one is spent and makes `did` the holder of `address`
+    /// as of `t`, taking it from anyone else (who loses `public` with it). A wrong
+    /// one counts, and the code is gone after [`CODE_TRIES`] of them.
+    pub(crate) fn confirm_contact(&self, did: &str, address: &str, code: &str, t: i64) -> anyhow::Result<Option<ContactRecord>> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let row: Option<(String, i64, u32)> = tx
+                .query_row("SELECT code, expires, failures FROM contact_codes WHERE did = ?1 AND address = ?2", params![did, address], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?;
+            let Some((want, expires, failures)) = row else { return Ok(None) };
+            if expires <= t {
+                tx.execute("DELETE FROM contact_codes WHERE did = ?1 AND address = ?2", params![did, address])?;
+                tx.commit()?;
+                return Ok(None);
+            }
+            if !crate::oidc::ct_eq(&want, &contact_code_hash(did, address, code)) {
+                if failures + 1 >= CODE_TRIES {
+                    tx.execute("DELETE FROM contact_codes WHERE did = ?1 AND address = ?2", params![did, address])?;
+                } else {
+                    tx.execute("UPDATE contact_codes SET failures = failures + 1 WHERE did = ?1 AND address = ?2", params![did, address])?;
+                }
+                tx.commit()?;
+                return Ok(None);
+            }
+            tx.execute("DELETE FROM contact_codes WHERE did = ?1 AND address = ?2", params![did, address])?;
+            tx.execute(
+                "INSERT INTO contacts (address, did, verified_at, public) VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(address) DO UPDATE SET verified_at = excluded.verified_at,
+                   public = CASE WHEN contacts.did = excluded.did THEN contacts.public ELSE 0 END, did = excluded.did",
+                params![address, did, t],
+            )?;
+            let rec = read_contact(&tx, address)?;
+            tx.commit()?;
+            Ok(rec)
+        })
+    }
+
+    pub(crate) fn contacts_of(&self, did: &str) -> anyhow::Result<Vec<ContactRecord>> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT address, did, verified_at, public FROM contacts WHERE did = ?1 ORDER BY address")?;
+            let rows = stmt.query_map(params![did], |r| Ok(ContactRecord { address: r.get(0)?, did: r.get(1)?, verified_at: r.get(2)?, public: r.get(3)? }))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub(crate) fn contact(&self, address: &str) -> anyhow::Result<Option<ContactRecord>> {
+        self.with(|c| read_contact(c, address))
+    }
+
+    pub(crate) fn set_contact_public(&self, did: &str, address: &str, public: bool) -> anyhow::Result<bool> {
+        self.with(|c| Ok(c.execute("UPDATE contacts SET public = ?3 WHERE did = ?1 AND address = ?2", params![did, address, public])? > 0))
+    }
+
+    pub(crate) fn delete_contact(&self, did: &str, address: &str) -> anyhow::Result<bool> {
+        self.with(|c| Ok(c.execute("DELETE FROM contacts WHERE did = ?1 AND address = ?2", params![did, address])? > 0))
+    }
+
     /// Count one attempt in `bucket`. `Some(seconds)` when `limit` is exceeded: how
     /// long until the window resets. A limit with `max == 0` never trips.
     pub(crate) fn hit(&self, bucket: &str, limit: RateLimit, t: i64) -> anyhow::Result<Option<i64>> {
@@ -426,6 +509,16 @@ impl Store {
             Ok((count > i64::from(limit.max)).then(|| (start + limit.window_secs - t).max(1)))
         })
     }
+}
+
+/// A code is six digits, so its hash only keeps a copy of the file from being read
+/// off directly; the ten-minute life and five tries are what protect it.
+fn contact_code_hash(did: &str, address: &str, code: &str) -> String {
+    hash(&format!("kith-contact-code|{did}|{address}|{code}"))
+}
+
+fn read_contact(c: &Connection, address: &str) -> anyhow::Result<Option<ContactRecord>> {
+    Ok(c.query_row("SELECT address, did, verified_at, public FROM contacts WHERE address = ?1", params![address], |r| Ok(ContactRecord { address: r.get(0)?, did: r.get(1)?, verified_at: r.get(2)?, public: r.get(3)? })).optional()?)
 }
 
 fn read_totp(c: &Connection, did: &str) -> anyhow::Result<Option<TotpRecord>> {
