@@ -184,6 +184,9 @@
 - **Verified contacts.**
   - The AWS path builds and is not yet tested against AWS: no SES identity or SMS
     origination number has been set up for it.
+  - With the `aws` feature the SDK's default HTTP client brings in `rustls` 0.21 and
+    `rustls-webpki` 0.101 beside the current ones. Only that build has them; switching the
+    SDK to its newer client would drop them.
   - A takeover is only as quick as the new holder: a recycled number or a domain that
     changed owners keeps attesting for the old holder until someone else proves it or
     it goes stale.
@@ -232,15 +235,61 @@
 Ordered roughly by how much each matters. File and line references are in the audit, not
 repeated here.
 
-- **Dependencies.** `cargo audit` reports nine advisories (2026-10-23):
-  - `rustls` 0.23.45, `rustls-webpki` 0.103.15 and `webpki-roots` 1.0.9 have fixes
-    (`cargo update -p rustls -p rustls-webpki -p webpki-roots`);
-  - `rsa` 0.9.10, RUSTSEC-2023-0071 (the Marvin timing attack), **has no fix**. The hub
-    uses it to sign RS256 ID tokens with a private key, and to verify NIST beacons.
-    Options: sign ID tokens with EdDSA only, or move the private-key operations to
-    `ring`, `aws-lc-rs` or OpenSSL;
-  - `crypto-bigint` and `ctutils` (timing, through `rsa` and the curve crates),
-    `tokio` 1.53.1 (an unsound `AsyncFd`), and a yanked `yoke-derive`.
+- **Dependencies.** `cargo audit` on 2026-10-23 reported nine advisories and two
+  warnings. Updating `Cargo.lock` fixed seven of the advisories and both warnings
+  (`rustls` 0.23.46, `rustls-webpki` 0.103.16, `webpki-roots` 1.0.11, `ctutils` 0.4.5,
+  `tokio` 1.54.1, `yoke-derive` 0.8.4). Two are left, and a lockfile update cannot reach
+  either:
+  - `crypto-bigint` 0.5.5, RUSTSEC-2026-0387 (timing). It comes in through
+    `elliptic-curve` 0.13, so through `p256` and `k256`, not through `rsa`. The fixed
+    version (>=0.7.6) needs `p256` and `k256` 0.14, which need `ecdsa` 0.17, `sha2` 0.11,
+    `signature` 3 and `rand_core` 0.10: a major bump of the RustCrypto stack, with API
+    changes to expect in `kith-core`, `kith-hub` and the CLI keystore. Not done. Which of
+    Kith's private-key operations on those curves a network attacker could time has not
+    been assessed.
+  - `rsa` 0.9.10, RUSTSEC-2023-0071 (the Marvin attack: a timing side channel in RSA
+    private-key operations). **No patched version exists**, and the README of the 0.10
+    release candidates (0.10.0-rc.19, 2026-10-06) still lists it as open. Where Kith
+    uses `rsa`:
+    - Private-key operation, exposed: RS256 signing in `RsaSigner::sign_typed`
+      (`kith-hub/src/oidc.rs`). Every ID token and back-channel logout token goes through
+      it unless the client registered `EdDSA`, and RS256 is the default. The key is
+      `hub-rsa-key.json`. The relying party chooses the `nonce` that is signed and sees how
+      long the hub took to answer, and the call is `Signer::sign`, which `rsa` 0.9 does not
+      blind (`sign_with_rng` does).
+    - Private-key operations, not reachable from the network: key generation at first
+      start, and RSA-OAEP decryption in `jwe::decrypt`, which only tests call.
+    - Public-key operations, not affected: OAEP encryption of ID tokens to a client's key
+      (`kith-hub/src/jwe.rs`), RS256 verification of upstream IdP tokens
+      (`kith-hub/src/upstream.rs`) and of NIST beacon pulses (`kith-core/src/beacon.rs`).
+
+    Options, with rough effort:
+    1. **Sign RS256 with `ring` (recommended).** About a day. `ring` is already in the
+       build (`rustls` through `reqwest`) and does its private-key arithmetic in constant
+       time. `RsaKeyPair::from_pkcs8` reads the PKCS#8 already stored in `hub-rsa-key.json`
+       (tried with a key written by `rsa` 0.9.10: it loads, and its signature verifies with
+       `rsa`), so `kid`s, the JWKS and relying parties do not change. `ring` has neither
+       RSA key generation nor OAEP, so `rsa` stays for key generation and the public-key
+       operations above. It still matches RUSTSEC-2023-0071 in the lockfile, so the CI
+       audit job needs an ignore for that one advisory, with this reasoning as the note.
+    2. **EdDSA ID tokens by default, RS256 opt-in.** Half a day plus test changes (most of
+       the hub's OIDC tests assume RS256): change `default_alg()` and create the RSA key
+       only when a client opts in. This shrinks the exposure to the clients that opt in
+       and does not remove it. OIDC Discovery requires `RS256` in
+       `id_token_signing_alg_values_supported`, the registration default is RS256, and
+       many relying-party libraries cannot verify EdDSA. Worth doing alongside option 1,
+       not instead of it.
+    3. **Replace `rsa` with `aws-lc-rs`** (OpenSSL has the same shape, with a heavier
+       system dependency). Two to three days. `aws-lc-rs` has RSA key generation, PKCS#1
+       v1.5 signing and verification, and OAEP in both directions, so `rsa` leaves the
+       tree and the advisory goes with it, with no ignore. The cost is a C build
+       dependency (`aws-lc-sys`) in development, CI and the release and Homebrew builds,
+       and a second crypto provider next to `ring` unless `reqwest` is switched to it too.
+
+    `rsa` 0.10 is not an option yet. It moves to `crypto-bigint` 0.7, the same RustCrypto
+    generation as `p256` and `k256` 0.14, so revisit it together with the `crypto-bigint`
+    item above once it is stable and its README no longer lists Marvin as open.
+
 - **Secrets at rest.** TOTP seeds, co-signer private keys and clients' `client_secret`
   are plaintext in SQLite; cookies, codes and refresh tokens are hashed. The hub's key
   files use the default umask. Encrypt the recoverable ones with a hub key and hash
