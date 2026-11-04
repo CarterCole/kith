@@ -29,7 +29,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
-use cedar_policy::{Authorizer, Context, Decision, Entities, EntityId, EntityTypeName, EntityUid, Policy, PolicyId, PolicySet, Request};
+use cedar_policy::{
+    Authorizer, Context, Decision, Entities, EntityId, EntityTypeName, EntityUid, Policy, PolicyId,
+    PolicySet, Request,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
@@ -96,10 +99,18 @@ pub struct Resource {
 
 impl Resource {
     pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
-        Resource { kind: kind.into(), id: id.into(), attrs: Map::new() }
+        Resource {
+            kind: kind.into(),
+            id: id.into(),
+            attrs: Map::new(),
+        }
     }
     pub fn uid_string(&self) -> String {
-        format!("{}::{}", self.kind, serde_json::to_string(&self.id).unwrap())
+        format!(
+            "{}::{}",
+            self.kind,
+            serde_json::to_string(&self.id).unwrap()
+        )
     }
 }
 
@@ -119,7 +130,8 @@ pub struct Engine {
 }
 
 fn uid(kind: &str, id: &str) -> Result<EntityUid> {
-    let t = EntityTypeName::from_str(kind).map_err(|e| Error::Authz(format!("entity type {kind}: {e}")))?;
+    let t = EntityTypeName::from_str(kind)
+        .map_err(|e| Error::Authz(format!("entity type {kind}: {e}")))?;
     Ok(EntityUid::from_type_name_and_id(t, EntityId::new(id)))
 }
 
@@ -129,7 +141,11 @@ pub fn cedar_value(v: &Value) -> Option<Value> {
         Value::Null => None,
         Value::Number(n) if n.is_f64() => Some(Value::String(n.to_string())),
         Value::Array(a) => Some(Value::Array(a.iter().filter_map(cedar_value).collect())),
-        Value::Object(o) => Some(Value::Object(o.iter().filter_map(|(k, v)| cedar_value(v).map(|v| (k.clone(), v))).collect())),
+        Value::Object(o) => Some(Value::Object(
+            o.iter()
+                .filter_map(|(k, v)| cedar_value(v).map(|v| (k.clone(), v)))
+                .collect(),
+        )),
         other => Some(other.clone()),
     }
 }
@@ -148,7 +164,8 @@ fn entity(kind: &str, id: &str, attrs: Value, parents: Vec<(&str, &str)>) -> Val
 
 impl Engine {
     pub fn new(bundle: Bundle) -> Result<Self> {
-        let policies = PolicySet::from_str(&bundle.policies).map_err(|e| Error::Authz(format!("policies: {e}")))?;
+        let policies = PolicySet::from_str(&bundle.policies)
+            .map_err(|e| Error::Authz(format!("policies: {e}")))?;
         Self::with_policy_set(bundle, policies)
     }
 
@@ -164,12 +181,18 @@ impl Engine {
                         "permit(principal, action == Action::\"{MEMBER_ACTION}\", resource == {kind}::{}) when {{ {rule} }};",
                         serde_json::to_string(name)?
                     );
-                    let p = Policy::parse(Some(PolicyId::new(&id)), src).map_err(|e| Error::Authz(format!("{kind} {name} rule: {e}")))?;
+                    let p = Policy::parse(Some(PolicyId::new(&id)), src)
+                        .map_err(|e| Error::Authz(format!("{kind} {name} rule: {e}")))?;
                     membership.add(p).map_err(|e| Error::Authz(e.to_string()))?;
                 }
             }
         }
-        Ok(Engine { bundle, policies, membership, authorizer: Authorizer::new() })
+        Ok(Engine {
+            bundle,
+            policies,
+            membership,
+            authorizer: Authorizer::new(),
+        })
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
@@ -178,7 +201,12 @@ impl Engine {
 
     /// Directory attributes for a principal merged with (and overriding) `attrs`.
     pub fn attributes(&self, id: &str, attrs: &Map<String, Value>) -> Map<String, Value> {
-        let mut out = self.bundle.directory.get(id).map(|d| d.attrs.clone()).unwrap_or_default();
+        let mut out = self
+            .bundle
+            .directory
+            .get(id)
+            .map(|d| d.attrs.clone())
+            .unwrap_or_default();
         for (k, v) in attrs {
             out.insert(k.clone(), v.clone());
         }
@@ -196,8 +224,18 @@ impl Engine {
         out
     }
 
-    fn principal_entity(&self, id: &str, attrs: &Map<String, Value>, groups: &BTreeSet<String>, roles: &BTreeSet<String>) -> Value {
-        let parents = groups.iter().map(|g| ("Group", g.as_str())).chain(roles.iter().map(|r| ("Role", r.as_str()))).collect();
+    fn principal_entity(
+        &self,
+        id: &str,
+        attrs: &Map<String, Value>,
+        groups: &BTreeSet<String>,
+        roles: &BTreeSet<String>,
+    ) -> Value {
+        let parents = groups
+            .iter()
+            .map(|g| ("Group", g.as_str()))
+            .chain(roles.iter().map(|r| ("Role", r.as_str())))
+            .collect();
         entity("User", id, cedar_map(attrs), parents)
     }
 
@@ -208,7 +246,12 @@ impl Engine {
 
     /// Memberships with some sets (`Group::x`, `Role::x`) ruled out, as revocations
     /// require. An excluded set never joins, so neither do sets that depended on it.
-    pub fn memberships_excluding(&self, id: &str, attrs: &Map<String, Value>, excluded: &BTreeSet<String>) -> Result<Memberships> {
+    pub fn memberships_excluding(
+        &self,
+        id: &str,
+        attrs: &Map<String, Value>,
+        excluded: &BTreeSet<String>,
+    ) -> Result<Memberships> {
         let mut groups = BTreeSet::new();
         let mut roles = BTreeSet::new();
         let limit = self.bundle.groups.len() + self.bundle.roles.len() + 1;
@@ -217,7 +260,8 @@ impl Engine {
             let entities = {
                 let mut es = self.set_entities();
                 es.push(self.principal_entity(id, attrs, &groups, &roles));
-                Entities::from_json_value(Value::Array(es), None).map_err(|e| Error::Authz(format!("entities: {e}")))?
+                Entities::from_json_value(Value::Array(es), None)
+                    .map_err(|e| Error::Authz(format!("entities: {e}")))?
             };
             for (kind, defs) in [("Group", &self.bundle.groups), ("Role", &self.bundle.roles)] {
                 for (name, def) in defs {
@@ -226,12 +270,23 @@ impl Engine {
                         continue;
                     }
                     let explicit = def.members.iter().any(|m| {
-                        m == id || m.strip_prefix("group:").is_some_and(|g| groups.contains(g)) || m.strip_prefix("role:").is_some_and(|r| roles.contains(r))
+                        m == id
+                            || m.strip_prefix("group:").is_some_and(|g| groups.contains(g))
+                            || m.strip_prefix("role:").is_some_and(|r| roles.contains(r))
                     });
                     let dynamic = def.rule.is_some() && {
-                        let req = Request::new(uid("User", id)?, uid("Action", MEMBER_ACTION)?, uid(kind, name)?, Context::empty(), None)
-                            .map_err(|e| Error::Authz(e.to_string()))?;
-                        self.authorizer.is_authorized(&req, &self.membership, &entities).decision() == Decision::Allow
+                        let req = Request::new(
+                            uid("User", id)?,
+                            uid("Action", MEMBER_ACTION)?,
+                            uid(kind, name)?,
+                            Context::empty(),
+                            None,
+                        )
+                        .map_err(|e| Error::Authz(e.to_string()))?;
+                        self.authorizer
+                            .is_authorized(&req, &self.membership, &entities)
+                            .decision()
+                            == Decision::Allow
                     };
                     if explicit || dynamic {
                         if kind == "Group" {
@@ -247,23 +302,42 @@ impl Engine {
                 break;
             }
         }
-        Ok(Memberships { groups: groups.into_iter().collect(), roles: roles.into_iter().collect() })
+        Ok(Memberships {
+            groups: groups.into_iter().collect(),
+            roles: roles.into_iter().collect(),
+        })
     }
 
     /// Evaluate `action` on `resource` for `principal`. Delegated principals must also
     /// hold a matching capability (attenuation): delegation can only narrow access.
-    pub fn authorize(&self, principal: &Principal, action: &str, resource: &Resource, context: &Value) -> Result<AuthzDecision> {
+    pub fn authorize(
+        &self,
+        principal: &Principal,
+        action: &str,
+        resource: &Resource,
+        context: &Value,
+    ) -> Result<AuthzDecision> {
         if let Some(caps) = &principal.caps {
             if !caps_allow(caps, action, &resource.uid_string()) {
-                return Ok(AuthzDecision { allowed: false, reasons: vec!["delegation:cap".into()], errors: vec![] });
+                return Ok(AuthzDecision {
+                    allowed: false,
+                    reasons: vec!["delegation:cap".into()],
+                    errors: vec![],
+                });
             }
         }
         let groups: BTreeSet<String> = principal.groups.iter().cloned().collect();
         let roles: BTreeSet<String> = principal.roles.iter().cloned().collect();
         let mut es = self.set_entities();
         es.push(self.principal_entity(&principal.id, &principal.attrs, &groups, &roles));
-        es.push(entity(&resource.kind, &resource.id, cedar_map(&resource.attrs), vec![]));
-        let entities = Entities::from_json_value(Value::Array(es), None).map_err(|e| Error::Authz(format!("entities: {e}")))?;
+        es.push(entity(
+            &resource.kind,
+            &resource.id,
+            cedar_map(&resource.attrs),
+            vec![],
+        ));
+        let entities = Entities::from_json_value(Value::Array(es), None)
+            .map_err(|e| Error::Authz(format!("entities: {e}")))?;
         let mut ctx = cedar_value(context).unwrap_or(json!({}));
         if !ctx.is_object() {
             ctx = json!({});
@@ -271,10 +345,19 @@ impl Engine {
         if let Some(actor) = &principal.actor {
             ctx["actor"] = json!(actor);
         }
-        let context = Context::from_json_value(ctx, None).map_err(|e| Error::Authz(format!("context: {e}")))?;
-        let req = Request::new(uid("User", &principal.id)?, uid("Action", action)?, uid(&resource.kind, &resource.id)?, context, None)
-            .map_err(|e| Error::Authz(e.to_string()))?;
-        let resp = self.authorizer.is_authorized(&req, &self.policies, &entities);
+        let context = Context::from_json_value(ctx, None)
+            .map_err(|e| Error::Authz(format!("context: {e}")))?;
+        let req = Request::new(
+            uid("User", &principal.id)?,
+            uid("Action", action)?,
+            uid(&resource.kind, &resource.id)?,
+            context,
+            None,
+        )
+        .map_err(|e| Error::Authz(e.to_string()))?;
+        let resp = self
+            .authorizer
+            .is_authorized(&req, &self.policies, &entities);
         Ok(AuthzDecision {
             allowed: resp.decision() == Decision::Allow,
             reasons: resp.diagnostics().reason().map(|p| p.to_string()).collect(),
@@ -309,7 +392,14 @@ mod tests {
         let mut attrs = e.attributes(id, &Map::new());
         attrs.insert("aal".into(), json!(aal));
         let m = e.memberships(id, &attrs).unwrap();
-        Principal { id: id.into(), attrs, groups: m.groups, roles: m.roles, actor: None, caps: None }
+        Principal {
+            id: id.into(),
+            attrs,
+            groups: m.groups,
+            roles: m.roles,
+            actor: None,
+            caps: None,
+        }
     }
 
     #[test]
@@ -329,18 +419,46 @@ mod tests {
         let ada = principal(&e, "did:kith:ada", 2);
         let bob = principal(&e, "did:kith:bob", 1);
         let op = Resource::new("Operation", "Query.invoices");
-        assert!(e.authorize(&ada, "Query.invoices", &op, &json!({})).unwrap().allowed);
-        assert!(e.authorize(&bob, "Query.invoices", &op, &json!({})).unwrap().allowed);
+        assert!(
+            e.authorize(&ada, "Query.invoices", &op, &json!({}))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            e.authorize(&bob, "Query.invoices", &op, &json!({}))
+                .unwrap()
+                .allowed
+        );
         let pay = Resource::new("Operation", "Mutation.payInvoice");
-        assert!(e.authorize(&ada, "Mutation.payInvoice", &pay, &json!({"amount": 500})).unwrap().allowed);
-        assert!(!e.authorize(&ada, "Mutation.payInvoice", &pay, &json!({"amount": 50000})).unwrap().allowed);
-        assert!(!e.authorize(&bob, "Mutation.payInvoice", &pay, &json!({"amount": 5})).unwrap().allowed);
+        assert!(
+            e.authorize(&ada, "Mutation.payInvoice", &pay, &json!({"amount": 500}))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !e.authorize(&ada, "Mutation.payInvoice", &pay, &json!({"amount": 50000}))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !e.authorize(&bob, "Mutation.payInvoice", &pay, &json!({"amount": 5}))
+                .unwrap()
+                .allowed
+        );
 
         let mut inv = Resource::new("Invoice", "inv_1");
         inv.attrs.insert("ownerId".into(), json!("ada@acme.test"));
         inv.attrs.insert("amount".into(), json!(12.5)); // floats are stringified, not rejected
-        assert!(e.authorize(&ada, "Invoice.read", &inv, &json!({})).unwrap().allowed);
-        assert!(!e.authorize(&bob, "Invoice.read", &inv, &json!({})).unwrap().allowed);
+        assert!(
+            e.authorize(&ada, "Invoice.read", &inv, &json!({}))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !e.authorize(&bob, "Invoice.read", &inv, &json!({}))
+                .unwrap()
+                .allowed
+        );
     }
 
     #[test]
@@ -348,29 +466,55 @@ mod tests {
         let e = Engine::from_json(BUNDLE).unwrap();
         let mut ada = principal(&e, "did:kith:ada", 2);
         ada.actor = Some("did:kith:assistant".into());
-        ada.caps = Some(vec![Capability::new("Query.*"), Capability::new("Mutation.payInvoice")]);
+        ada.caps = Some(vec![
+            Capability::new("Query.*"),
+            Capability::new("Mutation.payInvoice"),
+        ]);
         let op = Resource::new("Operation", "Query.invoices");
-        assert!(e.authorize(&ada, "Query.invoices", &op, &json!({})).unwrap().allowed);
+        assert!(
+            e.authorize(&ada, "Query.invoices", &op, &json!({}))
+                .unwrap()
+                .allowed
+        );
         // cap allows it, but the policy forbids delegated payments.
         let pay = Resource::new("Operation", "Mutation.payInvoice");
-        assert!(!e.authorize(&ada, "Mutation.payInvoice", &pay, &json!({"amount": 5})).unwrap().allowed);
+        assert!(
+            !e.authorize(&ada, "Mutation.payInvoice", &pay, &json!({"amount": 5}))
+                .unwrap()
+                .allowed
+        );
         // no cap for Invoice.read
         let mut inv = Resource::new("Invoice", "inv_1");
         inv.attrs.insert("ownerId".into(), json!("ada@acme.test"));
-        assert!(!e.authorize(&ada, "Invoice.read", &inv, &json!({})).unwrap().allowed);
+        assert!(
+            !e.authorize(&ada, "Invoice.read", &inv, &json!({}))
+                .unwrap()
+                .allowed
+        );
     }
 
     /// Shared conformance vectors (also run by the JS and Python packages).
     #[test]
     fn conformance_vectors() {
-        let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
+        let v: Value =
+            serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
         let e = Engine::new(serde_json::from_value(v["bundle"].clone()).unwrap()).unwrap();
         for m in v["memberships"].as_array().unwrap() {
             let id = m["id"].as_str().unwrap();
             let attrs = e.attributes(id, m["attrs"].as_object().unwrap());
             let got = e.memberships(id, &attrs).unwrap();
-            assert_eq!(json!(got.groups), m["groups"], "groups for {id} {}", m["attrs"]);
-            assert_eq!(json!(got.roles), m["roles"], "roles for {id} {}", m["attrs"]);
+            assert_eq!(
+                json!(got.groups),
+                m["groups"],
+                "groups for {id} {}",
+                m["attrs"]
+            );
+            assert_eq!(
+                json!(got.roles),
+                m["roles"],
+                "roles for {id} {}",
+                m["attrs"]
+            );
         }
         for d in v["decisions"].as_array().unwrap() {
             let id = d["principal"].as_str().unwrap();
@@ -382,14 +526,26 @@ mod tests {
                 groups: m.groups,
                 roles: m.roles,
                 actor: d["actor"].as_str().map(String::from),
-                caps: d.get("caps").map(|c| serde_json::from_value(c.clone()).unwrap()),
+                caps: d
+                    .get("caps")
+                    .map(|c| serde_json::from_value(c.clone()).unwrap()),
             };
-            let mut r = Resource::new(d["resource"]["type"].as_str().unwrap(), d["resource"]["id"].as_str().unwrap());
+            let mut r = Resource::new(
+                d["resource"]["type"].as_str().unwrap(),
+                d["resource"]["id"].as_str().unwrap(),
+            );
             if let Some(a) = d["resource"]["attrs"].as_object() {
                 r.attrs = a.clone();
             }
-            let got = e.authorize(&p, d["action"].as_str().unwrap(), &r, &d["context"]).unwrap();
-            assert_eq!(got.allowed, d["allowed"].as_bool().unwrap(), "{}: {got:?}", d["name"]);
+            let got = e
+                .authorize(&p, d["action"].as_str().unwrap(), &r, &d["context"])
+                .unwrap();
+            assert_eq!(
+                got.allowed,
+                d["allowed"].as_bool().unwrap(),
+                "{}: {got:?}",
+                d["name"]
+            );
         }
     }
 

@@ -37,7 +37,9 @@ impl<'a> Reader<'a> {
     }
 
     fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().expect("4 bytes")))
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
     }
 
     fn string(&mut self) -> Result<&'a [u8]> {
@@ -91,18 +93,34 @@ impl SshSig {
         let hash_algorithm = r.utf8()?.to_string();
         let signature = parse_signature(r.string()?, public_key.kty)?;
         r.finish()?;
-        Ok(SshSig { public_key, namespace, hash_algorithm, reserved, signature })
+        Ok(SshSig {
+            public_key,
+            namespace,
+            hash_algorithm,
+            reserved,
+            signature,
+        })
     }
 
     /// Check the signature over `message`, with the Kith namespace.
     pub fn verify(&self, message: &[u8]) -> Result<()> {
         if self.namespace != NAMESPACE {
-            return Err(Error::Signature(format!("SSHSIG namespace {:?}, expected {NAMESPACE:?}", self.namespace)));
+            return Err(Error::Signature(format!(
+                "SSHSIG namespace {:?}, expected {NAMESPACE:?}",
+                self.namespace
+            )));
         }
         if !self.reserved.is_empty() {
-            return Err(Error::Signature("SSHSIG reserved field is not empty".into()));
+            return Err(Error::Signature(
+                "SSHSIG reserved field is not empty".into(),
+            ));
         }
-        let data = signed_data(&self.namespace, &self.reserved, &self.hash_algorithm, message)?;
+        let data = signed_data(
+            &self.namespace,
+            &self.reserved,
+            &self.hash_algorithm,
+            message,
+        )?;
         self.public_key.verify(&data, &self.signature)
     }
 }
@@ -111,14 +129,21 @@ impl SshSig {
 pub fn verify(pk: &PublicKey, message: &[u8], blob: &[u8]) -> Result<()> {
     let sig = SshSig::parse(blob)?;
     if &sig.public_key != pk {
-        return Err(Error::Signature("SSHSIG public key is not the signer's key".into()));
+        return Err(Error::Signature(
+            "SSHSIG public key is not the signer's key".into(),
+        ));
     }
     sig.verify(message)
 }
 
 /// The bytes the SSH key signs: the preamble, namespace, reserved field, hash
 /// algorithm and the hash of the message.
-fn signed_data(namespace: &str, reserved: &[u8], hash_algorithm: &str, message: &[u8]) -> Result<Vec<u8>> {
+fn signed_data(
+    namespace: &str,
+    reserved: &[u8],
+    hash_algorithm: &str,
+    message: &[u8],
+) -> Result<Vec<u8>> {
     let hash = match hash_algorithm {
         "sha256" => Sha256::digest(message).to_vec(),
         "sha512" => Sha512::digest(message).to_vec(),
@@ -136,13 +161,20 @@ fn signed_data(namespace: &str, reserved: &[u8], hash_algorithm: &str, message: 
 fn parse_public_key(blob: &[u8]) -> Result<PublicKey> {
     let mut r = Reader(blob);
     let pk = match r.utf8()? {
-        "ssh-ed25519" => PublicKey { kty: KeyType::Ed25519, bytes: r.string()?.to_vec() },
+        "ssh-ed25519" => PublicKey {
+            kty: KeyType::Ed25519,
+            bytes: r.string()?.to_vec(),
+        },
         "ecdsa-sha2-nistp256" => {
             if r.string()? != b"nistp256" {
                 return Err(enc("curve name does not match the key type"));
             }
-            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(r.string()?).map_err(|e| enc(&e.to_string()))?;
-            PublicKey { kty: KeyType::P256, bytes: vk.to_encoded_point(true).as_bytes().to_vec() }
+            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(r.string()?)
+                .map_err(|e| enc(&e.to_string()))?;
+            PublicKey {
+                kty: KeyType::P256,
+                bytes: vk.to_encoded_point(true).as_bytes().to_vec(),
+            }
         }
         other => return Err(Error::Unsupported(format!("SSH key type {other}"))),
     };
@@ -170,7 +202,11 @@ fn parse_signature(blob: &[u8], kty: KeyType) -> Result<Vec<u8>> {
             inner.finish()?;
             rs
         }
-        (_, other) => return Err(Error::Signature(format!("SSH signature type {other} does not match the key"))),
+        (_, other) => {
+            return Err(Error::Signature(format!(
+                "SSH signature type {other} does not match the key"
+            )))
+        }
     };
     r.finish()?;
     Ok(sig)
@@ -197,7 +233,9 @@ pub fn did_key_from_openssh(line: &str) -> Result<String> {
     let (Some(kind), Some(b64)) = (parts.next(), parts.next()) else {
         return Err(enc("expected `<type> <base64> [comment]`"));
     };
-    let blob = STANDARD.decode(b64).map_err(|e| enc(&format!("base64: {e}")))?;
+    let blob = STANDARD
+        .decode(b64)
+        .map_err(|e| enc(&format!("base64: {e}")))?;
     if Reader(&blob).utf8()? != kind {
         return Err(enc("key type does not match the key blob"));
     }
@@ -212,7 +250,9 @@ pub fn dearmor(text: &str) -> Result<Vec<u8>> {
         .and_then(|s| s.strip_suffix(ARMOR_END))
         .ok_or_else(|| enc("not an armored SSH signature"))?;
     let b64: String = body.split_whitespace().collect();
-    STANDARD.decode(b64).map_err(|e| enc(&format!("base64: {e}")))
+    STANDARD
+        .decode(b64)
+        .map_err(|e| enc(&format!("base64: {e}")))
 }
 
 #[cfg(test)]
@@ -223,7 +263,8 @@ mod tests {
     use serde_json::Value;
 
     fn cases() -> Vec<Value> {
-        let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/sshsig.json")).unwrap();
+        let v: Value =
+            serde_json::from_str(include_str!("../../../spec/test-vectors/sshsig.json")).unwrap();
         v["cases"].as_array().unwrap().clone()
     }
 
@@ -242,10 +283,22 @@ mod tests {
         assert!(cases.iter().filter(|c| c["valid"] == true).count() >= 4);
         for c in &cases {
             let name = c["name"].as_str().unwrap();
-            let got = verify_sig(&sig_of(c), c["message"].as_str().unwrap().as_bytes(), &VerifyOptions::default());
-            assert_eq!(got.is_ok(), c["valid"].as_bool().unwrap(), "{name}: {got:?}");
+            let got = verify_sig(
+                &sig_of(c),
+                c["message"].as_str().unwrap().as_bytes(),
+                &VerifyOptions::default(),
+            );
+            assert_eq!(
+                got.is_ok(),
+                c["valid"].as_bool().unwrap(),
+                "{name}: {got:?}"
+            );
             // `sig` is exactly what ssh-keygen armored.
-            assert_eq!(b64u(dearmor(c["armored"].as_str().unwrap()).unwrap()), c["sig"].as_str().unwrap(), "{name}");
+            assert_eq!(
+                b64u(dearmor(c["armored"].as_str().unwrap()).unwrap()),
+                c["sig"].as_str().unwrap(),
+                "{name}"
+            );
         }
     }
 
@@ -253,12 +306,22 @@ mod tests {
     /// types Kith allows. Kith must reject those cases for its own reasons.
     #[test]
     fn rejects_what_ssh_keygen_accepts() {
-        let disagreements: Vec<Value> = cases().into_iter().filter(|c| c["ssh_keygen"] == true && c["valid"] == false).collect();
+        let disagreements: Vec<Value> = cases()
+            .into_iter()
+            .filter(|c| c["ssh_keygen"] == true && c["valid"] == false)
+            .collect();
         assert_eq!(disagreements.len(), 2);
         for c in &disagreements {
-            let err = verify_sig(&sig_of(c), c["message"].as_str().unwrap().as_bytes(), &VerifyOptions::default()).unwrap_err();
+            let err = verify_sig(
+                &sig_of(c),
+                c["message"].as_str().unwrap().as_bytes(),
+                &VerifyOptions::default(),
+            )
+            .unwrap_err();
             match c["name"].as_str().unwrap() {
-                "wrong-signer" => assert!(err.to_string().contains("not the signer's key"), "{err}"),
+                "wrong-signer" => {
+                    assert!(err.to_string().contains("not the signer's key"), "{err}")
+                }
                 "p384-unsupported" => assert!(matches!(err, Error::Unsupported(_)), "{err}"),
                 other => panic!("unexpected disagreement with ssh-keygen: {other}"),
             }
@@ -279,7 +342,11 @@ mod tests {
             let blob = b64u_decode(c["sig"].as_str().unwrap()).unwrap();
             SshSig::parse(&blob).unwrap();
             for n in 0..blob.len() {
-                assert!(SshSig::parse(&blob[..n]).is_err(), "{} cut at {n}", c["name"]);
+                assert!(
+                    SshSig::parse(&blob[..n]).is_err(),
+                    "{} cut at {n}",
+                    c["name"]
+                );
             }
         }
     }
@@ -289,6 +356,11 @@ mod tests {
         let c = cases().into_iter().find(|c| c["valid"] == true).unwrap();
         let mut sig = sig_of(&c);
         sig.alg = "Ed25519".into();
-        assert!(verify_sig(&sig, c["message"].as_str().unwrap().as_bytes(), &VerifyOptions::default()).is_err());
+        assert!(verify_sig(
+            &sig,
+            c["message"].as_str().unwrap().as_bytes(),
+            &VerifyOptions::default()
+        )
+        .is_err());
     }
 }

@@ -147,7 +147,9 @@ impl Event {
     /// The signed payload: the event without `sigs`.
     pub fn payload(&self) -> Result<Value> {
         let mut v = serde_json::to_value(self)?;
-        v.as_object_mut().expect("event is an object").remove("sigs");
+        v.as_object_mut()
+            .expect("event is an object")
+            .remove("sigs");
         Ok(v)
     }
 
@@ -181,23 +183,42 @@ impl Event {
 
 pub fn did_for_inception(ev: &Event) -> Result<String> {
     let hash = sha256(crate::canon::to_canonical(&ev.payload()?)?);
-    Ok(format!("{DID_PREFIX}{}", data_encoding::BASE32_NOPAD.encode(&hash).to_lowercase()))
+    Ok(format!(
+        "{DID_PREFIX}{}",
+        data_encoding::BASE32_NOPAD.encode(&hash).to_lowercase()
+    ))
 }
 
-pub fn new_inception(manage: SignerPolicy, next_rotation: &SignerPolicy, devices: Vec<Device>) -> Event {
+pub fn new_inception(
+    manage: SignerPolicy,
+    next_rotation: &SignerPolicy,
+    devices: Vec<Device>,
+) -> Event {
     Event {
         v: 1,
         did: None,
         seq: 0,
         prev: None,
         ts: now(),
-        body: EventBody::Inception { manage, next: next_rotation.digest(), devices },
+        body: EventBody::Inception {
+            manage,
+            next: next_rotation.digest(),
+            devices,
+        },
         sigs: vec![],
     }
 }
 
 pub fn next_event(state: &KeyState, body: EventBody) -> Event {
-    Event { v: 1, did: Some(state.did.clone()), seq: state.seq + 1, prev: Some(state.digest.clone()), ts: now().max(state.updated), body, sigs: vec![] }
+    Event {
+        v: 1,
+        did: Some(state.did.clone()),
+        seq: state.seq + 1,
+        prev: Some(state.digest.clone()),
+        ts: now().max(state.updated),
+        body,
+        sigs: vec![],
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,7 +264,11 @@ impl KeyState {
     /// True if `signed` may sign this identity's revocations: the manage policy, or
     /// any one active device with the `revoke` capability.
     pub fn may_revoke(&self, signed: &BTreeSet<String>) -> bool {
-        self.manage.is_satisfied_by(signed) || self.devices.values().any(|d| d.has_cap("revoke") && signed.contains(&d.key))
+        self.manage.is_satisfied_by(signed)
+            || self
+                .devices
+                .values()
+                .any(|d| d.has_cap("revoke") && signed.contains(&d.key))
     }
 
     /// Every signer that may authenticate as this identity (device keys and the
@@ -267,7 +292,11 @@ impl KeyState {
                 })
             })
             .collect();
-        let ids: Vec<String> = self.devices.keys().map(|id| format!("{}#{}", self.did, id)).collect();
+        let ids: Vec<String> = self
+            .devices
+            .keys()
+            .map(|id| format!("{}#{}", self.did, id))
+            .collect();
         let mut doc = json!({
             "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
             "id": self.did,
@@ -289,7 +318,8 @@ fn valid_signers(ev: &Event, opts: &VerifyOptions) -> Result<BTreeSet<String>> {
     let msg = ev.signing_message()?;
     let mut out = BTreeSet::new();
     for sig in &ev.sigs {
-        verify_sig(sig, &msg, opts).map_err(|e| Error::Kel(format!("seq {}: signature by {}: {e}", ev.seq, sig.signer)))?;
+        verify_sig(sig, &msg, opts)
+            .map_err(|e| Error::Kel(format!("seq {}: signature by {}: {e}", ev.seq, sig.signer)))?;
         out.insert(sig.signer.clone());
     }
     Ok(out)
@@ -311,8 +341,15 @@ fn validate_device(d: &Device) -> Result<()> {
 
 /// Replay and verify a KEL, returning the resulting state.
 pub fn verify_log(events: &[Event], opts: &VerifyOptions) -> Result<KeyState> {
-    let first = events.first().ok_or_else(|| Error::Kel("empty log".into()))?;
-    let EventBody::Inception { manage, next, devices } = &first.body else {
+    let first = events
+        .first()
+        .ok_or_else(|| Error::Kel("empty log".into()))?;
+    let EventBody::Inception {
+        manage,
+        next,
+        devices,
+    } = &first.body
+    else {
         return Err(Error::Kel("first event must be inception".into()));
     };
     if first.v != 1 || first.seq != 0 || first.prev.is_some() || first.did.is_some() {
@@ -321,13 +358,18 @@ pub fn verify_log(events: &[Event], opts: &VerifyOptions) -> Result<KeyState> {
     manage.validate()?;
     let signed = valid_signers(first, opts)?;
     if !manage.is_satisfied_by(&signed) {
-        return Err(Error::Kel("inception not signed by its manage policy".into()));
+        return Err(Error::Kel(
+            "inception not signed by its manage policy".into(),
+        ));
     }
     let mut dev_map = BTreeMap::new();
     for d in devices {
         validate_device(d)?;
         if !signed.contains(&d.key) {
-            return Err(Error::Kel(format!("device {} did not sign inception (proof of possession)", d.id)));
+            return Err(Error::Kel(format!(
+                "device {} did not sign inception (proof of possession)",
+                d.id
+            )));
         }
         if dev_map.insert(d.id.clone(), d.clone()).is_some() {
             return Err(Error::Kel(format!("duplicate device id {}", d.id)));
@@ -356,19 +398,31 @@ pub fn verify_log(events: &[Event], opts: &VerifyOptions) -> Result<KeyState> {
             return Err(Error::Kel(format!("seq {}: broken hash chain", ev.seq)));
         }
         if ev.ts < st.updated {
-            return Err(Error::Kel(format!("seq {}: timestamp went backwards", ev.seq)));
+            return Err(Error::Kel(format!(
+                "seq {}: timestamp went backwards",
+                ev.seq
+            )));
         }
         let signed = valid_signers(ev, opts)?;
         let by_manage = st.manage.is_satisfied_by(&signed);
         match &ev.body {
             EventBody::Inception { .. } => return Err(Error::Kel("duplicate inception".into())),
-            EventBody::Rotate { rotation, manage, next, revoke_devices } => {
+            EventBody::Rotate {
+                rotation,
+                manage,
+                next,
+                revoke_devices,
+            } => {
                 if rotation.digest() != st.next {
-                    return Err(Error::Kel("rotation policy does not match pre-rotation commitment".into()));
+                    return Err(Error::Kel(
+                        "rotation policy does not match pre-rotation commitment".into(),
+                    ));
                 }
                 rotation.validate()?;
                 if !rotation.is_satisfied_by(&signed) {
-                    return Err(Error::Kel("rotation not signed by the committed rotation keys".into()));
+                    return Err(Error::Kel(
+                        "rotation not signed by the committed rotation keys".into(),
+                    ));
                 }
                 manage.validate()?;
                 st.manage = manage.clone();
@@ -385,7 +439,9 @@ pub fn verify_log(events: &[Event], opts: &VerifyOptions) -> Result<KeyState> {
                     return Err(Error::Kel("add_device requires the manage policy".into()));
                 }
                 if !signed.contains(&device.key) {
-                    return Err(Error::Kel("new device must co-sign (proof of possession)".into()));
+                    return Err(Error::Kel(
+                        "new device must co-sign (proof of possession)".into(),
+                    ));
                 }
                 if st.devices.contains_key(&device.id) || st.revoked.contains(&device.id) {
                     return Err(Error::Kel(format!("device id {} already used", device.id)));
@@ -396,19 +452,33 @@ pub fn verify_log(events: &[Event], opts: &VerifyOptions) -> Result<KeyState> {
                 st.devices.insert(device.id.clone(), device.clone());
             }
             EventBody::RevokeDevice { device_id, .. } => {
-                let dev = st.devices.get(device_id).ok_or_else(|| Error::Kel(format!("unknown device {device_id}")))?;
+                let dev = st
+                    .devices
+                    .get(device_id)
+                    .ok_or_else(|| Error::Kel(format!("unknown device {device_id}")))?;
                 if !by_manage && !signed.contains(&dev.key) {
-                    return Err(Error::Kel("revoke_device requires manage policy or the device itself".into()));
+                    return Err(Error::Kel(
+                        "revoke_device requires manage policy or the device itself".into(),
+                    ));
                 }
                 st.devices.remove(device_id);
                 st.revoked.insert(device_id.clone());
             }
             EventBody::AliasCommit { commitment } => {
-                let by_device = st.devices.values().any(|d| d.has_cap("alias") && signed.contains(&d.key));
+                let by_device = st
+                    .devices
+                    .values()
+                    .any(|d| d.has_cap("alias") && signed.contains(&d.key));
                 if !by_manage && !by_device {
-                    return Err(Error::Kel("alias_commit requires manage policy or an alias-capable device".into()));
+                    return Err(Error::Kel(
+                        "alias_commit requires manage policy or an alias-capable device".into(),
+                    ));
                 }
-                st.alias_commitments.push(AliasCommitment { seq: ev.seq, ts: ev.ts, commitment: commitment.clone() });
+                st.alias_commitments.push(AliasCommitment {
+                    seq: ev.seq,
+                    ts: ev.ts,
+                    commitment: commitment.clone(),
+                });
             }
             EventBody::AliasLink { alias } => {
                 if !by_manage {
@@ -422,17 +492,29 @@ pub fn verify_log(events: &[Event], opts: &VerifyOptions) -> Result<KeyState> {
                 }
                 st.aliases.remove(alias);
             }
-            EventBody::PolicyRoot { root, revocations_through } => {
+            EventBody::PolicyRoot {
+                root,
+                revocations_through,
+            } => {
                 if !by_manage {
                     return Err(Error::Kel("policy_root requires the manage policy".into()));
                 }
                 if !root.starts_with('b') || root.len() < 10 {
                     return Err(Error::Kel(format!("policy root {root:?} is not a CID")));
                 }
-                if st.policy.as_ref().is_some_and(|p| *revocations_through < p.revocations_through) {
+                if st
+                    .policy
+                    .as_ref()
+                    .is_some_and(|p| *revocations_through < p.revocations_through)
+                {
                     return Err(Error::Kel("revocations_through went backwards".into()));
                 }
-                st.policy = Some(PolicyHead { seq: ev.seq, ts: ev.ts, root: root.clone(), revocations_through: *revocations_through });
+                st.policy = Some(PolicyHead {
+                    seq: ev.seq,
+                    ts: ev.ts,
+                    root: root.clone(),
+                    revocations_through: *revocations_through,
+                });
             }
         }
         st.seq = ev.seq;
@@ -475,7 +557,13 @@ pub(crate) mod tests {
             LocalSigner::generate(KeyType::Ed25519),
             LocalSigner::generate_eth_wallet(1),
         ];
-        let rotation = SignerPolicy::threshold(2, recovery.iter().map(|s| SignerPolicy::single(&s.id)).collect());
+        let rotation = SignerPolicy::threshold(
+            2,
+            recovery
+                .iter()
+                .map(|s| SignerPolicy::single(&s.id))
+                .collect(),
+        );
         let device = LocalSigner::generate(KeyType::Ed25519);
         let dev = Device {
             id: "laptop".into(),
@@ -490,7 +578,13 @@ pub(crate) mod tests {
         let mut inc = new_inception(SignerPolicy::single(&root.id), &rotation, vec![dev]);
         inc.sign(&root).unwrap();
         inc.sign(&device).unwrap();
-        Fixture { root, recovery, device, device_id: "laptop".into(), log: vec![inc] }
+        Fixture {
+            root,
+            recovery,
+            device,
+            device_id: "laptop".into(),
+            log: vec![inc],
+        }
     }
 
     #[test]
@@ -534,15 +628,37 @@ pub(crate) mod tests {
         missing.push(ev.clone());
         assert!(verify_log(&missing, &VerifyOptions::default()).is_err());
         let msg = ev.signing_message().unwrap();
-        ev.add_sig(crate::webauthn::soft_sign_message(&passkey, "example.com", "https://example.com", &msg).unwrap());
+        ev.add_sig(
+            crate::webauthn::soft_sign_message(
+                &passkey,
+                "example.com",
+                "https://example.com",
+                &msg,
+            )
+            .unwrap(),
+        );
         f.log.push(ev);
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         assert_eq!(st.devices.len(), 2);
 
         // A device may revoke itself.
-        let mut rev = next_event(&st, EventBody::RevokeDevice { device_id: "phone".into(), reason: Some("lost".into()) });
+        let mut rev = next_event(
+            &st,
+            EventBody::RevokeDevice {
+                device_id: "phone".into(),
+                reason: Some("lost".into()),
+            },
+        );
         let msg = rev.signing_message().unwrap();
-        rev.add_sig(crate::webauthn::soft_sign_message(&passkey, "example.com", "https://example.com", &msg).unwrap());
+        rev.add_sig(
+            crate::webauthn::soft_sign_message(
+                &passkey,
+                "example.com",
+                "https://example.com",
+                &msg,
+            )
+            .unwrap(),
+        );
         f.log.push(rev);
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         assert!(st.device("phone").is_none());
@@ -554,7 +670,16 @@ pub(crate) mod tests {
         let mut f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         let other = LocalSigner::generate(KeyType::Ed25519);
-        let dev = Device { id: "x".into(), key: other.id.clone(), name: "x".into(), kind: DeviceKind::Software, aal: 1, caps: vec![], rp_id: None, xkey: None };
+        let dev = Device {
+            id: "x".into(),
+            key: other.id.clone(),
+            name: "x".into(),
+            kind: DeviceKind::Software,
+            aal: 1,
+            caps: vec![],
+            rp_id: None,
+            xkey: None,
+        };
         let mut ev = next_event(&st, EventBody::AddDevice { device: dev });
         ev.sign(&f.device).unwrap();
         ev.sign(&other).unwrap();
@@ -566,19 +691,41 @@ pub(crate) mod tests {
     fn pre_rotation_recovers_from_compromised_root() {
         let mut f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
-        let rotation = SignerPolicy::threshold(2, f.recovery.iter().map(|s| SignerPolicy::single(&s.id)).collect());
+        let rotation = SignerPolicy::threshold(
+            2,
+            f.recovery
+                .iter()
+                .map(|s| SignerPolicy::single(&s.id))
+                .collect(),
+        );
         let new_root = LocalSigner::generate(KeyType::Ed25519);
         let new_next = SignerPolicy::single(LocalSigner::generate(KeyType::Ed25519).id);
 
         // The (compromised) root key alone cannot rotate.
-        let mut bad = next_event(&st, EventBody::Rotate { rotation: rotation.clone(), manage: SignerPolicy::single(&new_root.id), next: new_next.digest(), revoke_devices: true });
+        let mut bad = next_event(
+            &st,
+            EventBody::Rotate {
+                rotation: rotation.clone(),
+                manage: SignerPolicy::single(&new_root.id),
+                next: new_next.digest(),
+                revoke_devices: true,
+            },
+        );
         bad.sign(&f.root).unwrap();
         let mut attempt = f.log.clone();
         attempt.push(bad);
         assert!(verify_log(&attempt, &VerifyOptions::default()).is_err());
 
         // Two of the three recovery signers (one is an Ethereum wallet) can.
-        let mut ev = next_event(&st, EventBody::Rotate { rotation, manage: SignerPolicy::single(&new_root.id), next: new_next.digest(), revoke_devices: true });
+        let mut ev = next_event(
+            &st,
+            EventBody::Rotate {
+                rotation,
+                manage: SignerPolicy::single(&new_root.id),
+                next: new_next.digest(),
+                revoke_devices: true,
+            },
+        );
         ev.sign(&f.recovery[0]).unwrap();
         ev.sign(&f.recovery[2]).unwrap();
         f.log.push(ev);
@@ -592,9 +739,19 @@ pub(crate) mod tests {
     fn fork_detection() {
         let f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
-        let mut a = next_event(&st, EventBody::AliasLink { alias: "mailto:a@example.com".into() });
+        let mut a = next_event(
+            &st,
+            EventBody::AliasLink {
+                alias: "mailto:a@example.com".into(),
+            },
+        );
         a.sign(&f.root).unwrap();
-        let mut b = next_event(&st, EventBody::AliasLink { alias: "mailto:b@example.com".into() });
+        let mut b = next_event(
+            &st,
+            EventBody::AliasLink {
+                alias: "mailto:b@example.com".into(),
+            },
+        );
         b.sign(&f.root).unwrap();
         let log_a = [f.log.clone(), vec![a]].concat();
         let log_b = [f.log.clone(), vec![b]].concat();
@@ -607,15 +764,37 @@ pub(crate) mod tests {
         let mut f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         let root = "baguqeerasords4njcts6vs7qvdjfcvgnume4hqohf65zsfguprqphs3icwea".to_string();
-        let mut by_device = next_event(&st, EventBody::PolicyRoot { root: root.clone(), revocations_through: 3 });
+        let mut by_device = next_event(
+            &st,
+            EventBody::PolicyRoot {
+                root: root.clone(),
+                revocations_through: 3,
+            },
+        );
         by_device.sign(&f.device).unwrap();
-        assert!(verify_log(&[f.log.clone(), vec![by_device]].concat(), &VerifyOptions::default()).is_err());
-        let mut ev = next_event(&st, EventBody::PolicyRoot { root: root.clone(), revocations_through: 3 });
+        assert!(verify_log(
+            &[f.log.clone(), vec![by_device]].concat(),
+            &VerifyOptions::default()
+        )
+        .is_err());
+        let mut ev = next_event(
+            &st,
+            EventBody::PolicyRoot {
+                root: root.clone(),
+                revocations_through: 3,
+            },
+        );
         ev.sign(&f.root).unwrap();
         f.log.push(ev);
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         assert_eq!(st.policy.as_ref().unwrap().root, root);
-        let mut back = next_event(&st, EventBody::PolicyRoot { root, revocations_through: 2 });
+        let mut back = next_event(
+            &st,
+            EventBody::PolicyRoot {
+                root,
+                revocations_through: 2,
+            },
+        );
         back.sign(&f.root).unwrap();
         f.log.push(back);
         assert!(verify_log(&f.log, &VerifyOptions::default()).is_err());

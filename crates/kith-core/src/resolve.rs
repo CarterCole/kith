@@ -56,7 +56,10 @@ pub struct Candidate {
 /// to ask for. `mailto:` becomes `acct:` (RFC 7565).
 fn host_and_resource(alias: &str) -> Result<(String, String)> {
     let unsupported = || Error::Unsupported(format!("no back-link method for alias {alias}"));
-    if let Some(addr) = alias.strip_prefix("mailto:").or_else(|| alias.strip_prefix("acct:")) {
+    if let Some(addr) = alias
+        .strip_prefix("mailto:")
+        .or_else(|| alias.strip_prefix("acct:"))
+    {
         let (_, host) = addr.rsplit_once('@').ok_or_else(unsupported)?;
         if host.is_empty() || addr.starts_with('@') {
             return Err(unsupported());
@@ -71,7 +74,12 @@ fn host_and_resource(alias: &str) -> Result<(String, String)> {
         return Ok((host.to_ascii_lowercase(), alias.to_string()));
     }
     if let Some(rest) = alias.strip_prefix("did:web:") {
-        let host = rest.split(':').next().unwrap_or_default().replace("%3A", ":").replace("%3a", ":");
+        let host = rest
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .replace("%3A", ":")
+            .replace("%3a", ":");
         if host.is_empty() {
             return Err(unsupported());
         }
@@ -82,7 +90,11 @@ fn host_and_resource(alias: &str) -> Result<(String, String)> {
 
 /// `http://` for loopback hosts (tests), `https://` for everything else.
 pub fn origin(host: &str) -> String {
-    let bare = host.rsplit_once(':').filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit())).map(|(h, _)| h).unwrap_or(host);
+    let bare = host
+        .rsplit_once(':')
+        .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .map(|(h, _)| h)
+        .unwrap_or(host);
     let local = matches!(bare, "localhost" | "127.0.0.1" | "[::1]") || bare.ends_with(".localhost");
     format!("{}://{host}", if local { "http" } else { "https" })
 }
@@ -108,15 +120,30 @@ pub fn did_web_url(did: &str) -> Option<String> {
         return None;
     }
     let path: Vec<&str> = parts.collect();
-    Some(if path.is_empty() { format!("{}/.well-known/did.json", origin(&host)) } else { format!("{}/{}/did.json", origin(&host), path.join("/")) })
+    Some(if path.is_empty() {
+        format!("{}/.well-known/did.json", origin(&host))
+    } else {
+        format!("{}/{}/did.json", origin(&host), path.join("/"))
+    })
 }
 
 /// What to fetch for `alias`, in the order to try. Errors for alias kinds that have
 /// no resolvable back-link yet (wallets, ENS, `at://`, OpenID Connect accounts).
 pub fn lookups(alias: &str) -> Result<Vec<Lookup>> {
     let (host, resource) = host_and_resource(alias)?;
-    let webfinger = Lookup::WebFinger { url: format!("{}/.well-known/webfinger?resource={}", origin(&host), percent_encode(&resource)) };
-    let dns = Lookup::Dns { name: format!("{DNS_LABEL}.{}", host.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host)) };
+    let webfinger = Lookup::WebFinger {
+        url: format!(
+            "{}/.well-known/webfinger?resource={}",
+            origin(&host),
+            percent_encode(&resource)
+        ),
+    };
+    let dns = Lookup::Dns {
+        name: format!(
+            "{DNS_LABEL}.{}",
+            host.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host)
+        ),
+    };
     let mut out = Vec::new();
     if let Some(rest) = alias.strip_prefix("https://") {
         // A bare origin is the host's own alias: DNS can vouch for it.
@@ -149,7 +176,11 @@ pub fn from_jrd(jrd: &Value) -> Vec<Candidate> {
         .filter(|l| l["rel"] == REL_ROOT)
         .filter_map(|l| {
             let did = l["href"].as_str()?;
-            did.starts_with("did:kith:").then(|| Candidate { did: did.to_string(), hub: l["properties"][PROP_HUB].as_str().map(String::from), via: "webfinger" })
+            did.starts_with("did:kith:").then(|| Candidate {
+                did: did.to_string(),
+                hub: l["properties"][PROP_HUB].as_str().map(String::from),
+                via: "webfinger",
+            })
         })
         .collect()
 }
@@ -169,7 +200,11 @@ pub fn from_txt<S: AsRef<str>>(records: &[S]) -> Vec<Candidate> {
                     _ => {}
                 }
             }
-            did.map(|did| Candidate { did, hub, via: "dns" })
+            did.map(|did| Candidate {
+                did,
+                hub,
+                via: "dns",
+            })
         })
         .collect()
 }
@@ -182,7 +217,11 @@ pub fn from_did_document(doc: &Value) -> Vec<Candidate> {
         .flatten()
         .filter_map(|v| v.as_str())
         .filter(|s| s.starts_with("did:kith:"))
-        .map(|did| Candidate { did: did.to_string(), hub: None, via: "did:web" })
+        .map(|did| Candidate {
+            did: did.to_string(),
+            hub: None,
+            via: "did:web",
+        })
         .collect()
 }
 
@@ -211,8 +250,15 @@ pub fn unique(alias: &str, mut passed: Vec<Candidate>) -> Result<Option<Candidat
     match passed.len() {
         0 | 1 => Ok(passed.pop()),
         _ => {
-            let roots: Vec<String> = passed.iter().map(|c| format!("{} (via {})", c.did, c.via)).collect();
-            Err(Error::Ambiguous(format!("{alias} is linked back by {} roots: {}", passed.len(), roots.join(", "))))
+            let roots: Vec<String> = passed
+                .iter()
+                .map(|c| format!("{} (via {})", c.did, c.via))
+                .collect();
+            Err(Error::Ambiguous(format!(
+                "{alias} is linked back by {} roots: {}",
+                passed.len(),
+                roots.join(", ")
+            )))
         }
     }
 }
@@ -250,7 +296,13 @@ mod tests {
     #[test]
     fn mailto_is_webfinger_as_acct() {
         let l = lookups("mailto:ada@acme.test").unwrap();
-        assert_eq!(l, vec![Lookup::WebFinger { url: "https://acme.test/.well-known/webfinger?resource=acct%3Aada%40acme.test".into() }]);
+        assert_eq!(
+            l,
+            vec![Lookup::WebFinger {
+                url: "https://acme.test/.well-known/webfinger?resource=acct%3Aada%40acme.test"
+                    .into()
+            }]
+        );
         assert_eq!(lookups("acct:ada@acme.test").unwrap(), l);
     }
 
@@ -267,19 +319,39 @@ mod tests {
         // A URL with a path is an account at that host, which DNS cannot vouch for.
         let l = lookups("https://github.com/ada").unwrap();
         assert_eq!(l.len(), 1);
-        assert!(matches!(&l[0], Lookup::WebFinger { url } if url.starts_with("https://github.com/.well-known/webfinger?resource=")));
+        assert!(
+            matches!(&l[0], Lookup::WebFinger { url } if url.starts_with("https://github.com/.well-known/webfinger?resource="))
+        );
     }
 
     #[test]
     fn did_web_document_then_dns_then_webfinger() {
         let l = lookups("did:web:acme.test").unwrap();
-        assert_eq!(l[0], Lookup::DidWeb { url: "https://acme.test/.well-known/did.json".into() });
-        assert_eq!(l[1], Lookup::Dns { name: "_kith.acme.test".into() });
+        assert_eq!(
+            l[0],
+            Lookup::DidWeb {
+                url: "https://acme.test/.well-known/did.json".into()
+            }
+        );
+        assert_eq!(
+            l[1],
+            Lookup::Dns {
+                name: "_kith.acme.test".into()
+            }
+        );
         assert!(matches!(&l[2], Lookup::WebFinger { .. }));
         let l = lookups("did:web:acme.test:users:ada").unwrap();
-        assert_eq!(l[0], Lookup::DidWeb { url: "https://acme.test/users/ada/did.json".into() });
+        assert_eq!(
+            l[0],
+            Lookup::DidWeb {
+                url: "https://acme.test/users/ada/did.json".into()
+            }
+        );
         assert!(!l.iter().any(|x| matches!(x, Lookup::Dns { .. })));
-        assert_eq!(did_web_url("did:web:localhost%3A8080:u"), Some("http://localhost:8080/u/did.json".into()));
+        assert_eq!(
+            did_web_url("did:web:localhost%3A8080:u"),
+            Some("http://localhost:8080/u/did.json".into())
+        );
     }
 
     #[test]
@@ -288,13 +360,23 @@ mod tests {
         assert_eq!(l, vec![Lookup::WebFinger { url: "http://localhost:7789/.well-known/webfinger?resource=acct%3Aada%40localhost%3A7789".into() }]);
         assert_eq!(origin("acme.test:8443"), "https://acme.test:8443");
         assert_eq!(origin("app.localhost"), "http://app.localhost");
-        let Lookup::Dns { name } = &lookups("https://localhost:7789").unwrap()[0] else { panic!() };
+        let Lookup::Dns { name } = &lookups("https://localhost:7789").unwrap()[0] else {
+            panic!()
+        };
         assert_eq!(name, "_kith.localhost");
     }
 
     #[test]
     fn unsupported_aliases_are_errors() {
-        for a in ["eip155:1:0xabc", "at://ada.bsky.social", "https://oauth.telegram.org#424242", "mailto:nobody", "https://", "did:web:", "ada"] {
+        for a in [
+            "eip155:1:0xabc",
+            "at://ada.bsky.social",
+            "https://oauth.telegram.org#424242",
+            "mailto:nobody",
+            "https://",
+            "did:web:",
+            "ada",
+        ] {
             assert!(lookups(a).is_err() || a.starts_with("https://oauth"), "{a}");
         }
         assert!(lookups("eip155:1:0xabc").is_err());
@@ -313,36 +395,84 @@ mod tests {
         });
         let c = from_jrd(&jrd);
         assert_eq!(c.len(), 2);
-        assert_eq!(c[0], Candidate { did: "did:kith:aaa".into(), hub: Some("https://hub.example".into()), via: "webfinger" });
+        assert_eq!(
+            c[0],
+            Candidate {
+                did: "did:kith:aaa".into(),
+                hub: Some("https://hub.example".into()),
+                via: "webfinger"
+            }
+        );
         assert_eq!(c[1].hub, None);
         assert!(from_jrd(&json!({})).is_empty());
     }
 
     #[test]
     fn txt_records() {
-        let c = from_txt(&["v=spf1 -all", "did=did:kith:aaa; hub=https://hub.example", "did=did:plc:x", "did=did:kith:bbb"]);
+        let c = from_txt(&[
+            "v=spf1 -all",
+            "did=did:kith:aaa; hub=https://hub.example",
+            "did=did:plc:x",
+            "did=did:kith:bbb",
+        ]);
         assert_eq!(c.len(), 2);
-        assert_eq!(c[0], Candidate { did: "did:kith:aaa".into(), hub: Some("https://hub.example".into()), via: "dns" });
+        assert_eq!(
+            c[0],
+            Candidate {
+                did: "did:kith:aaa".into(),
+                hub: Some("https://hub.example".into()),
+                via: "dns"
+            }
+        );
         assert_eq!(c[1].did, "did:kith:bbb");
     }
 
     #[test]
     fn did_document_also_known_as() {
-        let c = from_did_document(&json!({"id": "did:web:acme.test", "alsoKnownAs": ["https://acme.test", "did:kith:aaa"]}));
-        assert_eq!(c, vec![Candidate { did: "did:kith:aaa".into(), hub: None, via: "did:web" }]);
+        let c = from_did_document(
+            &json!({"id": "did:web:acme.test", "alsoKnownAs": ["https://acme.test", "did:kith:aaa"]}),
+        );
+        assert_eq!(
+            c,
+            vec![Candidate {
+                did: "did:kith:aaa".into(),
+                hub: None,
+                via: "did:web"
+            }]
+        );
     }
 
     fn cand(did: &str, hub: Option<&str>, via: &'static str) -> Candidate {
-        Candidate { did: did.into(), hub: hub.map(String::from), via }
+        Candidate {
+            did: did.into(),
+            hub: hub.map(String::from),
+            via,
+        }
     }
 
     #[test]
     fn merge_keeps_one_entry_per_root() {
-        let m = merge([cand("did:kith:a", None, "dns"), cand("did:kith:b", None, "webfinger"), cand("did:kith:a", Some("https://hub.example"), "webfinger")]);
-        assert_eq!(m, vec![cand("did:kith:a", Some("https://hub.example"), "dns"), cand("did:kith:b", None, "webfinger")]);
+        let m = merge([
+            cand("did:kith:a", None, "dns"),
+            cand("did:kith:b", None, "webfinger"),
+            cand("did:kith:a", Some("https://hub.example"), "webfinger"),
+        ]);
+        assert_eq!(
+            m,
+            vec![
+                cand("did:kith:a", Some("https://hub.example"), "dns"),
+                cand("did:kith:b", None, "webfinger")
+            ]
+        );
         // The first hub wins; a later one does not replace it.
-        let m = merge([cand("did:kith:a", Some("https://one.example"), "dns"), cand("did:kith:a", Some("https://two.example"), "webfinger")]);
-        assert_eq!(m, vec![cand("did:kith:a", Some("https://one.example"), "dns")]);
+        let m = merge([
+            cand("did:kith:a", Some("https://one.example"), "dns"),
+            cand("did:kith:a", Some("https://two.example"), "webfinger"),
+        ]);
+        assert_eq!(
+            m,
+            vec![cand("did:kith:a", Some("https://one.example"), "dns")]
+        );
         assert!(merge(Vec::new()).is_empty());
     }
 
@@ -351,11 +481,19 @@ mod tests {
         let a = cand("did:kith:a", None, "dns");
         let b = cand("did:kith:b", None, "webfinger");
         assert_eq!(unique("mailto:ada@acme.test", vec![]).unwrap(), None);
-        assert_eq!(unique("mailto:ada@acme.test", vec![a.clone()]).unwrap(), Some(a.clone()));
+        assert_eq!(
+            unique("mailto:ada@acme.test", vec![a.clone()]).unwrap(),
+            Some(a.clone())
+        );
         let err = unique("mailto:ada@acme.test", vec![a, b]).unwrap_err();
         assert!(matches!(err, Error::Ambiguous(_)));
         let msg = err.to_string();
-        assert!(msg.contains("did:kith:a (via dns)") && msg.contains("did:kith:b (via webfinger)") && msg.contains("2 roots"), "{msg}");
+        assert!(
+            msg.contains("did:kith:a (via dns)")
+                && msg.contains("did:kith:b (via webfinger)")
+                && msg.contains("2 roots"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -363,10 +501,20 @@ mod tests {
         let mut f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         assert!(!links_back(&st, "mailto:ada@acme.test"));
-        let mut ev = next_event(&st, EventBody::AliasLink { alias: "mailto:ada@acme.test".into() });
+        let mut ev = next_event(
+            &st,
+            EventBody::AliasLink {
+                alias: "mailto:ada@acme.test".into(),
+            },
+        );
         ev.sign(&f.root).unwrap();
         f.log.push(ev);
-        let mut ev = next_event(&verify_log(&f.log, &VerifyOptions::default()).unwrap(), EventBody::AliasLink { alias: "https://acme.test".into() });
+        let mut ev = next_event(
+            &verify_log(&f.log, &VerifyOptions::default()).unwrap(),
+            EventBody::AliasLink {
+                alias: "https://acme.test".into(),
+            },
+        );
         ev.sign(&f.root).unwrap();
         f.log.push(ev);
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
@@ -375,7 +523,12 @@ mod tests {
         assert!(links_back(&st, "https://acme.test/"));
         assert!(!links_back(&st, "https://acme.test/ada"));
         assert!(!links_back(&st, "mailto:bob@acme.test"));
-        let mut ev = next_event(&st, EventBody::AliasUnlink { alias: "mailto:ada@acme.test".into() });
+        let mut ev = next_event(
+            &st,
+            EventBody::AliasUnlink {
+                alias: "mailto:ada@acme.test".into(),
+            },
+        );
         ev.sign(&f.root).unwrap();
         f.log.push(ev);
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();

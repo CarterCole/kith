@@ -69,7 +69,9 @@ pub struct Heartbeat {
 
 fn digest_of<T: Serialize>(v: &T) -> Result<String> {
     let mut v = serde_json::to_value(v)?;
-    v.as_object_mut().ok_or_else(|| Error::Encoding("expected an object".into()))?.remove("sigs");
+    v.as_object_mut()
+        .ok_or_else(|| Error::Encoding("expected an object".into()))?
+        .remove("sigs");
     Ok(b64u(sha256(crate::canon::to_canonical(&v)?)))
 }
 
@@ -98,7 +100,13 @@ impl Entry {
         digest_of(self)
     }
     pub fn signing_message(&self) -> Result<Vec<u8>> {
-        Ok(format!("kith revocation v1\norg: {}\nseq: {}\ndigest: {}", self.org, self.seq, self.digest()?).into_bytes())
+        Ok(format!(
+            "kith revocation v1\norg: {}\nseq: {}\ndigest: {}",
+            self.org,
+            self.seq,
+            self.digest()?
+        )
+        .into_bytes())
     }
     pub fn sign(&mut self, s: &LocalSigner) -> Result<()> {
         let sig = s.sign(&self.signing_message()?)?;
@@ -107,11 +115,21 @@ impl Entry {
     }
     /// Check the signatures against the org's key state.
     pub fn verify(&self, org: &KeyState) -> Result<()> {
-        if self.v != 1 || self.org != org.did || self.seq == 0 || (self.seq == 1) != self.prev.is_none() {
-            return Err(Error::Token(format!("malformed revocation entry {}", self.seq)));
+        if self.v != 1
+            || self.org != org.did
+            || self.seq == 0
+            || (self.seq == 1) != self.prev.is_none()
+        {
+            return Err(Error::Token(format!(
+                "malformed revocation entry {}",
+                self.seq
+            )));
         }
         if !org.may_revoke(&signed_by(&self.sigs, &self.signing_message()?)?) {
-            return Err(Error::Signature(format!("revocation {} is not signed by a revoker of {}", self.seq, org.did)));
+            return Err(Error::Signature(format!(
+                "revocation {} is not signed by a revoker of {}",
+                self.seq, org.did
+            )));
         }
         Ok(())
     }
@@ -119,13 +137,27 @@ impl Entry {
 
 impl Heartbeat {
     pub fn new(org: &str, latest: Option<&Entry>, beacon: Option<BeaconValue>) -> Result<Self> {
-        Ok(Heartbeat { v: 1, org: org.into(), seq: latest.map_or(0, |e| e.seq), head: latest.map(Entry::digest).transpose()?, ts: now(), beacon, sigs: vec![] })
+        Ok(Heartbeat {
+            v: 1,
+            org: org.into(),
+            seq: latest.map_or(0, |e| e.seq),
+            head: latest.map(Entry::digest).transpose()?,
+            ts: now(),
+            beacon,
+            sigs: vec![],
+        })
     }
     pub fn digest(&self) -> Result<String> {
         digest_of(self)
     }
     pub fn signing_message(&self) -> Result<Vec<u8>> {
-        Ok(format!("kith revocation heartbeat v1\norg: {}\nseq: {}\ndigest: {}", self.org, self.seq, self.digest()?).into_bytes())
+        Ok(format!(
+            "kith revocation heartbeat v1\norg: {}\nseq: {}\ndigest: {}",
+            self.org,
+            self.seq,
+            self.digest()?
+        )
+        .into_bytes())
     }
     pub fn sign(&mut self, s: &LocalSigner) -> Result<()> {
         let sig = s.sign(&self.signing_message()?)?;
@@ -137,7 +169,10 @@ impl Heartbeat {
             return Err(Error::Token("malformed heartbeat".into()));
         }
         if !org.may_revoke(&signed_by(&self.sigs, &self.signing_message()?)?) {
-            return Err(Error::Signature(format!("heartbeat is not signed by a revoker of {}", org.did)));
+            return Err(Error::Signature(format!(
+                "heartbeat is not signed by a revoker of {}",
+                org.did
+            )));
         }
         Ok(())
     }
@@ -160,7 +195,11 @@ pub struct FreshnessPolicy {
 
 impl Default for FreshnessPolicy {
     fn default() -> Self {
-        FreshnessPolicy { fresh_for: 120, max_staleness: 900, require_beacon: true }
+        FreshnessPolicy {
+            fresh_for: 120,
+            max_staleness: 900,
+            require_beacon: true,
+        }
     }
 }
 
@@ -216,7 +255,17 @@ pub struct Follower {
 
 impl Follower {
     pub fn new(org: impl Into<String>, base: u64, policy: FreshnessPolicy) -> Self {
-        Follower { org: org.into(), policy, base, entries: BTreeMap::new(), digests: BTreeMap::new(), proven: None, head_seq: base, clock: 0, forked: false }
+        Follower {
+            org: org.into(),
+            policy,
+            base,
+            entries: BTreeMap::new(),
+            digests: BTreeMap::new(),
+            proven: None,
+            head_seq: base,
+            clock: 0,
+            forked: false,
+        }
     }
 
     /// A new policy root arrived: drop the entries it already reflects.
@@ -256,7 +305,10 @@ impl Follower {
         if let Some(known) = self.digests.get(&e.seq) {
             if *known != d {
                 self.forked = true;
-                return Err(Error::Token(format!("duplicity: two revocation entries at seq {}", e.seq)));
+                return Err(Error::Token(format!(
+                    "duplicity: two revocation entries at seq {}",
+                    e.seq
+                )));
             }
             return Ok(());
         }
@@ -264,13 +316,21 @@ impl Follower {
         if let (Some(prev), Some(want)) = (e.prev.as_ref(), self.digests.get(&(e.seq - 1))) {
             if prev != want {
                 self.forked = true;
-                return Err(Error::Token(format!("revocation {} does not chain to {}", e.seq, e.seq - 1)));
+                return Err(Error::Token(format!(
+                    "revocation {} does not chain to {}",
+                    e.seq,
+                    e.seq - 1
+                )));
             }
         }
         if let Some(next) = self.entries.get(&(e.seq + 1)) {
             if next.prev.as_deref() != Some(d.as_str()) {
                 self.forked = true;
-                return Err(Error::Token(format!("revocation {} does not chain to {}", e.seq + 1, e.seq)));
+                return Err(Error::Token(format!(
+                    "revocation {} does not chain to {}",
+                    e.seq + 1,
+                    e.seq
+                )));
             }
         }
         self.digests.insert(e.seq, d);
@@ -283,7 +343,13 @@ impl Follower {
 
     /// Add a heartbeat. Its proven time is the beacon's publication time (or its
     /// own timestamp, if the policy allows unbeaconed heartbeats).
-    pub fn apply_heartbeat(&mut self, org: &KeyState, h: &Heartbeat, beacons: &dyn BeaconVerifier, now: i64) -> Result<()> {
+    pub fn apply_heartbeat(
+        &mut self,
+        org: &KeyState,
+        h: &Heartbeat,
+        beacons: &dyn BeaconVerifier,
+        now: i64,
+    ) -> Result<()> {
         if org.did != self.org {
             return Err(Error::Token("heartbeat for another org".into()));
         }
@@ -291,7 +357,10 @@ impl Follower {
         if let (Some(head), Some(known)) = (&h.head, self.digests.get(&h.seq)) {
             if head != known {
                 self.forked = true;
-                return Err(Error::Token(format!("duplicity: heartbeat names another entry {}", h.seq)));
+                return Err(Error::Token(format!(
+                    "duplicity: heartbeat names another entry {}",
+                    h.seq
+                )));
             }
         }
         let proven = match &h.beacon {
@@ -326,7 +395,12 @@ impl Follower {
                 _ => Level::Stale,
             }
         };
-        Freshness { level, age, seq, head_seq: self.head_seq }
+        Freshness {
+            level,
+            age,
+            seq,
+            head_seq: self.head_seq,
+        }
     }
 
     fn revocations(&self) -> impl Iterator<Item = &Revocation> {
@@ -334,15 +408,19 @@ impl Follower {
     }
 
     pub fn is_principal_revoked(&self, id: &str) -> bool {
-        self.revocations().any(|r| matches!(r, Revocation::Principal { id: x } if x == id))
+        self.revocations()
+            .any(|r| matches!(r, Revocation::Principal { id: x } if x == id))
     }
 
     pub fn is_token_revoked(&self, jti: &str) -> bool {
-        self.revocations().any(|r| matches!(r, Revocation::Token { jti: x } if x == jti))
+        self.revocations()
+            .any(|r| matches!(r, Revocation::Token { jti: x } if x == jti))
     }
 
     pub fn is_device_revoked(&self, did: &str, device: &str) -> bool {
-        self.revocations().any(|r| matches!(r, Revocation::Device { did: d, device: x } if d == did && x == device))
+        self.revocations().any(
+            |r| matches!(r, Revocation::Device { did: d, device: x } if d == did && x == device),
+        )
     }
 
     /// Sets a principal has been removed from.
@@ -384,12 +462,32 @@ pub struct Request<'a> {
 ///    (so anything that came through them goes too), whatever the token claimed;
 /// 4. revoked permit policies are dropped;
 /// 5. policies see `context.kith = {sync_age, degraded, revocation_seq}`.
-pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64) -> Result<AuthzDecision> {
-    let Request { principal, jti, action, resource, context } = *req;
-    let deny = |why: &str| Ok(AuthzDecision { allowed: false, reasons: vec![why.to_string()], errors: vec![] });
+pub fn authorize(
+    slice: &Slice,
+    follower: &mut Follower,
+    req: &Request,
+    now: i64,
+) -> Result<AuthzDecision> {
+    let Request {
+        principal,
+        jti,
+        action,
+        resource,
+        context,
+    } = *req;
+    let deny = |why: &str| {
+        Ok(AuthzDecision {
+            allowed: false,
+            reasons: vec![why.to_string()],
+            errors: vec![],
+        })
+    };
     let f = follower.freshness(now);
     if !f.allows_decisions() {
-        return deny(&format!("freshness:{}", serde_json::to_value(f.level)?.as_str().unwrap_or("stale")));
+        return deny(&format!(
+            "freshness:{}",
+            serde_json::to_value(f.level)?.as_str().unwrap_or("stale")
+        ));
     }
     if follower.is_principal_revoked(&principal.id) {
         return deny("revoked:principal");
@@ -399,8 +497,17 @@ pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64
     }
     let engine = slice.engine_without(&follower.revoked_policies())?;
     let attrs = engine.attributes(&principal.id, &principal.attrs);
-    let m = engine.memberships_excluding(&principal.id, &attrs, &follower.excluded_sets(&principal.id))?;
-    let p = Principal { attrs, groups: m.groups, roles: m.roles, ..principal.clone() };
+    let m = engine.memberships_excluding(
+        &principal.id,
+        &attrs,
+        &follower.excluded_sets(&principal.id),
+    )?;
+    let p = Principal {
+        attrs,
+        groups: m.groups,
+        roles: m.roles,
+        ..principal.clone()
+    };
     let mut ctx = match context {
         Value::Object(o) => o.clone(),
         _ => Map::new(),
@@ -424,13 +531,19 @@ mod tests {
     impl BeaconVerifier for ClockBeacon {
         fn verify(&self, v: &BeaconValue) -> Result<i64> {
             match v {
-                BeaconValue::Drand { round, signature, .. } if signature == "ok" => Ok(*round as i64),
+                BeaconValue::Drand {
+                    round, signature, ..
+                } if signature == "ok" => Ok(*round as i64),
                 _ => Err(Error::Signature("bad beacon".into())),
             }
         }
     }
     fn beacon(t: i64) -> Option<BeaconValue> {
-        Some(BeaconValue::Drand { chain: "test".into(), round: t as u64, signature: "ok".into() })
+        Some(BeaconValue::Drand {
+            chain: "test".into(),
+            round: t as u64,
+            signature: "ok".into(),
+        })
     }
 
     struct Org {
@@ -442,13 +555,26 @@ mod tests {
     fn org() -> Org {
         let admin = LocalSigner::generate(KeyType::Ed25519);
         let revoker = LocalSigner::generate(KeyType::Ed25519);
-        let dev = Device { id: "hub".into(), key: revoker.id.clone(), name: "hub revoker".into(), kind: DeviceKind::Software, aal: 1, caps: vec!["revoke".into()], rp_id: None, xkey: None };
+        let dev = Device {
+            id: "hub".into(),
+            key: revoker.id.clone(),
+            name: "hub revoker".into(),
+            kind: DeviceKind::Software,
+            aal: 1,
+            caps: vec!["revoke".into()],
+            rp_id: None,
+            xkey: None,
+        };
         let next = SignerPolicy::single(LocalSigner::generate(KeyType::Ed25519).id);
         let mut inc = new_inception(SignerPolicy::single(&admin.id), &next, vec![dev]);
         inc.sign(&admin).unwrap();
         inc.sign(&revoker).unwrap();
         let state = verify_log(&[inc], &VerifyOptions::default()).unwrap();
-        Org { admin, revoker, state }
+        Org {
+            admin,
+            revoker,
+            state,
+        }
     }
 
     fn entry(o: &Org, prev: Option<&Entry>, r: Vec<Revocation>) -> Entry {
@@ -466,9 +592,18 @@ mod tests {
     #[test]
     fn freshness_degrades_then_fails_closed() {
         let o = org();
-        let mut f = Follower::new(&o.state.did, 0, FreshnessPolicy { fresh_for: 60, max_staleness: 600, require_beacon: true });
+        let mut f = Follower::new(
+            &o.state.did,
+            0,
+            FreshnessPolicy {
+                fresh_for: 60,
+                max_staleness: 600,
+                require_beacon: true,
+            },
+        );
         assert_eq!(f.freshness(1000).level, Level::Stale, "no heartbeat yet");
-        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000).unwrap();
+        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000)
+            .unwrap();
         assert_eq!(f.freshness(1030).level, Level::Fresh);
         assert_eq!(f.freshness(1300).level, Level::Degraded);
         assert_eq!(f.freshness(1700).level, Level::Stale);
@@ -481,12 +616,18 @@ mod tests {
         f.apply_heartbeat(&o.state, &h, &ClockBeacon, 1700).unwrap();
         assert_eq!(f.freshness(1700).level, Level::Stale);
         // A beacon claiming the future is rejected.
-        assert!(f.apply_heartbeat(&o.state, &heartbeat(&o, None, 99_999), &ClockBeacon, 1700).is_err());
+        assert!(f
+            .apply_heartbeat(&o.state, &heartbeat(&o, None, 99_999), &ClockBeacon, 1700)
+            .is_err());
         // Someone else's key can't sign heartbeats.
         let mut forged = heartbeat(&o, None, 1700);
         forged.sigs.clear();
-        forged.sign(&LocalSigner::generate(KeyType::Ed25519)).unwrap();
-        assert!(f.apply_heartbeat(&o.state, &forged, &ClockBeacon, 1700).is_err());
+        forged
+            .sign(&LocalSigner::generate(KeyType::Ed25519))
+            .unwrap();
+        assert!(f
+            .apply_heartbeat(&o.state, &forged, &ClockBeacon, 1700)
+            .is_err());
     }
 
     #[test]
@@ -497,10 +638,19 @@ mod tests {
         let e3 = entry(&o, Some(&e2), vec![Revocation::Token { jti: "c".into() }]);
         let mut f = Follower::new(&o.state.did, 0, FreshnessPolicy::default());
         f.apply_entry(&o.state, &e1).unwrap();
-        f.apply_heartbeat(&o.state, &heartbeat(&o, Some(&e3), 100), &ClockBeacon, 100).unwrap();
-        assert_eq!(f.freshness(100).level, Level::Behind, "a heartbeat named entry 3");
+        f.apply_heartbeat(&o.state, &heartbeat(&o, Some(&e3), 100), &ClockBeacon, 100)
+            .unwrap();
+        assert_eq!(
+            f.freshness(100).level,
+            Level::Behind,
+            "a heartbeat named entry 3"
+        );
         f.apply_entry(&o.state, &e3).unwrap();
-        assert_eq!(f.freshness(100).level, Level::Behind, "entry 2 still missing");
+        assert_eq!(
+            f.freshness(100).level,
+            Level::Behind,
+            "entry 2 still missing"
+        );
         f.apply_entry(&o.state, &e2).unwrap();
         assert_eq!(f.freshness(100).level, Level::Fresh);
         assert!(f.is_token_revoked("b"));
@@ -513,88 +663,289 @@ mod tests {
     #[test]
     fn compaction_drops_entries_the_root_reflects() {
         let o = org();
-        let e1 = entry(&o, None, vec![Revocation::Principal { id: "did:kith:bob".into() }]);
-        let e2 = entry(&o, Some(&e1), vec![Revocation::Principal { id: "did:kith:eve".into() }]);
+        let e1 = entry(
+            &o,
+            None,
+            vec![Revocation::Principal {
+                id: "did:kith:bob".into(),
+            }],
+        );
+        let e2 = entry(
+            &o,
+            Some(&e1),
+            vec![Revocation::Principal {
+                id: "did:kith:eve".into(),
+            }],
+        );
         let mut f = Follower::new(&o.state.did, 0, FreshnessPolicy::default());
         f.apply_entry(&o.state, &e1).unwrap();
         f.apply_entry(&o.state, &e2).unwrap();
         f.set_base(1);
-        assert!(!f.is_principal_revoked("did:kith:bob"), "now reflected in the policy root itself");
+        assert!(
+            !f.is_principal_revoked("did:kith:bob"),
+            "now reflected in the policy root itself"
+        );
         assert!(f.is_principal_revoked("did:kith:eve"));
         assert_eq!(f.seq(), 2);
     }
 
     fn setup() -> (Org, Slice, Follower) {
-        let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
+        let v: Value =
+            serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
         let mut bundle: Bundle = serde_json::from_value(v["bundle"].clone()).unwrap();
         bundle.policies.push_str(
             "\n@id(\"pay-needs-fresh\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) unless { context has kith && context.kith.sync_age < 60 };",
         );
         let store = MemStore::new();
         let root = build(&store, &bundle).unwrap();
-        let q = Query::Actions { actions: vec!["Query.invoices".into(), "Mutation.payInvoice".into()], principals: vec!["did:kith:ada".into()] };
+        let q = Query::Actions {
+            actions: vec!["Query.invoices".into(), "Mutation.payInvoice".into()],
+            principals: vec!["did:kith:ada".into()],
+        };
         let slice = load(&store, &root, &q).unwrap();
         let o = org();
-        let f = Follower::new(&o.state.did, 0, FreshnessPolicy { fresh_for: 30, max_staleness: 3600, require_beacon: true });
+        let f = Follower::new(
+            &o.state.did,
+            0,
+            FreshnessPolicy {
+                fresh_for: 30,
+                max_staleness: 3600,
+                require_beacon: true,
+            },
+        );
         (o, slice, f)
     }
 
     fn ada() -> Principal {
         let mut attrs = Map::new();
         attrs.insert("aal".into(), json!(2));
-        Principal { id: "did:kith:ada".into(), attrs, groups: vec!["finance".into()], roles: vec!["billing-reader".into()], actor: None, caps: None }
+        Principal {
+            id: "did:kith:ada".into(),
+            attrs,
+            groups: vec!["finance".into()],
+            roles: vec!["billing-reader".into()],
+            actor: None,
+            caps: None,
+        }
     }
 
     #[test]
     fn member_revocation_cascades_and_ignores_token_claims() {
         let (o, slice, mut f) = setup();
-        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000).unwrap();
+        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000)
+            .unwrap();
         let op = Resource::new("Operation", "Query.invoices");
-        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &op, context: &json!({}) }, 1000).unwrap().allowed);
+        assert!(
+            authorize(
+                &slice,
+                &mut f,
+                &Request {
+                    principal: &ada(),
+                    jti: None,
+                    action: "Query.invoices",
+                    resource: &op,
+                    context: &json!({})
+                },
+                1000
+            )
+            .unwrap()
+            .allowed
+        );
 
         // Removing ada from finance also removes billing-reader (via group:finance),
         // even though her token still says billing-reader.
-        let e1 = entry(&o, None, vec![Revocation::Member { id: "did:kith:ada".into(), set: "Group::finance".into() }]);
+        let e1 = entry(
+            &o,
+            None,
+            vec![Revocation::Member {
+                id: "did:kith:ada".into(),
+                set: "Group::finance".into(),
+            }],
+        );
         f.apply_entry(&o.state, &e1).unwrap();
-        let d = authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &op, context: &json!({}) }, 1001).unwrap();
+        let d = authorize(
+            &slice,
+            &mut f,
+            &Request {
+                principal: &ada(),
+                jti: None,
+                action: "Query.invoices",
+                resource: &op,
+                context: &json!({}),
+            },
+            1001,
+        )
+        .unwrap();
         assert!(!d.allowed, "{d:?}");
     }
 
     #[test]
     fn policy_revocation_removes_permits_only() {
         let (o, slice, mut f) = setup();
-        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000).unwrap();
-        let e1 = entry(&o, None, vec![Revocation::Policy { id: "read-invoices".into() }, Revocation::Policy { id: "no-delegated-pay".into() }]);
+        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000)
+            .unwrap();
+        let e1 = entry(
+            &o,
+            None,
+            vec![
+                Revocation::Policy {
+                    id: "read-invoices".into(),
+                },
+                Revocation::Policy {
+                    id: "no-delegated-pay".into(),
+                },
+            ],
+        );
         f.apply_entry(&o.state, &e1).unwrap();
         let op = Resource::new("Operation", "Query.invoices");
-        assert!(!authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &op, context: &json!({}) }, 1000).unwrap().allowed);
+        assert!(
+            !authorize(
+                &slice,
+                &mut f,
+                &Request {
+                    principal: &ada(),
+                    jti: None,
+                    action: "Query.invoices",
+                    resource: &op,
+                    context: &json!({})
+                },
+                1000
+            )
+            .unwrap()
+            .allowed
+        );
         // The forbid on delegated payments survives its "revocation".
         let mut delegated = ada();
         delegated.actor = Some("did:kith:assistant".into());
         let pay = Resource::new("Operation", "Mutation.payInvoice");
-        assert!(!authorize(&slice, &mut f, &Request { principal: &delegated, jti: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1000).unwrap().allowed);
-        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1000).unwrap().allowed);
+        assert!(
+            !authorize(
+                &slice,
+                &mut f,
+                &Request {
+                    principal: &delegated,
+                    jti: None,
+                    action: "Mutation.payInvoice",
+                    resource: &pay,
+                    context: &json!({"amount": 5})
+                },
+                1000
+            )
+            .unwrap()
+            .allowed
+        );
+        assert!(
+            authorize(
+                &slice,
+                &mut f,
+                &Request {
+                    principal: &ada(),
+                    jti: None,
+                    action: "Mutation.payInvoice",
+                    resource: &pay,
+                    context: &json!({"amount": 5})
+                },
+                1000
+            )
+            .unwrap()
+            .allowed
+        );
     }
 
     #[test]
     fn policies_can_demand_fresher_views_than_the_verifier() {
         let (o, slice, mut f) = setup();
-        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000).unwrap();
+        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000)
+            .unwrap();
         let pay = Resource::new("Operation", "Mutation.payInvoice");
         let read = Resource::new("Operation", "Query.invoices");
-        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1010).unwrap().allowed);
+        assert!(
+            authorize(
+                &slice,
+                &mut f,
+                &Request {
+                    principal: &ada(),
+                    jti: None,
+                    action: "Mutation.payInvoice",
+                    resource: &pay,
+                    context: &json!({"amount": 5})
+                },
+                1010
+            )
+            .unwrap()
+            .allowed
+        );
         // 10 minutes without a heartbeat: degraded. Reads still work; the payment
         // policy wants a view younger than 60 s.
         assert_eq!(f.freshness(1600).level, Level::Degraded);
-        assert!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &read, context: &json!({}) }, 1600).unwrap().allowed);
-        assert!(!authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Mutation.payInvoice", resource: &pay, context: &json!({"amount": 5}) }, 1600).unwrap().allowed);
+        assert!(
+            authorize(
+                &slice,
+                &mut f,
+                &Request {
+                    principal: &ada(),
+                    jti: None,
+                    action: "Query.invoices",
+                    resource: &read,
+                    context: &json!({})
+                },
+                1600
+            )
+            .unwrap()
+            .allowed
+        );
+        assert!(
+            !authorize(
+                &slice,
+                &mut f,
+                &Request {
+                    principal: &ada(),
+                    jti: None,
+                    action: "Mutation.payInvoice",
+                    resource: &pay,
+                    context: &json!({"amount": 5})
+                },
+                1600
+            )
+            .unwrap()
+            .allowed
+        );
         // Past the verifier's own budget: nothing.
-        let d = authorize(&slice, &mut f, &Request { principal: &ada(), jti: None, action: "Query.invoices", resource: &read, context: &json!({}) }, 5000).unwrap();
+        let d = authorize(
+            &slice,
+            &mut f,
+            &Request {
+                principal: &ada(),
+                jti: None,
+                action: "Query.invoices",
+                resource: &read,
+                context: &json!({}),
+            },
+            5000,
+        )
+        .unwrap();
         assert_eq!(d.reasons, vec!["freshness:stale"]);
         // Principal and token revocations.
-        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 5000), &ClockBeacon, 5000).unwrap();
+        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 5000), &ClockBeacon, 5000)
+            .unwrap();
         let e1 = entry(&o, None, vec![Revocation::Token { jti: "t1".into() }]);
         f.apply_entry(&o.state, &e1).unwrap();
-        assert_eq!(authorize(&slice, &mut f, &Request { principal: &ada(), jti: Some("t1"), action: "Query.invoices", resource: &read, context: &json!({}) }, 5000).unwrap().reasons, vec!["revoked:token"]);
+        assert_eq!(
+            authorize(
+                &slice,
+                &mut f,
+                &Request {
+                    principal: &ada(),
+                    jti: Some("t1"),
+                    action: "Query.invoices",
+                    resource: &read,
+                    context: &json!({})
+                },
+                5000
+            )
+            .unwrap()
+            .reasons,
+            vec!["revoked:token"]
+        );
     }
 }

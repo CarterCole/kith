@@ -19,17 +19,27 @@ const OP_SHA256: u8 = 0x08;
 
 /// Calendars whose pending attestations may be followed when upgrading. Pending
 /// URIs come from untrusted proof files, so only these are contacted.
-pub const UPGRADE_ALLOWLIST: &[&str] = &[".calendar.opentimestamps.org", ".calendar.eternitywall.com", ".calendar.catallaxy.com"];
+pub const UPGRADE_ALLOWLIST: &[&str] = &[
+    ".calendar.opentimestamps.org",
+    ".calendar.eternitywall.com",
+    ".calendar.catallaxy.com",
+];
 
 pub fn may_follow(uri: &str) -> bool {
     uri.strip_prefix("https://").is_some_and(|host| {
         let host = host.split('/').next().unwrap_or_default();
-        UPGRADE_ALLOWLIST.iter().any(|suffix| host.ends_with(suffix) && host.len() > suffix.len())
+        UPGRADE_ALLOWLIST
+            .iter()
+            .any(|suffix| host.ends_with(suffix) && host.len() > suffix.len())
     })
 }
 
 /// Default public calendars.
-pub const CALENDARS: &[&str] = &["https://a.pool.opentimestamps.org", "https://b.pool.opentimestamps.org", "https://a.pool.eternitywall.com"];
+pub const CALENDARS: &[&str] = &[
+    "https://a.pool.opentimestamps.org",
+    "https://b.pool.opentimestamps.org",
+    "https://a.pool.eternitywall.com",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Op {
@@ -75,7 +85,11 @@ impl Op {
             Op::Append(b) => [msg, b].concat(),
             Op::Prepend(b) => [b.as_slice(), msg].concat(),
             Op::Reverse => msg.iter().rev().copied().collect(),
-            Op::Hexlify => msg.iter().map(|b| format!("{b:02x}")).collect::<String>().into_bytes(),
+            Op::Hexlify => msg
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+                .into_bytes(),
         })
     }
 }
@@ -84,11 +98,20 @@ impl Op {
 pub enum Attestation {
     // Variant order follows the tags, so sorting matches the reference serializer.
     /// `msg` is the Merkle root of the Bitcoin block at `height`.
-    Bitcoin { height: u64 },
-    Litecoin { height: u64 },
+    Bitcoin {
+        height: u64,
+    },
+    Litecoin {
+        height: u64,
+    },
     /// Submitted to a calendar; upgrade later from `{uri}/timestamp/{hex(msg)}`.
-    Pending { uri: String },
-    Unknown { tag: [u8; 8], payload: Vec<u8> },
+    Pending {
+        uri: String,
+    },
+    Unknown {
+        tag: [u8; 8],
+        payload: Vec<u8>,
+    },
 }
 
 /// A timestamp tree: attestations on this message, and operations leading on.
@@ -119,7 +142,10 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     fn byte(&mut self) -> Result<u8> {
-        let v = *self.b.get(self.i).ok_or_else(|| Error::Encoding("ots: truncated".into()))?;
+        let v = *self
+            .b
+            .get(self.i)
+            .ok_or_else(|| Error::Encoding("ots: truncated".into()))?;
         self.i += 1;
         Ok(v)
     }
@@ -188,14 +214,24 @@ fn read_attestation(r: &mut Reader) -> Result<Attestation> {
     let mut p = Reader { b: &payload, i: 0 };
     Ok(match tag {
         PENDING => {
-            let uri = String::from_utf8(p.varbytes(1000)?).map_err(|_| Error::Encoding("ots: calendar uri".into()))?;
-            if !uri.bytes().all(|c| c.is_ascii_alphanumeric() || b"-._/:".contains(&c)) {
-                return Err(Error::Encoding(format!("ots: suspicious calendar uri {uri:?}")));
+            let uri = String::from_utf8(p.varbytes(1000)?)
+                .map_err(|_| Error::Encoding("ots: calendar uri".into()))?;
+            if !uri
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-._/:".contains(&c))
+            {
+                return Err(Error::Encoding(format!(
+                    "ots: suspicious calendar uri {uri:?}"
+                )));
             }
             Attestation::Pending { uri }
         }
-        BITCOIN => Attestation::Bitcoin { height: p.varuint()? },
-        LITECOIN => Attestation::Litecoin { height: p.varuint()? },
+        BITCOIN => Attestation::Bitcoin {
+            height: p.varuint()?,
+        },
+        LITECOIN => Attestation::Litecoin {
+            height: p.varuint()?,
+        },
         _ => Attestation::Unknown { tag, payload },
     })
 }
@@ -235,7 +271,14 @@ fn write_attestation(a: &Attestation, out: &mut Vec<u8>) {
         Attestation::Bitcoin { height } | Attestation::Litecoin { height } => {
             let mut p = vec![];
             put_varuint(*height, &mut p);
-            (if matches!(a, Attestation::Bitcoin { .. }) { BITCOIN } else { LITECOIN }, p)
+            (
+                if matches!(a, Attestation::Bitcoin { .. }) {
+                    BITCOIN
+                } else {
+                    LITECOIN
+                },
+                p,
+            )
         }
         Attestation::Unknown { tag, payload } => (*tag, payload.clone()),
     };
@@ -301,7 +344,10 @@ impl Timestamp {
 
     fn walk(&self, msg: &[u8], out: &mut Vec<Reached>) -> Result<()> {
         for a in &self.attestations {
-            out.push(Reached { attestation: a.clone(), msg: msg.to_vec() });
+            out.push(Reached {
+                attestation: a.clone(),
+                msg: msg.to_vec(),
+            });
         }
         for (op, child) in &self.ops {
             let next = op.apply(msg)?;
@@ -357,7 +403,9 @@ impl DetachedFile {
             return Err(Error::Unsupported("OpenTimestamps proof version".into()));
         }
         if r.byte()? != OP_SHA256 {
-            return Err(Error::Unsupported("OpenTimestamps proofs of non-SHA-256 digests".into()));
+            return Err(Error::Unsupported(
+                "OpenTimestamps proofs of non-SHA-256 digests".into(),
+            ));
         }
         let digest: [u8; 32] = r.bytes(32)?.try_into().expect("32 bytes");
         let timestamp = read_timestamp(&mut r, 0)?;
@@ -383,13 +431,18 @@ impl DetachedFile {
     /// The earliest Bitcoin block this proof reaches, as `(height, block time)`.
     /// `header(height)` returns that block's raw 80-byte header; its Merkle root
     /// (bytes 36..68, raw order) must equal the attested message.
-    pub fn verify_bitcoin(&self, header: &dyn Fn(u64) -> Result<Vec<u8>>) -> Result<Option<(u64, i64)>> {
+    pub fn verify_bitcoin(
+        &self,
+        header: &dyn Fn(u64) -> Result<Vec<u8>>,
+    ) -> Result<Option<(u64, i64)>> {
         let mut best: Option<(u64, i64)> = None;
         for r in self.attestations()? {
             if let Attestation::Bitcoin { height } = r.attestation {
                 let h = header(height)?;
                 if h.len() != 80 || r.msg.len() != 32 || h[36..68] != r.msg[..] {
-                    return Err(Error::Signature(format!("ots: block {height} merkle root does not match")));
+                    return Err(Error::Signature(format!(
+                        "ots: block {height} merkle root does not match"
+                    )));
                 }
                 let time = i64::from(u32::from_le_bytes(h[68..72].try_into().expect("4 bytes")));
                 if best.is_none_or(|(b, _)| height < b) {
@@ -418,8 +471,19 @@ impl DetachedFile {
 /// Returns the file skeleton and the message to submit to calendars.
 pub fn stamp_request(digest: [u8; 32], nonce: [u8; 16]) -> (DetachedFile, Vec<u8>) {
     let appended = Op::Append(nonce.to_vec());
-    let msg = Op::Sha256.apply(&appended.apply(&digest).expect("append")).expect("sha256");
-    let ts = Timestamp { attestations: vec![], ops: vec![(appended, Timestamp { attestations: vec![], ops: vec![(Op::Sha256, Timestamp::default())] })] };
+    let msg = Op::Sha256
+        .apply(&appended.apply(&digest).expect("append"))
+        .expect("sha256");
+    let ts = Timestamp {
+        attestations: vec![],
+        ops: vec![(
+            appended,
+            Timestamp {
+                attestations: vec![],
+                ops: vec![(Op::Sha256, Timestamp::default())],
+            },
+        )],
+    };
     (DetachedFile::new(digest, ts), msg)
 }
 
@@ -439,7 +503,12 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(Error::Encoding("odd hex".into()));
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| Error::Encoding("bad hex".into()))).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| Error::Encoding("bad hex".into()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -453,7 +522,21 @@ mod tests {
         // A calendar answers: prepend its own bytes, hash, then "pending at me".
         let resp = Timestamp {
             attestations: vec![],
-            ops: vec![(Op::Prepend(vec![1, 2, 3]), Timestamp { attestations: vec![], ops: vec![(Op::Sha256, Timestamp { attestations: vec![Attestation::Pending { uri: "https://a.pool.opentimestamps.org".into() }], ops: vec![] })] })],
+            ops: vec![(
+                Op::Prepend(vec![1, 2, 3]),
+                Timestamp {
+                    attestations: vec![],
+                    ops: vec![(
+                        Op::Sha256,
+                        Timestamp {
+                            attestations: vec![Attestation::Pending {
+                                uri: "https://a.pool.opentimestamps.org".into(),
+                            }],
+                            ops: vec![],
+                        },
+                    )],
+                },
+            )],
         };
         add_calendar_response(&mut file, &msg, &resp.to_bytes()).unwrap();
         let bytes = file.to_bytes();
@@ -461,11 +544,21 @@ mod tests {
         assert_eq!(back, file);
         let pending = back.pending().unwrap();
         let commitment = &pending["https://a.pool.opentimestamps.org"];
-        assert_eq!(*commitment, Op::Sha256.apply(&[vec![1, 2, 3], msg.clone()].concat()).unwrap());
+        assert_eq!(
+            *commitment,
+            Op::Sha256
+                .apply(&[vec![1, 2, 3], msg.clone()].concat())
+                .unwrap()
+        );
         // After Bitcoin confirms: the calendar's upgrade maps that commitment to a block.
-        let upgrade = Timestamp { attestations: vec![Attestation::Bitcoin { height: 800_000 }], ops: vec![] };
+        let upgrade = Timestamp {
+            attestations: vec![Attestation::Bitcoin { height: 800_000 }],
+            ops: vec![],
+        };
         let mut up = back.clone();
-        up.timestamp.merge_at(&digest, commitment, &upgrade).unwrap();
+        up.timestamp
+            .merge_at(&digest, commitment, &upgrade)
+            .unwrap();
         let header = |root: &[u8]| {
             let mut h = vec![0u8; 80];
             h[36..68].copy_from_slice(root);
@@ -473,7 +566,14 @@ mod tests {
             h
         };
         let good = header(commitment);
-        assert_eq!(up.verify_bitcoin(&|h| { assert_eq!(h, 800_000); Ok(good.clone()) }).unwrap(), Some((800_000, 1_700_000_000)));
+        assert_eq!(
+            up.verify_bitcoin(&|h| {
+                assert_eq!(h, 800_000);
+                Ok(good.clone())
+            })
+            .unwrap(),
+            Some((800_000, 1_700_000_000))
+        );
         assert!(up.verify_bitcoin(&|_| Ok(header(&[0; 32]))).is_err());
     }
 }
@@ -486,31 +586,55 @@ mod vector_tests {
 
     #[test]
     fn opentimestamps_client_examples() {
-        let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/ots.json")).unwrap();
-        let b64 = |s: &Value| base64::engine::general_purpose::STANDARD.decode(s.as_str().unwrap()).unwrap();
+        let v: Value =
+            serde_json::from_str(include_str!("../../../spec/test-vectors/ots.json")).unwrap();
+        let b64 = |s: &Value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(s.as_str().unwrap())
+                .unwrap()
+        };
         for c in v["cases"].as_array().unwrap() {
             let bytes = b64(&c["ots"]);
             let f = DetachedFile::parse(&bytes).unwrap_or_else(|e| panic!("{}: {e}", c["name"]));
             // Our writer reproduces the reference client's bytes exactly.
             assert_eq!(f.to_bytes(), bytes, "{}", c["name"]);
             if !c["data"].is_null() {
-                assert_eq!(f.digest, crate::util::sha256(b64(&c["data"])), "{}", c["name"]);
+                assert_eq!(
+                    f.digest,
+                    crate::util::sha256(b64(&c["data"])),
+                    "{}",
+                    c["name"]
+                );
             }
             match c["bitcoin"].as_object() {
                 Some(b) => {
                     let header = hex_decode(b["header"].as_str().unwrap()).unwrap();
-                    let got = f.verify_bitcoin(&|h| { assert_eq!(h, b["height"].as_u64().unwrap()); Ok(header.clone()) }).unwrap();
-                    assert_eq!(got, Some((b["height"].as_u64().unwrap(), b["time"].as_i64().unwrap())));
+                    let got = f
+                        .verify_bitcoin(&|h| {
+                            assert_eq!(h, b["height"].as_u64().unwrap());
+                            Ok(header.clone())
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        got,
+                        Some((b["height"].as_u64().unwrap(), b["time"].as_i64().unwrap()))
+                    );
                 }
                 None => {
-                    assert_eq!(f.verify_bitcoin(&|_| panic!("no bitcoin attestation expected")).unwrap(), None);
+                    assert_eq!(
+                        f.verify_bitcoin(&|_| panic!("no bitcoin attestation expected"))
+                            .unwrap(),
+                        None
+                    );
                     let pending = f.pending().unwrap();
                     assert!(!pending.is_empty());
                     assert!(pending.keys().all(|u| may_follow(u)), "{pending:?}");
                 }
             }
         }
-        assert!(!may_follow("https://evil.example/calendar.opentimestamps.org"));
+        assert!(!may_follow(
+            "https://evil.example/calendar.opentimestamps.org"
+        ));
         assert!(!may_follow("http://alice.btc.calendar.opentimestamps.org"));
     }
 }

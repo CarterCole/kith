@@ -67,7 +67,14 @@ impl Enrollment {
 fn get(h: &Hub, id: &str) -> ApiResult<Enrollment> {
     let mut m = h.enrollments.lock().unwrap();
     m.retain(|_, e| e.created + ENROLL_TTL > now());
-    m.get(id).cloned().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "not_found".into(), "unknown or expired enrollment".into(), None))
+    m.get(id).cloned().ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "not_found".into(),
+            "unknown or expired enrollment".into(),
+            None,
+        )
+    })
 }
 
 fn put(h: &Hub, id: &str, e: Enrollment) {
@@ -80,12 +87,33 @@ pub struct StartReq {
     name: Option<String>,
 }
 
-pub async fn start(State(h): State<Arc<Hub>>, headers: HeaderMap, body: Option<Json<StartReq>>) -> ApiResult<Json<Value>> {
+pub async fn start(
+    State(h): State<Arc<Hub>>,
+    headers: HeaderMap,
+    body: Option<Json<StartReq>>,
+) -> ApiResult<Json<Value>> {
     let c = h.bearer(&headers)?;
     let id = random_id();
-    let name = body.and_then(|b| b.0.name).unwrap_or_else(|| "passkey".into());
-    put(&h, &id, Enrollment { did: c.sub.clone(), name, created: now(), key: None, credential_id: None, device_id: None, message: None, sig: None });
-    Ok(Json(json!({"id": id, "url": format!("{}/enroll/{id}", h.cfg.issuer), "rp_id": h.cfg.rp_id, "expires_in": ENROLL_TTL})))
+    let name = body
+        .and_then(|b| b.0.name)
+        .unwrap_or_else(|| "passkey".into());
+    put(
+        &h,
+        &id,
+        Enrollment {
+            did: c.sub.clone(),
+            name,
+            created: now(),
+            key: None,
+            credential_id: None,
+            device_id: None,
+            message: None,
+            sig: None,
+        },
+    );
+    Ok(Json(
+        json!({"id": id, "url": format!("{}/enroll/{id}", h.cfg.issuer), "rp_id": h.cfg.rp_id, "expires_in": ENROLL_TTL}),
+    ))
 }
 
 pub async fn status(State(h): State<Arc<Hub>>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -98,13 +126,25 @@ pub struct KeyReq {
     credential_id: String,
 }
 
-pub async fn submit_key(State(h): State<Arc<Hub>>, Path(id): Path<String>, Json(req): Json<KeyReq>) -> ApiResult<Json<Value>> {
+pub async fn submit_key(
+    State(h): State<Arc<Hub>>,
+    Path(id): Path<String>,
+    Json(req): Json<KeyReq>,
+) -> ApiResult<Json<Value>> {
     let mut e = get(&h, &id)?;
     if e.key.is_some() {
-        return Err(ApiError(StatusCode::CONFLICT, "exists".into(), "a passkey was already submitted".into(), None));
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "exists".into(),
+            "a passkey was already submitted".into(),
+            None,
+        ));
     }
     if PublicKey::from_did_key(&req.key)?.kty != KeyType::P256 {
-        return Err(ApiError::bad("invalid_request", "passkeys must be ES256 (P-256)"));
+        return Err(ApiError::bad(
+            "invalid_request",
+            "passkeys must be ES256 (P-256)",
+        ));
     }
     e.key = Some(req.key);
     e.credential_id = Some(req.credential_id);
@@ -118,14 +158,24 @@ pub struct EventReq {
     message: String,
 }
 
-pub async fn submit_event(State(h): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>, Json(req): Json<EventReq>) -> ApiResult<Json<Value>> {
+pub async fn submit_event(
+    State(h): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<EventReq>,
+) -> ApiResult<Json<Value>> {
     let c = h.bearer(&headers)?;
     let mut e = get(&h, &id)?;
     if c.sub != e.did {
-        return Err(ApiError::unauthorized("enrollment belongs to another identity"));
+        return Err(ApiError::unauthorized(
+            "enrollment belongs to another identity",
+        ));
     }
     if e.key.is_none() || e.message.is_some() {
-        return Err(ApiError::bad("invalid_request", "enrollment is not waiting for approval"));
+        return Err(ApiError::bad(
+            "invalid_request",
+            "enrollment is not waiting for approval",
+        ));
     }
     e.device_id = Some(req.device_id);
     e.message = Some(req.message);
@@ -138,15 +188,23 @@ pub struct SigReq {
     sig: Sig,
 }
 
-pub async fn submit_sig(State(h): State<Arc<Hub>>, Path(id): Path<String>, Json(req): Json<SigReq>) -> ApiResult<Json<Value>> {
+pub async fn submit_sig(
+    State(h): State<Arc<Hub>>,
+    Path(id): Path<String>,
+    Json(req): Json<SigReq>,
+) -> ApiResult<Json<Value>> {
     let mut e = get(&h, &id)?;
     let (Some(key), Some(message)) = (&e.key, &e.message) else {
         return Err(ApiError::bad("invalid_request", "nothing to sign yet"));
     };
     if &req.sig.signer != key || req.sig.alg != "WebAuthn" {
-        return Err(ApiError::bad("invalid_request", "signature must come from the enrolled passkey"));
+        return Err(ApiError::bad(
+            "invalid_request",
+            "signature must come from the enrolled passkey",
+        ));
     }
-    verify_sig(&req.sig, message.as_bytes(), &VerifyOptions::default()).map_err(ApiError::unauthorized)?;
+    verify_sig(&req.sig, message.as_bytes(), &VerifyOptions::default())
+        .map_err(ApiError::unauthorized)?;
     e.sig = Some(req.sig);
     put(&h, &id, e.clone());
     Ok(Json(e.json()))
@@ -154,7 +212,13 @@ pub async fn submit_sig(State(h): State<Arc<Hub>>, Path(id): Path<String>, Json(
 
 pub async fn page(State(h): State<Arc<Hub>>, Path(id): Path<String>) -> Response {
     match get(&h, &id) {
-        Ok(e) => pages::enroll(json!({"id": id, "did": e.did, "name": e.name, "rp_id": h.cfg.rp_id, "state": e.state()})),
-        Err(_) => pages::message(StatusCode::NOT_FOUND, "Link expired", "This enrollment link is unknown or has expired. Run `kith passkey enroll` again."),
+        Ok(e) => pages::enroll(
+            json!({"id": id, "did": e.did, "name": e.name, "rp_id": h.cfg.rp_id, "state": e.state()}),
+        ),
+        Err(_) => pages::message(
+            StatusCode::NOT_FOUND,
+            "Link expired",
+            "This enrollment link is unknown or has expired. Run `kith passkey enroll` again.",
+        ),
     }
 }

@@ -63,6 +63,16 @@
   - Back- and front-channel logout notices.
   - ID tokens encrypted to the client (`RSA-OAEP-256`, `ECDH-ES`; checked against `jose`).
   - Browser passkey enrollment brokered by the hub (`kith passkey enroll`).
+  - Browser sign-up with `--signup`: a passkey and a downloaded recovery key make an
+    identity the hub holds no key for ([spec §7.11](../spec/07-oidc.md)). Verified in
+    headless Chrome (`scripts/signup-demo.sh`). The recovery key can be generated,
+    derived from the visitor's own secret words, or any public `did:key` they bring.
+  - Sign-up through a provider: a provider account no identity links gets a ticket,
+    makes a passkey and a recovery key, and is linked to the new identity and signed in
+    ([spec §7.11](../spec/07-oidc.md)). Verified in headless Chrome against a mock
+    OpenID Connect provider, not yet against Google or any real one.
+  - Proof of work as an account score: `POST /v1/work`, the `work` token attribute,
+    mining in the sign-up page and `kith work` ([spec §7.12](../spec/07-oidc.md)).
   - Upstream OIDC providers as a login factor, starting with Telegram Login
     ([spec §7.8](../spec/07-oidc.md)). Tested against a stand-in provider, not yet
     against Telegram itself.
@@ -101,6 +111,17 @@
   no RFC 7592. Login challenges and passkey enrollments in progress are still in
   memory (the page retries after a restart). The bundle is a hot-reloaded file, and
   there is no rate limit on anything but login, registration and TOTP.
+- **Browser accounts.** An identity made at `/signup` has one passkey, which is also
+  its manage key, so it can't add another device, and nothing yet uses its recovery
+  key. It has no name or email attribute. Sign-up is open to anyone who reaches the
+  hub and is only rate limited per address ([spec §7.11](../spec/07-oidc.md)).
+- **Provider sign-up.** Links made at sign-up live in the hub's store, not the identity's
+  log, and can't be removed or added to from a session. Attributes (name, email) are
+  not kept after the session that brought them. GitHub and Facebook aren't OpenID
+  Connect and need adapters; Apple needs a generated client secret.
+- **Work.** `work` is a cost score, not proof of a person, and GPUs buy it cheaply.
+  There is no JS or Python helper for mining or checking yet, and no per-hub
+  difficulty policy, such as requiring N bits to sign up.
 - **Audiences.** The hub mints tokens for any `audience`. It needs a registry of
   resource servers and per-audience claim release (privacy, and smaller tokens).
 - **Signers still to do:**

@@ -40,7 +40,10 @@ pub fn cid_of(bytes: &[u8]) -> String {
     varint(DAG_JSON, &mut raw);
     raw.extend([0x12, 0x20]);
     raw.extend(sha256(bytes));
-    format!("b{}", data_encoding::BASE32_NOPAD.encode(&raw).to_lowercase())
+    format!(
+        "b{}",
+        data_encoding::BASE32_NOPAD.encode(&raw).to_lowercase()
+    )
 }
 
 /// Encode a value as a block: canonical JSON bytes and their CID.
@@ -72,9 +75,13 @@ pub trait BlockPut: BlockGet {
 
 /// Fetch a block and check it hashes to its CID.
 pub fn get_verified(store: &dyn BlockGet, cid: &str) -> Result<Value> {
-    let bytes = store.get(cid)?.ok_or_else(|| Error::NotFound(format!("block {cid}")))?;
+    let bytes = store
+        .get(cid)?
+        .ok_or_else(|| Error::NotFound(format!("block {cid}")))?;
     if cid_of(&bytes) != cid {
-        return Err(Error::Encoding(format!("block {cid} does not match its hash")));
+        return Err(Error::Encoding(format!(
+            "block {cid} does not match its hash"
+        )));
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -151,7 +158,10 @@ pub struct Recording<'a> {
 
 impl<'a> Recording<'a> {
     pub fn new(inner: &'a dyn BlockGet) -> Self {
-        Recording { inner, seen: Mutex::new(BTreeMap::new()) }
+        Recording {
+            inner,
+            seen: Mutex::new(BTreeMap::new()),
+        }
     }
     pub fn into_blocks(self) -> BTreeMap<String, Vec<u8>> {
         self.seen.into_inner().unwrap()
@@ -172,7 +182,11 @@ impl BlockGet for Recording<'_> {
 fn nibble(key: &str, depth: usize) -> usize {
     let h = sha256(key.as_bytes());
     let b = h[depth / 2];
-    (if depth.is_multiple_of(2) { b >> 4 } else { b & 0x0f }) as usize
+    (if depth.is_multiple_of(2) {
+        b >> 4
+    } else {
+        b & 0x0f
+    }) as usize
 }
 
 /// Build a Merkle map. Returns the root CID; every node is written to `store`.
@@ -201,7 +215,11 @@ fn build_node(store: &dyn BlockPut, entries: &[(&String, &Value)], depth: usize)
     }
     let mut c = vec![];
     for b in buckets {
-        c.push(if b.is_empty() { Value::Null } else { link(&build_node(store, &b, depth + 1)?) });
+        c.push(if b.is_empty() {
+            Value::Null
+        } else {
+            link(&build_node(store, &b, depth + 1)?)
+        });
     }
     put_value(store, &json!({ "c": c }))
 }
@@ -220,13 +238,22 @@ pub fn map_get(store: &dyn BlockGet, root: &str, key: &str) -> Result<Option<Val
             }
             return Ok(None);
         }
-        let c = node.get("c").and_then(Value::as_array).filter(|c| c.len() == 16);
+        let c = node
+            .get("c")
+            .and_then(Value::as_array)
+            .filter(|c| c.len() == 16);
         let Some(c) = c else {
-            return Err(Error::Encoding(format!("merkle map node {cid} is malformed")));
+            return Err(Error::Encoding(format!(
+                "merkle map node {cid} is malformed"
+            )));
         };
         match &c[nibble(key, depth)] {
             Value::Null => return Ok(None),
-            v => cid = as_link(v).ok_or_else(|| Error::Encoding("merkle map child is not a link".into()))?.to_string(),
+            v => {
+                cid = as_link(v)
+                    .ok_or_else(|| Error::Encoding("merkle map child is not a link".into()))?
+                    .to_string()
+            }
         }
     }
     Err(Error::Encoding("merkle map too deep".into()))
@@ -253,12 +280,31 @@ pub fn map_entries(store: &dyn BlockGet, root: &str) -> Result<BTreeMap<String, 
 
 /// Blocks as a JSON object `{cid: block text}` (the test-vector and HTTP bundle form).
 pub fn blocks_to_json(blocks: &BTreeMap<String, Vec<u8>>) -> Value {
-    Value::Object(blocks.iter().map(|(k, v)| (k.clone(), Value::String(String::from_utf8_lossy(v).into_owned()))).collect::<Map<_, _>>())
+    Value::Object(
+        blocks
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    Value::String(String::from_utf8_lossy(v).into_owned()),
+                )
+            })
+            .collect::<Map<_, _>>(),
+    )
 }
 
 pub fn blocks_from_json(v: &Value) -> Result<BTreeMap<String, Vec<u8>>> {
-    let o = v.as_object().ok_or_else(|| Error::Encoding("blocks must be an object".into()))?;
-    Ok(o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().as_bytes().to_vec())).collect())
+    let o = v
+        .as_object()
+        .ok_or_else(|| Error::Encoding("blocks must be an object".into()))?;
+    Ok(o.iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                v.as_str().unwrap_or_default().as_bytes().to_vec(),
+            )
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -270,12 +316,16 @@ mod tests {
         let (cid, bytes) = encode(&json!({"hello": "world"})).unwrap();
         assert_eq!(bytes, br#"{"hello":"world"}"#);
         // Same CID as @ipld/dag-json + multiformats produce for this value.
-        assert_eq!(cid, "baguqeerasords4njcts6vs7qvdjfcvgnume4hqohf65zsfguprqphs3icwea");
+        assert_eq!(
+            cid,
+            "baguqeerasords4njcts6vs7qvdjfcvgnume4hqohf65zsfguprqphs3icwea"
+        );
     }
 
     #[test]
     fn map_shape_is_order_independent_and_proves_absence() {
-        let entries: BTreeMap<String, Value> = (0..100).map(|i| (format!("k{i}"), json!(i))).collect();
+        let entries: BTreeMap<String, Value> =
+            (0..100).map(|i| (format!("k{i}"), json!(i))).collect();
         let a = MemStore::new();
         let root = map_build(&a, &entries).unwrap();
         let b = MemStore::new();
@@ -286,9 +336,15 @@ mod tests {
         let rec = Recording::new(&a);
         assert_eq!(map_get(&rec, &root, "k42").unwrap(), Some(json!(42)));
         let proof = rec.into_blocks();
-        assert!(proof.len() < a.len() / 3, "a lookup touches a path, not the tree");
+        assert!(
+            proof.len() < a.len() / 3,
+            "a lookup touches a path, not the tree"
+        );
         // The proof alone is enough to repeat the lookup.
-        assert_eq!(map_get(&MemStore::from_blocks(proof), &root, "k42").unwrap(), Some(json!(42)));
+        assert_eq!(
+            map_get(&MemStore::from_blocks(proof), &root, "k42").unwrap(),
+            Some(json!(42))
+        );
         assert_eq!(map_get(&a, &root, "nope").unwrap(), None);
         assert_eq!(map_entries(&a, &root).unwrap(), entries);
     }
@@ -297,7 +353,9 @@ mod tests {
     fn tampered_blocks_are_rejected() {
         let s = MemStore::new();
         let root = map_build(&s, &[("a".to_string(), json!(1))].into_iter().collect()).unwrap();
-        s.0.lock().unwrap().insert(root.clone(), br#"{"e":[["a",2]]}"#.to_vec());
+        s.0.lock()
+            .unwrap()
+            .insert(root.clone(), br#"{"e":[["a",2]]}"#.to_vec());
         assert!(map_get(&s, &root, "a").is_err());
     }
 }

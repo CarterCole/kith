@@ -48,7 +48,13 @@ pub struct AliasProof {
     pub sig: Sig,
 }
 
-fn proof_message(root: &str, alias: &str, aud: Option<&str>, nonce: Option<&str>, iat: i64) -> Vec<u8> {
+fn proof_message(
+    root: &str,
+    alias: &str,
+    aud: Option<&str>,
+    nonce: Option<&str>,
+    iat: i64,
+) -> Vec<u8> {
     format!(
         "kith alias link v1\nroot: {root}\nalias: {alias}\naud: {}\nnonce: {}\niat: {iat}",
         aud.unwrap_or("*"),
@@ -59,7 +65,11 @@ fn proof_message(root: &str, alias: &str, aud: Option<&str>, nonce: Option<&str>
 
 impl PrivateAlias {
     pub fn generate(label: impl Into<String>) -> Self {
-        PrivateAlias { label: label.into(), signer: LocalSigner::generate(KeyType::Ed25519), salt: random_id() }
+        PrivateAlias {
+            label: label.into(),
+            signer: LocalSigner::generate(KeyType::Ed25519),
+            salt: random_id(),
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -70,15 +80,42 @@ impl PrivateAlias {
         commitment(root, self.id(), &self.salt)
     }
 
-    pub fn prove(&self, root: &str, seq: u64, aud: Option<String>, nonce: Option<String>) -> Result<AliasProof> {
+    pub fn prove(
+        &self,
+        root: &str,
+        seq: u64,
+        aud: Option<String>,
+        nonce: Option<String>,
+    ) -> Result<AliasProof> {
         let iat = now();
-        let sig = self.signer.sign(&proof_message(root, self.id(), aud.as_deref(), nonce.as_deref(), iat))?;
-        Ok(AliasProof { v: 1, root: root.into(), alias: self.id().into(), salt: self.salt.clone(), seq, aud, nonce, iat, sig })
+        let sig = self.signer.sign(&proof_message(
+            root,
+            self.id(),
+            aud.as_deref(),
+            nonce.as_deref(),
+            iat,
+        ))?;
+        Ok(AliasProof {
+            v: 1,
+            root: root.into(),
+            alias: self.id().into(),
+            salt: self.salt.clone(),
+            seq,
+            aud,
+            nonce,
+            iat,
+            sig,
+        })
     }
 }
 
 /// Verify an alias proof against the root identity's current key state.
-pub fn verify_alias_proof(proof: &AliasProof, root: &KeyState, aud: Option<&str>, nonce: Option<&str>) -> Result<()> {
+pub fn verify_alias_proof(
+    proof: &AliasProof,
+    root: &KeyState,
+    aud: Option<&str>,
+    nonce: Option<&str>,
+) -> Result<()> {
     if proof.root != root.did {
         return Err(Error::Signature("proof is for a different root".into()));
     }
@@ -89,13 +126,29 @@ pub fn verify_alias_proof(proof: &AliasProof, root: &KeyState, aud: Option<&str>
         return Err(Error::Signature("alias proof nonce mismatch".into()));
     }
     let c = commitment(&proof.root, &proof.alias, &proof.salt);
-    if !root.alias_commitments.iter().any(|a| a.seq == proof.seq && a.commitment == c) {
+    if !root
+        .alias_commitments
+        .iter()
+        .any(|a| a.seq == proof.seq && a.commitment == c)
+    {
         return Err(Error::NotFound("alias commitment not in root KEL".into()));
     }
     if proof.sig.signer != proof.alias {
-        return Err(Error::Signature("proof must be signed by the alias key".into()));
+        return Err(Error::Signature(
+            "proof must be signed by the alias key".into(),
+        ));
     }
-    verify_sig(&proof.sig, &proof_message(&proof.root, &proof.alias, proof.aud.as_deref(), proof.nonce.as_deref(), proof.iat), &VerifyOptions::default())
+    verify_sig(
+        &proof.sig,
+        &proof_message(
+            &proof.root,
+            &proof.alias,
+            proof.aud.as_deref(),
+            proof.nonce.as_deref(),
+            proof.iat,
+        ),
+        &VerifyOptions::default(),
+    )
 }
 
 #[cfg(test)]
@@ -108,11 +161,23 @@ mod tests {
         let mut f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         let alias = PrivateAlias::generate("gaming");
-        let mut ev = next_event(&st, EventBody::AliasCommit { commitment: alias.commitment(&st.did) });
+        let mut ev = next_event(
+            &st,
+            EventBody::AliasCommit {
+                commitment: alias.commitment(&st.did),
+            },
+        );
         ev.sign(&f.device).unwrap(); // a device with the `alias` cap may commit
         f.log.push(ev);
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
-        let proof = alias.prove(&st.did, 1, Some("https://shop.example".into()), Some("n1".into())).unwrap();
+        let proof = alias
+            .prove(
+                &st.did,
+                1,
+                Some("https://shop.example".into()),
+                Some("n1".into()),
+            )
+            .unwrap();
         verify_alias_proof(&proof, &st, Some("https://shop.example"), Some("n1")).unwrap();
         assert!(verify_alias_proof(&proof, &st, Some("https://other.example"), None).is_err());
         let mut forged = proof.clone();

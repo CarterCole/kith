@@ -63,11 +63,18 @@ pub struct HubSigner {
 impl HubSigner {
     pub fn generate() -> Self {
         let key = SecretKey::generate(KeyType::Ed25519);
-        HubSigner { kid: key.public().jwk_thumbprint(), key }
+        HubSigner {
+            kid: key.public().jwk_thumbprint(),
+            key,
+        }
     }
 
     pub fn issue(&self, claims: &AccessClaims) -> Result<String> {
-        jws::sign(json!({"typ": "at+jwt", "kid": self.kid}), &serde_json::to_value(claims)?, &self.key)
+        jws::sign(
+            json!({"typ": "at+jwt", "kid": self.kid}),
+            &serde_json::to_value(claims)?,
+            &self.key,
+        )
     }
 
     pub fn jwks(&self) -> Value {
@@ -83,12 +90,24 @@ impl HubSigner {
     }
 
     pub fn from_json(v: &Value) -> Result<Self> {
-        let key = SecretKey::from_bytes(KeyType::Ed25519, &b64u_decode(v["secret"].as_str().unwrap_or_default())?)?;
-        Ok(HubSigner { kid: v["kid"].as_str().unwrap_or_default().into(), key })
+        let key = SecretKey::from_bytes(
+            KeyType::Ed25519,
+            &b64u_decode(v["secret"].as_str().unwrap_or_default())?,
+        )?;
+        Ok(HubSigner {
+            kid: v["kid"].as_str().unwrap_or_default().into(),
+            key,
+        })
     }
 }
 
-pub fn verify_access_token(token: &str, jwks: &Value, issuer: &str, audience: &str, now: i64) -> Result<AccessClaims> {
+pub fn verify_access_token(
+    token: &str,
+    jwks: &Value,
+    issuer: &str,
+    audience: &str,
+    now: i64,
+) -> Result<AccessClaims> {
     let t = jws::decode(token)?;
     if t.header["typ"] != "at+jwt" {
         return Err(Error::Token("expected typ at+jwt".into()));
@@ -99,7 +118,8 @@ pub fn verify_access_token(token: &str, jwks: &Value, issuer: &str, audience: &s
         .and_then(|ks| ks.iter().find(|k| k["kid"] == kid))
         .ok_or_else(|| Error::Token(format!("unknown kid {kid}")))?;
     jws::verify(&t, &PublicKey::from_jwk(jwk)?)?;
-    let c: AccessClaims = serde_json::from_value(t.claims).map_err(|e| Error::Token(e.to_string()))?;
+    let c: AccessClaims =
+        serde_json::from_value(t.claims).map_err(|e| Error::Token(e.to_string()))?;
     if c.iss != issuer || c.aud != audience {
         return Err(Error::Token("issuer or audience mismatch".into()));
     }

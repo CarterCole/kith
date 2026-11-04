@@ -59,12 +59,19 @@ fn star() -> String {
 }
 
 fn glob(pattern: &str, value: &str) -> bool {
-    pattern == "*" || pattern == value || pattern.strip_suffix('*').is_some_and(|p| value.starts_with(p))
+    pattern == "*"
+        || pattern == value
+        || pattern
+            .strip_suffix('*')
+            .is_some_and(|p| value.starts_with(p))
 }
 
 impl Capability {
     pub fn new(action: impl Into<String>) -> Self {
-        Capability { action: action.into(), resource: star() }
+        Capability {
+            action: action.into(),
+            resource: star(),
+        }
     }
     pub fn allows(&self, action: &str, resource: &str) -> bool {
         glob(&self.action, action) && glob(&self.resource, resource)
@@ -93,7 +100,9 @@ pub trait KelResolver {
 
 impl KelResolver for HashMap<String, KeyState> {
     fn resolve(&self, did: &str) -> Result<KeyState> {
-        self.get(did).cloned().ok_or_else(|| Error::NotFound(did.into()))
+        self.get(did)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(did.into()))
     }
 }
 
@@ -101,10 +110,17 @@ impl KelResolver for HashMap<String, KeyState> {
 pub enum DeviceSigner<'a> {
     Key(&'a SecretKey),
     /// A passkey: signs through WebAuthn (software authenticator here).
-    Passkey { key: &'a SecretKey, rp_id: &'a str, origin: &'a str },
+    Passkey {
+        key: &'a SecretKey,
+        rp_id: &'a str,
+        origin: &'a str,
+    },
     /// A key that never enters this process (Secure Enclave, TPM, PKCS#11, an
     /// agent): `sign` returns the raw signature a `kty` key produces.
-    External { kty: KeyType, sign: &'a dyn Fn(&[u8]) -> Result<Vec<u8>> },
+    External {
+        kty: KeyType,
+        sign: &'a dyn Fn(&[u8]) -> Result<Vec<u8>>,
+    },
 }
 
 /// A session key certified by a device.
@@ -122,7 +138,9 @@ impl SessionKey {
         let claims = GrantClaims {
             iss: did.into(),
             dev: device.id.clone(),
-            cnf: Cnf { jwk: secret.public().to_jwk() },
+            cnf: Cnf {
+                jwk: secret.public().to_jwk(),
+            },
             aal: device.aal,
             iat,
             exp: iat + ttl,
@@ -132,20 +150,31 @@ impl SessionKey {
         let claims = serde_json::to_value(&claims)?;
         let grant = match signer {
             DeviceSigner::Key(k) => jws::sign(header, &claims, k)?,
-            DeviceSigner::Passkey { key, rp_id, origin } => jws::sign_webauthn(header, &claims, key, rp_id, origin)?,
+            DeviceSigner::Passkey { key, rp_id, origin } => {
+                jws::sign_webauthn(header, &claims, key, rp_id, origin)?
+            }
             DeviceSigner::External { kty, sign } => jws::sign_with(header, &claims, kty, sign)?,
         };
-        Ok(SessionKey { did: did.into(), secret, grant })
+        Ok(SessionKey {
+            did: did.into(),
+            secret,
+            grant,
+        })
     }
 
     fn sign(&self, typ: &str, claims: Value) -> Result<String> {
-        jws::sign(json!({"typ": typ, "kith_grant": self.grant}), &claims, &self.secret)
+        jws::sign(
+            json!({"typ": typ, "kith_grant": self.grant}),
+            &claims,
+            &self.secret,
+        )
     }
 
     /// A short-lived, single-use proof of possession for `aud` (e.g. a hub).
     pub fn session_token(&self, aud: &str, extra: Value) -> Result<String> {
         let iat = now();
-        let mut claims = json!({"iss": self.did, "aud": aud, "iat": iat, "exp": iat + 120, "jti": random_id()});
+        let mut claims =
+            json!({"iss": self.did, "aud": aud, "iat": iat, "exp": iat + 120, "jti": random_id()});
         if let Value::Object(m) = extra {
             for (k, v) in m {
                 claims[k] = v;
@@ -157,7 +186,15 @@ impl SessionKey {
     /// Delegate `caps` to another identity (`to`), redeemable at `aud`.
     pub fn delegate(&self, to: &str, aud: &str, caps: Vec<Capability>, ttl: i64) -> Result<String> {
         let iat = now();
-        let claims = DelegationClaims { iss: self.did.clone(), sub: to.into(), aud: aud.into(), cap: caps, iat, exp: iat + ttl, jti: random_id() };
+        let claims = DelegationClaims {
+            iss: self.did.clone(),
+            sub: to.into(),
+            aud: aud.into(),
+            cap: caps,
+            iat,
+            exp: iat + ttl,
+            jti: random_id(),
+        };
         self.sign(TYP_DELEGATION, serde_json::to_value(claims)?)
     }
 }
@@ -181,17 +218,25 @@ fn check_times(iat: i64, exp: i64, now: i64) -> Result<()> {
 }
 
 /// Verify a session-key-signed token of type `typ` and its device grant.
-pub fn verify_chain(token: &str, typ: &str, resolver: &dyn KelResolver, now: i64) -> Result<VerifiedChain> {
+pub fn verify_chain(
+    token: &str,
+    typ: &str,
+    resolver: &dyn KelResolver,
+    now: i64,
+) -> Result<VerifiedChain> {
     let outer = jws::decode(token)?;
     if outer.header["typ"] != typ {
         return Err(Error::Token(format!("expected typ {typ}")));
     }
-    let grant_jwt = outer.header["kith_grant"].as_str().ok_or_else(|| Error::Token("missing kith_grant".into()))?;
+    let grant_jwt = outer.header["kith_grant"]
+        .as_str()
+        .ok_or_else(|| Error::Token("missing kith_grant".into()))?;
     let grant = jws::decode(grant_jwt)?;
     if grant.header["typ"] != TYP_GRANT {
         return Err(Error::Token("kith_grant has wrong typ".into()));
     }
-    let gc: GrantClaims = serde_json::from_value(grant.claims.clone()).map_err(|e| Error::Token(format!("grant: {e}")))?;
+    let gc: GrantClaims = serde_json::from_value(grant.claims.clone())
+        .map_err(|e| Error::Token(format!("grant: {e}")))?;
     let state = resolver.resolve(&gc.iss)?;
     let device = state
         .device(&gc.dev)
@@ -202,8 +247,12 @@ pub fn verify_chain(token: &str, typ: &str, resolver: &dyn KelResolver, now: i64
 
     let session_key = PublicKey::from_jwk(&gc.cnf.jwk)?;
     jws::verify(&outer, &session_key)?;
-    let iat = outer.claims["iat"].as_i64().ok_or_else(|| Error::Token("missing iat".into()))?;
-    let exp = outer.claims["exp"].as_i64().ok_or_else(|| Error::Token("missing exp".into()))?;
+    let iat = outer.claims["iat"]
+        .as_i64()
+        .ok_or_else(|| Error::Token("missing iat".into()))?;
+    let exp = outer.claims["exp"]
+        .as_i64()
+        .ok_or_else(|| Error::Token("missing exp".into()))?;
     check_times(iat, exp, now)?;
     if exp > gc.exp + LEEWAY {
         return Err(Error::Token("token outlives its grant".into()));
@@ -214,23 +263,44 @@ pub fn verify_chain(token: &str, typ: &str, resolver: &dyn KelResolver, now: i64
     if outer.claims["iss"] != gc.iss {
         return Err(Error::Token("iss does not match grant".into()));
     }
-    Ok(VerifiedChain { did: gc.iss.clone(), aal: gc.aal.min(device.aal), device, session_key, header: outer.header, claims: outer.claims, grant: gc })
+    Ok(VerifiedChain {
+        did: gc.iss.clone(),
+        aal: gc.aal.min(device.aal),
+        device,
+        session_key,
+        header: outer.header,
+        claims: outer.claims,
+        grant: gc,
+    })
 }
 
-pub fn verify_session_token(token: &str, aud: &str, resolver: &dyn KelResolver, now: i64) -> Result<VerifiedChain> {
+pub fn verify_session_token(
+    token: &str,
+    aud: &str,
+    resolver: &dyn KelResolver,
+    now: i64,
+) -> Result<VerifiedChain> {
     let v = verify_chain(token, TYP_SESSION, resolver, now)?;
     if v.claims["aud"] != aud {
         return Err(Error::Token("audience mismatch".into()));
     }
     if !v.device.has_cap("session") {
-        return Err(Error::Token("device is not allowed to create sessions".into()));
+        return Err(Error::Token(
+            "device is not allowed to create sessions".into(),
+        ));
     }
     Ok(v)
 }
 
-pub fn verify_delegation(token: &str, aud: &str, resolver: &dyn KelResolver, now: i64) -> Result<(VerifiedChain, DelegationClaims)> {
+pub fn verify_delegation(
+    token: &str,
+    aud: &str,
+    resolver: &dyn KelResolver,
+    now: i64,
+) -> Result<(VerifiedChain, DelegationClaims)> {
     let v = verify_chain(token, TYP_DELEGATION, resolver, now)?;
-    let d: DelegationClaims = serde_json::from_value(v.claims.clone()).map_err(|e| Error::Token(format!("delegation: {e}")))?;
+    let d: DelegationClaims = serde_json::from_value(v.claims.clone())
+        .map_err(|e| Error::Token(format!("delegation: {e}")))?;
     if d.aud != aud {
         return Err(Error::Token("delegation audience mismatch".into()));
     }
@@ -248,7 +318,8 @@ mod tests {
         let f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         let dev = st.device(&f.device_id).unwrap().clone();
-        let sk = SessionKey::create(&st.did, &dev, DeviceSigner::Key(&f.device.secret), 3600).unwrap();
+        let sk =
+            SessionKey::create(&st.did, &dev, DeviceSigner::Key(&f.device.secret), 3600).unwrap();
         let tok = sk.session_token("https://hub.example", json!({})).unwrap();
         let mut r = HashMap::new();
         r.insert(st.did.clone(), st.clone());
@@ -264,8 +335,15 @@ mod tests {
         let mut f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         let dev = st.device(&f.device_id).unwrap().clone();
-        let sk = SessionKey::create(&st.did, &dev, DeviceSigner::Key(&f.device.secret), 3600).unwrap();
-        let mut ev = crate::kel::next_event(&st, crate::kel::EventBody::RevokeDevice { device_id: dev.id.clone(), reason: None });
+        let sk =
+            SessionKey::create(&st.did, &dev, DeviceSigner::Key(&f.device.secret), 3600).unwrap();
+        let mut ev = crate::kel::next_event(
+            &st,
+            crate::kel::EventBody::RevokeDevice {
+                device_id: dev.id.clone(),
+                reason: None,
+            },
+        );
         ev.sign(&f.root).unwrap();
         f.log.push(ev);
         let st2 = verify_log(&f.log, &VerifyOptions::default()).unwrap();
@@ -280,8 +358,16 @@ mod tests {
         let f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         let dev = st.device(&f.device_id).unwrap().clone();
-        let sk = SessionKey::create(&st.did, &dev, DeviceSigner::Key(&f.device.secret), 3600).unwrap();
-        let tok = sk.delegate("did:kith:someone", "hub", vec![Capability::new("Query.invoice*")], 600).unwrap();
+        let sk =
+            SessionKey::create(&st.did, &dev, DeviceSigner::Key(&f.device.secret), 3600).unwrap();
+        let tok = sk
+            .delegate(
+                "did:kith:someone",
+                "hub",
+                vec![Capability::new("Query.invoice*")],
+                600,
+            )
+            .unwrap();
         let mut r = HashMap::new();
         r.insert(st.did.clone(), st);
         let (_, d) = verify_delegation(&tok, "hub", &r, now()).unwrap();

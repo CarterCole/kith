@@ -18,7 +18,11 @@
   `amr` claims.
 - **"Sign in with Kith" for existing apps.** The hub is a standard OpenID Connect
   provider: code flow with PKCE, username-less passkey login, SSO, step-up through
-  `acr_values`, and pairwise subjects.
+  `acr_values`, and pairwise subjects. With `--signup`, people can create an account in
+  the browser with a passkey, or by signing in with a provider first.
+- **Work as a score.** An account can show it cost compute: a nonce whose hash with the
+  DID has many leading zero bits. Tokens carry the count as `work`, which policies can
+  use (`principal.work >= 24`). `kith work` mines from a terminal.
 - **Aliases.** Public ones are proved in both directions and resolve through WebFinger,
   DNS or did:web back-links; the CLI pins them as local names. Private ones are
   unlinkable until you choose to prove the link.
@@ -85,6 +89,9 @@ kith rotate --revoke-devices                 # recovery keys (or paper key + TOT
 kith hub serve --bundle bundle.json --clients clients.json   # run a hub (+ OIDC clients)
 kith hub serve --upstreams upstreams.json    # also accept "Sign in with Telegram"
 kith hub serve --registration-token "$TOKEN" # let apps register themselves (RFC 7591)
+kith hub serve --signup                      # let anyone create an account at /signup (a passkey)
+                                             # /whoami: sign in with that passkey, see your identity
+kith work --bits 24                          # spend compute on your identity; the hub records the best proof
 kith hub serve --admin-token "$TOKEN"        # /v1/admin/…: sessions, consent, clients
 kith alias link 'https://oauth.telegram.org#<your id>'   # let that Telegram account sign in as you
 kith name add ada mailto:ada@acme.test       # follow her WebFinger (or DNS) back-link, check her KEL links it, pin it

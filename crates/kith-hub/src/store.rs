@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS totp (did TEXT PRIMARY KEY, secret TEXT NOT NULL, con
 CREATE TABLE IF NOT EXISTS cosigners (did TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS seen_jti (jti TEXT PRIMARY KEY, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS rate_limits (bucket TEXT PRIMARY KEY, window_start INTEGER NOT NULL, window_secs INTEGER NOT NULL, count INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS handles (handle TEXT PRIMARY KEY, did TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS provider_links (alias TEXT PRIMARY KEY, did TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS emails (email TEXT PRIMARY KEY, did TEXT NOT NULL, verified INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS emails_did ON emails (did);
+CREATE TABLE IF NOT EXISTS work (did TEXT PRIMARY KEY, bits INTEGER NOT NULL, nonce INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
 ";
 
@@ -74,7 +79,11 @@ fn key(secret: &str) -> String {
     hash(secret)
 }
 
-fn one<T: DeserializeOwned>(c: &Connection, sql: &str, p: impl Params) -> anyhow::Result<Option<T>> {
+fn one<T: DeserializeOwned>(
+    c: &Connection,
+    sql: &str,
+    p: impl Params,
+) -> anyhow::Result<Option<T>> {
     let data: Option<String> = c.query_row(sql, p, |r| r.get(0)).optional()?;
     Ok(data.map(|d| serde_json::from_str(&d)).transpose()?)
 }
@@ -99,7 +108,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Store { conn: Mutex::new(conn) })
+        Ok(Store {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
@@ -116,7 +127,16 @@ impl Store {
             for (did, r) in m {
                 if self.totp(&did)?.is_none() {
                     let secret = b64u_decode(r["secret"].as_str().unwrap_or_default())?;
-                    self.put_totp(&did, &TotpRecord { secret, confirmed: r["confirmed"].as_bool().unwrap_or(false), last_step: r["last_step"].as_i64().unwrap_or(0), failures: 0, locked_until: 0 })?;
+                    self.put_totp(
+                        &did,
+                        &TotpRecord {
+                            secret,
+                            confirmed: r["confirmed"].as_bool().unwrap_or(false),
+                            last_step: r["last_step"].as_i64().unwrap_or(0),
+                            failures: 0,
+                            locked_until: 0,
+                        },
+                    )?;
                 }
             }
             done(totp)?;
@@ -125,7 +145,12 @@ impl Store {
         if let Some(Value::Object(m)) = read_json(&cosigners) {
             for (did, s) in m {
                 LocalSigner::from_json(&s)?;
-                self.with(|c| Ok(c.execute("INSERT OR IGNORE INTO cosigners (did, data) VALUES (?1, ?2)", params![did, s.to_string()])?))?;
+                self.with(|c| {
+                    Ok(c.execute(
+                        "INSERT OR IGNORE INTO cosigners (did, data) VALUES (?1, ?2)",
+                        params![did, s.to_string()],
+                    )?)
+                })?;
             }
             done(cosigners)?;
         }
@@ -144,12 +169,18 @@ impl Store {
     /// Drop what has expired.
     pub fn sweep(&self, t: i64) -> anyhow::Result<()> {
         self.with(|c| {
-            c.execute("DELETE FROM oidc_requests WHERE created + ?1 <= ?2", params![REQUEST_TTL, t])?;
+            c.execute(
+                "DELETE FROM oidc_requests WHERE created + ?1 <= ?2",
+                params![REQUEST_TTL, t],
+            )?;
             c.execute("DELETE FROM oidc_codes WHERE expires <= ?1", params![t])?;
             c.execute("DELETE FROM oidc_sessions WHERE expires <= ?1", params![t])?;
             c.execute("DELETE FROM oidc_refresh WHERE expires <= ?1", params![t])?;
             c.execute("DELETE FROM seen_jti WHERE expires <= ?1", params![t])?;
-            c.execute("DELETE FROM rate_limits WHERE window_start + window_secs <= ?1", params![t])?;
+            c.execute(
+                "DELETE FROM rate_limits WHERE window_start + window_secs <= ?1",
+                params![t],
+            )?;
             Ok(())
         })
     }
@@ -157,7 +188,9 @@ impl Store {
     /// Row counts, for the admin API.
     pub fn counts(&self) -> anyhow::Result<Value> {
         self.with(|c| {
-            let count = |table: &str| -> anyhow::Result<i64> { Ok(c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?) };
+            let count = |table: &str| -> anyhow::Result<i64> {
+                Ok(c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+            };
             Ok(json!({
                 "sessions": count("oidc_sessions")?,
                 "refresh_tokens": count("oidc_refresh")?,
@@ -174,38 +207,80 @@ impl Store {
     // ------------------------------------------------------------ sign-in requests
 
     pub(crate) fn put_request(&self, id: &str, r: &AuthRequest) -> anyhow::Result<()> {
-        self.with(|c| Ok(c.execute("INSERT OR REPLACE INTO oidc_requests (key, created, data) VALUES (?1, ?2, ?3)", params![key(id), r.created, json(r)?]).map(drop)?))
+        self.with(|c| {
+            Ok(c.execute(
+                "INSERT OR REPLACE INTO oidc_requests (key, created, data) VALUES (?1, ?2, ?3)",
+                params![key(id), r.created, json(r)?],
+            )
+            .map(drop)?)
+        })
     }
 
     pub(crate) fn request(&self, id: &str) -> anyhow::Result<Option<AuthRequest>> {
-        self.with(|c| one(c, "SELECT data FROM oidc_requests WHERE key = ?1 AND created + ?2 > ?3", params![key(id), REQUEST_TTL, now()]))
+        self.with(|c| {
+            one(
+                c,
+                "SELECT data FROM oidc_requests WHERE key = ?1 AND created + ?2 > ?3",
+                params![key(id), REQUEST_TTL, now()],
+            )
+        })
     }
 
     /// Change a stored request in place; `false` when there is none.
-    pub(crate) fn update_request(&self, id: &str, f: impl FnOnce(&mut AuthRequest)) -> anyhow::Result<bool> {
+    pub(crate) fn update_request(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut AuthRequest),
+    ) -> anyhow::Result<bool> {
         self.with(|c| {
-            let Some(mut r) = one::<AuthRequest>(c, "SELECT data FROM oidc_requests WHERE key = ?1 AND created + ?2 > ?3", params![key(id), REQUEST_TTL, now()])? else {
+            let Some(mut r) = one::<AuthRequest>(
+                c,
+                "SELECT data FROM oidc_requests WHERE key = ?1 AND created + ?2 > ?3",
+                params![key(id), REQUEST_TTL, now()],
+            )?
+            else {
                 return Ok(false);
             };
             f(&mut r);
-            c.execute("UPDATE oidc_requests SET data = ?2 WHERE key = ?1", params![key(id), json(&r)?])?;
+            c.execute(
+                "UPDATE oidc_requests SET data = ?2 WHERE key = ?1",
+                params![key(id), json(&r)?],
+            )?;
             Ok(true)
         })
     }
 
     /// Remove and return a request: exactly one caller gets it.
     pub(crate) fn take_request(&self, id: &str) -> anyhow::Result<Option<AuthRequest>> {
-        self.with(|c| one(c, "DELETE FROM oidc_requests WHERE key = ?1 RETURNING data", params![key(id)]))
+        self.with(|c| {
+            one(
+                c,
+                "DELETE FROM oidc_requests WHERE key = ?1 RETURNING data",
+                params![key(id)],
+            )
+        })
     }
 
     // ------------------------------------------------------------ codes
 
     pub(crate) fn put_code(&self, code: &str, g: &CodeGrant) -> anyhow::Result<()> {
-        self.with(|c| Ok(c.execute("INSERT INTO oidc_codes (key, sid, expires, data) VALUES (?1, ?2, ?3, ?4)", params![key(code), g.sid, g.expires, json(g)?]).map(drop)?))
+        self.with(|c| {
+            Ok(c.execute(
+                "INSERT INTO oidc_codes (key, sid, expires, data) VALUES (?1, ?2, ?3, ?4)",
+                params![key(code), g.sid, g.expires, json(g)?],
+            )
+            .map(drop)?)
+        })
     }
 
     pub(crate) fn take_code(&self, code: &str) -> anyhow::Result<Option<CodeGrant>> {
-        self.with(|c| one(c, "DELETE FROM oidc_codes WHERE key = ?1 RETURNING data", params![key(code)]))
+        self.with(|c| {
+            one(
+                c,
+                "DELETE FROM oidc_codes WHERE key = ?1 RETURNING data",
+                params![key(code)],
+            )
+        })
     }
 
     /// Unredeemed codes of a hub session (by its public `sid`) die with it.
@@ -221,32 +296,68 @@ impl Store {
 
     /// The live session behind a cookie.
     pub(crate) fn session(&self, cookie: &str) -> anyhow::Result<Option<SsoSession>> {
-        self.with(|c| one(c, "SELECT data FROM oidc_sessions WHERE key = ?1 AND expires > ?2", params![key(cookie), now()]))
+        self.with(|c| {
+            one(
+                c,
+                "SELECT data FROM oidc_sessions WHERE key = ?1 AND expires > ?2",
+                params![key(cookie), now()],
+            )
+        })
     }
 
     /// Note that `client_id` got tokens in the session behind `cookie`, and return
     /// the session's public id.
-    pub(crate) fn session_add_client(&self, cookie: &str, client_id: &str) -> anyhow::Result<Option<String>> {
+    pub(crate) fn session_add_client(
+        &self,
+        cookie: &str,
+        client_id: &str,
+    ) -> anyhow::Result<Option<String>> {
         self.with(|c| {
-            let Some(mut s) = one::<SsoSession>(c, "SELECT data FROM oidc_sessions WHERE key = ?1 AND expires > ?2", params![key(cookie), now()])? else {
+            let Some(mut s) = one::<SsoSession>(
+                c,
+                "SELECT data FROM oidc_sessions WHERE key = ?1 AND expires > ?2",
+                params![key(cookie), now()],
+            )?
+            else {
                 return Ok(None);
             };
             s.clients.insert(client_id.to_string());
-            c.execute("UPDATE oidc_sessions SET data = ?2 WHERE key = ?1", params![key(cookie), json(&s)?])?;
+            c.execute(
+                "UPDATE oidc_sessions SET data = ?2 WHERE key = ?1",
+                params![key(cookie), json(&s)?],
+            )?;
             Ok(Some(s.id))
         })
     }
 
     pub(crate) fn take_session(&self, cookie: &str) -> anyhow::Result<Option<SsoSession>> {
-        self.with(|c| one(c, "DELETE FROM oidc_sessions WHERE key = ?1 RETURNING data", params![key(cookie)]))
+        self.with(|c| {
+            one(
+                c,
+                "DELETE FROM oidc_sessions WHERE key = ?1 RETURNING data",
+                params![key(cookie)],
+            )
+        })
     }
 
     pub(crate) fn take_session_by_sid(&self, sid: &str) -> anyhow::Result<Option<SsoSession>> {
-        self.with(|c| one(c, "DELETE FROM oidc_sessions WHERE sid = ?1 RETURNING data", params![sid]))
+        self.with(|c| {
+            one(
+                c,
+                "DELETE FROM oidc_sessions WHERE sid = ?1 RETURNING data",
+                params![sid],
+            )
+        })
     }
 
     pub(crate) fn take_sessions_of(&self, did: &str) -> anyhow::Result<Vec<SsoSession>> {
-        self.with(|c| many(c, "DELETE FROM oidc_sessions WHERE did = ?1 RETURNING data", params![did]))
+        self.with(|c| {
+            many(
+                c,
+                "DELETE FROM oidc_sessions WHERE did = ?1 RETURNING data",
+                params![did],
+            )
+        })
     }
 
     /// Live sessions, the ones ending last first; all of them, or one identity's.
@@ -263,12 +374,23 @@ impl Store {
     }
 
     pub(crate) fn take_refresh(&self, token: &str) -> anyhow::Result<Option<RefreshGrant>> {
-        self.with(|c| one(c, "DELETE FROM oidc_refresh WHERE key = ?1 RETURNING data", params![key(token)]))
+        self.with(|c| {
+            one(
+                c,
+                "DELETE FROM oidc_refresh WHERE key = ?1 RETURNING data",
+                params![key(token)],
+            )
+        })
     }
 
     /// Revoke refresh tokens by identity, client, hub session, or any combination
     /// of those. With no filter, none.
-    pub(crate) fn revoke_refresh(&self, did: Option<&str>, client_id: Option<&str>, sid: Option<&str>) -> anyhow::Result<usize> {
+    pub(crate) fn revoke_refresh(
+        &self,
+        did: Option<&str>,
+        client_id: Option<&str>,
+        sid: Option<&str>,
+    ) -> anyhow::Result<usize> {
         if did.is_none() && client_id.is_none() && sid.is_none() {
             return Ok(0);
         }
@@ -277,7 +399,12 @@ impl Store {
 
     // ------------------------------------------------------------ consent
 
-    pub(crate) fn grant<'a>(&self, did: &str, client_id: &str, scopes: impl IntoIterator<Item = &'a str>) -> anyhow::Result<()> {
+    pub(crate) fn grant<'a>(
+        &self,
+        did: &str,
+        client_id: &str,
+        scopes: impl IntoIterator<Item = &'a str>,
+    ) -> anyhow::Result<()> {
         self.with(|c| {
             let t = now();
             for s in scopes {
@@ -287,16 +414,24 @@ impl Store {
         })
     }
 
-    pub(crate) fn granted_scopes(&self, did: &str, client_id: &str) -> anyhow::Result<BTreeSet<String>> {
+    pub(crate) fn granted_scopes(
+        &self,
+        did: &str,
+        client_id: &str,
+    ) -> anyhow::Result<BTreeSet<String>> {
         self.with(|c| {
-            let mut stmt = c.prepare("SELECT scope FROM oidc_grants WHERE did = ?1 AND client_id = ?2")?;
+            let mut stmt =
+                c.prepare("SELECT scope FROM oidc_grants WHERE did = ?1 AND client_id = ?2")?;
             let rows = stmt.query_map(params![did, client_id], |r| r.get::<_, String>(0))?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
     }
 
     /// Every client an identity agreed to share with: (client id, scopes, first granted).
-    pub(crate) fn grants_of(&self, did: &str) -> anyhow::Result<Vec<(String, BTreeSet<String>, i64)>> {
+    pub(crate) fn grants_of(
+        &self,
+        did: &str,
+    ) -> anyhow::Result<Vec<(String, BTreeSet<String>, i64)>> {
         self.with(|c| {
             let mut stmt = c.prepare("SELECT client_id, scope, granted FROM oidc_grants WHERE did = ?1 ORDER BY client_id, scope")?;
             let mut out: Vec<(String, BTreeSet<String>, i64)> = vec![];
@@ -315,7 +450,12 @@ impl Store {
     }
 
     pub(crate) fn revoke_grant(&self, did: &str, client_id: &str) -> anyhow::Result<usize> {
-        self.with(|c| Ok(c.execute("DELETE FROM oidc_grants WHERE did = ?1 AND client_id = ?2", params![did, client_id])?))
+        self.with(|c| {
+            Ok(c.execute(
+                "DELETE FROM oidc_grants WHERE did = ?1 AND client_id = ?2",
+                params![did, client_id],
+            )?)
+        })
     }
 
     // ------------------------------------------------------------ registered clients
@@ -327,11 +467,23 @@ impl Store {
     }
 
     pub(crate) fn client(&self, id: &str) -> anyhow::Result<Option<Client>> {
-        self.with(|c| one(c, "SELECT data FROM oidc_clients WHERE client_id = ?1", params![id]))
+        self.with(|c| {
+            one(
+                c,
+                "SELECT data FROM oidc_clients WHERE client_id = ?1",
+                params![id],
+            )
+        })
     }
 
     pub(crate) fn clients(&self) -> anyhow::Result<Vec<Client>> {
-        self.with(|c| many(c, "SELECT data FROM oidc_clients ORDER BY created, client_id", []))
+        self.with(|c| {
+            many(
+                c,
+                "SELECT data FROM oidc_clients ORDER BY created, client_id",
+                [],
+            )
+        })
     }
 
     /// Delete a registered client with everything that referred to it: consent,
@@ -371,18 +523,166 @@ impl Store {
     }
 
     pub(crate) fn cosigner(&self, did: &str) -> anyhow::Result<Option<LocalSigner>> {
-        self.with(|c| Ok(one::<Value>(c, "SELECT data FROM cosigners WHERE did = ?1", params![did])?.map(|v| LocalSigner::from_json(&v)).transpose()?))
+        self.with(|c| {
+            Ok(
+                one::<Value>(c, "SELECT data FROM cosigners WHERE did = ?1", params![did])?
+                    .map(|v| LocalSigner::from_json(&v))
+                    .transpose()?,
+            )
+        })
     }
 
     /// The hub-held co-signer key for `did`, created on first use.
     pub(crate) fn cosigner_or_create(&self, did: &str) -> anyhow::Result<LocalSigner> {
         self.with(|c| {
-            if let Some(v) = one::<Value>(c, "SELECT data FROM cosigners WHERE did = ?1", params![did])? {
+            if let Some(v) =
+                one::<Value>(c, "SELECT data FROM cosigners WHERE did = ?1", params![did])?
+            {
                 return Ok(LocalSigner::from_json(&v)?);
             }
             let s = LocalSigner::generate(KeyType::Ed25519);
-            c.execute("INSERT INTO cosigners (did, data) VALUES (?1, ?2)", params![did, s.to_json().to_string()])?;
+            c.execute(
+                "INSERT INTO cosigners (did, data) VALUES (?1, ?2)",
+                params![did, s.to_json().to_string()],
+            )?;
             Ok(s)
+        })
+    }
+
+    // ------------------------------------------------------------ sign-up handles
+
+    /// Remember which identity a passkey created at sign-up (spec §7.11) belongs to.
+    /// Its user handle was chosen before the identity existed, so it can't be the DID.
+    pub(crate) fn put_handle(&self, handle: &str, did: &str) -> anyhow::Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO handles (handle, did) VALUES (?1, ?2)",
+                params![handle, did],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn did_for_handle(&self, handle: &str) -> anyhow::Result<Option<String>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT did FROM handles WHERE handle = ?1",
+                params![handle],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+    }
+
+    // ------------------------------------------------------------ provider sign-up links
+
+    /// Record that the upstream account `alias` belongs to `did`, made at sign-up
+    /// (spec §7.11). `false` when the account is already linked to an identity.
+    pub(crate) fn put_provider_link(&self, alias: &str, did: &str) -> anyhow::Result<bool> {
+        self.with(|c| {
+            Ok(c.execute(
+                "INSERT OR IGNORE INTO provider_links (alias, did) VALUES (?1, ?2)",
+                params![alias, did],
+            )? == 1)
+        })
+    }
+
+    pub(crate) fn provider_link(&self, alias: &str) -> anyhow::Result<Option<String>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT did FROM provider_links WHERE alias = ?1",
+                params![alias],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+    }
+
+    /// The upstream accounts linked to `did` at sign-up.
+    pub(crate) fn provider_links_of(&self, did: &str) -> anyhow::Result<Vec<String>> {
+        self.with(|c| {
+            let mut stmt =
+                c.prepare("SELECT alias FROM provider_links WHERE did = ?1 ORDER BY alias")?;
+            let rows = stmt.query_map(params![did], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    pub(crate) fn del_provider_link(&self, alias: &str) -> anyhow::Result<()> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM provider_links WHERE alias = ?1",
+                params![alias],
+            )?;
+            Ok(())
+        })
+    }
+
+    // ------------------------------------------------------------ verified email
+
+    /// Record a verified address for `did`; `false` when another identity has it.
+    pub(crate) fn put_email(&self, email: &str, did: &str) -> anyhow::Result<bool> {
+        self.with(|c| {
+            Ok(c.execute(
+                "INSERT OR IGNORE INTO emails (email, did, verified) VALUES (?1, ?2, 1)",
+                params![email, did],
+            )? == 1)
+        })
+    }
+
+    pub(crate) fn email_taken(&self, email: &str) -> anyhow::Result<bool> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM emails WHERE email = ?1",
+                params![email],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
+    }
+
+    pub(crate) fn email_for(&self, did: &str) -> anyhow::Result<Option<String>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT email FROM emails WHERE did = ?1 AND verified = 1 ORDER BY rowid LIMIT 1",
+                params![did],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+    }
+
+    pub(crate) fn del_email(&self, email: &str) -> anyhow::Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM emails WHERE email = ?1", params![email])?;
+            Ok(())
+        })
+    }
+
+    // ------------------------------------------------------------ proof of work
+
+    /// Keep the best proof seen for `did` (spec §7.12); returns the best now on record.
+    /// The nonce is stored as the same 64 bits it is hashed as.
+    pub(crate) fn put_work(&self, did: &str, bits: u32, nonce: u64) -> anyhow::Result<u32> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO work (did, bits, nonce) VALUES (?1, ?2, ?3) ON CONFLICT(did) DO UPDATE SET bits = excluded.bits, nonce = excluded.nonce WHERE excluded.bits > work.bits",
+                params![did, bits, nonce as i64],
+            )?;
+            Ok(c.query_row("SELECT bits FROM work WHERE did = ?1", params![did], |r| r.get(0))?)
+        })
+    }
+
+    /// `(bits, nonce)` of the best proof on record.
+    pub fn work_for(&self, did: &str) -> anyhow::Result<Option<(u32, u64)>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT bits, nonce FROM work WHERE did = ?1",
+                params![did],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?)
         })
     }
 
@@ -392,13 +692,21 @@ impl Store {
     pub(crate) fn first_use(&self, jti: &str, expires: i64, t: i64) -> anyhow::Result<bool> {
         self.with(|c| {
             c.execute("DELETE FROM seen_jti WHERE expires <= ?1", params![t])?;
-            Ok(c.execute("INSERT OR IGNORE INTO seen_jti (jti, expires) VALUES (?1, ?2)", params![jti, expires])? == 1)
+            Ok(c.execute(
+                "INSERT OR IGNORE INTO seen_jti (jti, expires) VALUES (?1, ?2)",
+                params![jti, expires],
+            )? == 1)
         })
     }
 
     /// Count one attempt in `bucket`. `Some(seconds)` when `limit` is exceeded: how
     /// long until the window resets. A limit with `max == 0` never trips.
-    pub(crate) fn hit(&self, bucket: &str, limit: RateLimit, t: i64) -> anyhow::Result<Option<i64>> {
+    pub(crate) fn hit(
+        &self,
+        bucket: &str,
+        limit: RateLimit,
+        t: i64,
+    ) -> anyhow::Result<Option<i64>> {
         if limit.max == 0 {
             return Ok(None);
         }
@@ -428,18 +736,48 @@ mod tests {
     #[test]
     fn rate_limit_windows() {
         let s = store();
-        let limit = RateLimit { max: 2, window_secs: 60 };
+        let limit = RateLimit {
+            max: 2,
+            window_secs: 60,
+        };
         assert_eq!(s.hit("login|1.2.3.4", limit, 1000).unwrap(), None);
         assert_eq!(s.hit("login|1.2.3.4", limit, 1001).unwrap(), None);
-        assert_eq!(s.hit("login|1.2.3.4", limit, 1002).unwrap(), Some(58), "third try in the window is refused");
-        assert_eq!(s.hit("login|9.9.9.9", limit, 1002).unwrap(), None, "other callers are not affected");
-        assert_eq!(s.hit("login|1.2.3.4", limit, 1060).unwrap(), None, "the window has passed");
+        assert_eq!(
+            s.hit("login|1.2.3.4", limit, 1002).unwrap(),
+            Some(58),
+            "third try in the window is refused"
+        );
+        assert_eq!(
+            s.hit("login|9.9.9.9", limit, 1002).unwrap(),
+            None,
+            "other callers are not affected"
+        );
+        assert_eq!(
+            s.hit("login|1.2.3.4", limit, 1060).unwrap(),
+            None,
+            "the window has passed"
+        );
         // Buckets with longer windows are not swept by shorter ones.
-        let hour = RateLimit { max: 1, window_secs: 3600 };
+        let hour = RateLimit {
+            max: 1,
+            window_secs: 3600,
+        };
         assert_eq!(s.hit("register|1.2.3.4", hour, 2000).unwrap(), None);
         assert_eq!(s.hit("login|1.2.3.4", limit, 2100).unwrap(), None);
         assert_eq!(s.hit("register|1.2.3.4", hour, 2100).unwrap(), Some(3500));
-        assert_eq!(s.hit("anything", RateLimit { max: 0, window_secs: 1 }, 0).unwrap(), None, "max 0 disables");
+        assert_eq!(
+            s.hit(
+                "anything",
+                RateLimit {
+                    max: 0,
+                    window_secs: 1
+                },
+                0
+            )
+            .unwrap(),
+            None,
+            "max 0 disables"
+        );
     }
 
     #[test]
@@ -447,18 +785,41 @@ mod tests {
         let s = store();
         assert!(s.first_use("j1", 100, 50).unwrap());
         assert!(!s.first_use("j1", 100, 60).unwrap(), "seen before");
-        assert!(s.first_use("j1", 100, 100).unwrap(), "forgotten once expired");
+        assert!(
+            s.first_use("j1", 100, 100).unwrap(),
+            "forgotten once expired"
+        );
 
         assert!(s.totp("did:kith:a").unwrap().is_none());
-        let rec = TotpRecord { secret: vec![1, 2, 3], confirmed: false, last_step: 7, failures: 4, locked_until: 0 };
+        let rec = TotpRecord {
+            secret: vec![1, 2, 3],
+            confirmed: false,
+            last_step: 7,
+            failures: 4,
+            locked_until: 0,
+        };
         s.put_totp("did:kith:a", &rec).unwrap();
         let back = s.totp("did:kith:a").unwrap().unwrap();
-        assert_eq!((back.secret, back.confirmed, back.last_step, back.failures), (vec![1, 2, 3], false, 7, 4));
-        s.put_totp("did:kith:a", &TotpRecord { locked_until: 99, ..rec }).unwrap();
+        assert_eq!(
+            (back.secret, back.confirmed, back.last_step, back.failures),
+            (vec![1, 2, 3], false, 7, 4)
+        );
+        s.put_totp(
+            "did:kith:a",
+            &TotpRecord {
+                locked_until: 99,
+                ..rec
+            },
+        )
+        .unwrap();
         assert_eq!(s.totp("did:kith:a").unwrap().unwrap().locked_until, 99);
 
         let a = s.cosigner_or_create("did:kith:a").unwrap();
-        assert_eq!(s.cosigner_or_create("did:kith:a").unwrap().id, a.id, "created once");
+        assert_eq!(
+            s.cosigner_or_create("did:kith:a").unwrap().id,
+            a.id,
+            "created once"
+        );
         assert_eq!(s.cosigner("did:kith:a").unwrap().unwrap().id, a.id);
         assert!(s.cosigner("did:kith:b").unwrap().is_none());
     }
@@ -469,9 +830,17 @@ mod tests {
         s.grant("did:kith:a", "app", ["openid", "email"]).unwrap();
         s.grant("did:kith:a", "app", ["openid", "groups"]).unwrap();
         s.grant("did:kith:a", "other", ["openid"]).unwrap();
-        assert_eq!(s.granted_scopes("did:kith:a", "app").unwrap(), BTreeSet::from(["email".to_string(), "groups".into(), "openid".into()]));
+        assert_eq!(
+            s.granted_scopes("did:kith:a", "app").unwrap(),
+            BTreeSet::from(["email".to_string(), "groups".into(), "openid".into()])
+        );
         let all = s.grants_of("did:kith:a").unwrap();
-        assert_eq!(all.iter().map(|g| (g.0.as_str(), g.1.len())).collect::<Vec<_>>(), vec![("app", 3), ("other", 1)]);
+        assert_eq!(
+            all.iter()
+                .map(|g| (g.0.as_str(), g.1.len()))
+                .collect::<Vec<_>>(),
+            vec![("app", 3), ("other", 1)]
+        );
         assert_eq!(s.revoke_grant("did:kith:a", "app").unwrap(), 3);
         assert!(s.granted_scopes("did:kith:a", "app").unwrap().is_empty());
         assert_eq!(s.grants_of("did:kith:b").unwrap(), vec![]);

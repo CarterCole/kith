@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Signed out · Kith</title>
+<title>Signed out · {{BRAND}}</title>
 <style nonce="{{NONCE}}">{{STYLE}}</style>
 </head>
 <body>
 <main>
-  <div class="brand">Kith</div>
+  <div class="brand">{{BRAND}}</div>
   <h1>Signed out</h1>
   <p id="text">Signing you out of your apps…</p>
   <div id="frames" class="hidden"></div>
@@ -22,7 +22,7 @@ function finish() {
   if (finished) return;
   finished = true;
   if (D.redirect) location.replace(D.redirect);
-  else $("text").textContent = "You are signed out of the Kith hub.";
+  else $("text").textContent = "You are signed out of {{BRAND}}.";
 }
 for (const src of D.frames) {
   const f = document.createElement("iframe");

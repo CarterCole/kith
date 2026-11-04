@@ -460,7 +460,163 @@ curl -s -X DELETE -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
   "https://id.example.com/v1/admin/identities/did:kith:…/sessions"
 ```
 
-## 7.11 Not yet implemented
+## 7.11 Browser sign-up
+
+A hub started with `--signup` lets anyone create an identity at `GET /signup`, with a
+passkey and nothing else. It is off by default: it turns a hub into an open registry.
+
+```
+Browser  POST /v1/signup                        → {id, handle, rp_id}
+         navigator.credentials.create({ user.id = handle, ES256, resident key })
+         POST /v1/signup/{id}/key {key, recovery_key}
+                                                → {message}   the inception to sign
+         navigator.credentials.get({ challenge = SHA-256(message) })
+         POST /v1/signup/{id}/sig {sig}         → {did}
+```
+
+The identity the hub records:
+- `manage`: the new passkey, alone.
+- `next`: the digest of a policy naming one **recovery key**. The browser generates it
+  (ECDSA P-256) and offers it as a file to download before the passkey exists; the hub
+  only ever receives its public `did:key`.
+- one device, the passkey, `kind: passkey`, `aal: 2`, `caps: [session, alias]`,
+  `rp_id` the hub's, named `passkey`.
+
+The passkey signs the inception itself with a WebAuthn assertion, which satisfies both
+the manage policy and the device's proof of possession (§1.6). The hub checks the
+assertion as it checks a login (its RP id, its origins), then the log as it checks any
+`PUT /v1/kel/{did}`. It holds no key for the identity.
+
+Nothing personal goes into the log, which is public and mirrored: not a name, not an
+email address. The name the visitor types is the passkey's label on their own device
+and is never sent.
+
+**User handle.** A passkey's user handle is fixed when it is created, but the DID is a
+hash of the inception, which contains the passkey's public key. So the handle is not the
+DID, as it is for `kith passkey enroll` (§7.7). It is `h_` and 128 random bits, kept in
+the hub's store next to the DID once the identity exists. `POST /oauth/login` accepts
+either as `did` and resolves a handle before anything else. An app never sees a handle:
+`sub` is the DID (or its pairwise form).
+
+**Account page.** `GET /whoami` shows who this browser is signed in as. It works with or
+without `--signup`.
+- Signed out, it asks for a passkey (username-less, as the login page does) and posts
+  `{challenge_id, did, factors}` to `POST /whoami`. `did` may be a handle. The hub checks
+  the factors as `/oauth/login` does, but one of the identity's devices must have signed:
+  the page is open to anyone, so a one-time code alone is refused. On success it starts
+  the ordinary hub session (§7.6), so apps the person then visits get SSO. A failed
+  attempt returns a fresh challenge. The endpoint shares `/oauth/login`'s rate limit.
+- Signed in, it shows the DID, the devices in the log (and which one signed in), the
+  session's assurance level and expiry, and what the hub keeps about the identity: a
+  verified email, provider accounts linked to it, and its work (§7.12). It never shows
+  the handle. "Sign out" is `GET /oauth/logout`.
+- The session holds only while the device it signed in with is still in the log, as for
+  SSO. `GET /` sends a signed-in browser here, and anyone else to `/signup` (with
+  `--signup`). The sign-up page ends here unless an app sent the visitor.
+
+**Limits.**
+- `POST /v1/signup` is rate limited per client address (default 5 an hour), and at
+  most 1000 sign-ups are in progress at once. Each lasts 10 minutes.
+- Both the log (`kels/`) and the handle (`hub.sqlite`) are needed to sign in; back up
+  both.
+- The identity has one device. There is no browser page to add another passkey or to
+  use the recovery key: adding a device needs the manage key's signature, and that is
+  the passkey, which the CLI can't produce. Until those exist, losing the passkey
+  loses the account.
+- The identity has no name or email attribute, so tokens carry no `name` or `email`
+  claim. Attributes come from the directory (§4.3) or an upstream provider (§7.8).
+
+The page loses nothing if the visitor skips the download, but the recovery key can't be
+made again.
+
+**Choosing the recovery key.** The hub only needs a public `did:key`, so the page offers
+three sources and the hub cannot tell them apart:
+1. **A generated key.** The browser makes a P-256 key and offers its private half as a
+   file.
+2. **Secret words.** The key is derived from words the visitor chooses, so nothing needs
+   saving but the words. The derivation is fixed so it can be redone anywhere:
+   ```
+   phrase = NFKD(words), lower-cased, split on whitespace, joined with one space
+   seed   = PBKDF2-HMAC-SHA-256(phrase, salt = "kith/recovery/p256/v1", 600000 rounds, 64 bytes)
+   d      = (seed as a big-endian integer) mod (n − 1) + 1      n = the P-256 group order
+   key    = did:key of the point d·G
+   ```
+   The page requires at least 5 words. The salt is fixed, so an attacker can try
+   guesses against any account: the digest of the recovery key is public in the log.
+   Six random words is a sensible floor; a short or familiar phrase will be found.
+3. **A public key brought from elsewhere** (P-256, Ed25519 or secp256k1 as a `did:key`),
+   derived or stored however the visitor likes. `POST /v1/signup/check` and an optional
+   `recovery_key` on `POST /v1/signup` let the page vet it before a passkey exists.
+
+In every case the hub receives the public key only, and the log holds only the digest of
+the policy naming it until a rotation reveals the key.
+
+**Sign-up through a provider.** With `--signup` and an upstream provider configured
+(§7.8), a login from a provider account that no identity links is not refused. The
+hub makes a **ticket**: the verified `{iss}#{sub}`, the login request that started it,
+and the attributes the provider is trusted for. It redirects to
+`/signup?ticket=…` and sets the ticket in an `HttpOnly` cookie. The sign-up above then
+runs unchanged, so the account still gets a passkey as its manage key and a recovery
+key, and the hub still holds no key for it.
+- `POST /v1/signup` takes `{ticket}` and accepts it only when the cookie holds the same
+  value, once, within 15 minutes. The ticket is a bearer value in a URL; without the
+  cookie, anyone who saw the URL could link someone else's provider account to their
+  own passkey.
+- When the passkey's signature is accepted, the hub records `{iss}#{sub}` → the new DID
+  in its own store, then writes the log. If writing the log fails the link is removed.
+  An account already linked is refused (`409`).
+- The link is **not** written into the identity's log, which is public and mirrored: it
+  would publish a provider account number next to the DID. The hub is the only party
+  that can check provider evidence, and it already issues the tokens, so this widens no
+  trust. `kith alias link` still links an account in the log (§5.1); either kind signs
+  the identity in, and a session ends when no link of either kind remains.
+- The reply carries `redirect` and a session cookie when the hub could finish the sign-in
+  the app started: the provider account signs in at AAL1 (`amr: fed`), the same as an
+  existing identity would. Otherwise (the request expired, or it asks for more than
+  AAL1) the person signs in with the passkey.
+- The next login from that provider account signs in to that identity.
+- Someone who typed an identity before choosing the provider is signing in, not signing
+  up, and still gets the "not linked" page.
+
+Not done: unlinking a provider account made this way, or linking another from a signed-in
+session. Provider attributes (name, email) apply to the session that provided them and
+are not stored.
+
+## 7.12 Work
+
+An identity can show it cost someone compute. This is a score, not a credential: it says
+nothing about who the holder is, only that effort was spent on this identity.
+
+A **proof** for `did` is a 64-bit `nonce` such that
+
+```
+SHA-256( "kith/work/v1" ‖ 0x00 ‖ did ‖ 0x00 ‖ nonce as 8 bytes, big-endian )
+```
+
+starts with many zero bits. The count of leading zero bits is the **work** of the proof.
+Each extra bit doubles the expected effort, so work grows with the logarithm of the time
+spent, and one hash checks a proof. The DID is in the preimage: a proof is for one
+identity and can't be moved to another.
+
+- `POST /v1/work {did, nonce}` records the proof if it has at least 12 bits and beats
+  the one on record. Anyone may submit; it can only raise that identity's work. The
+  identity must exist on the hub. It is rate limited per client address (default 120 a
+  minute). The reply is `{bits, work}`.
+- `GET /v1/work/{did}` returns `{did, work, nonce}`, so anyone can check the record.
+- Access tokens carry the attribute `work` (0 when none), next to `aal`. Group rules
+  and policies can use it: `principal.work >= 24`. The name is reserved, so an upstream
+  provider can't set it (§7.8). An ID token includes `work` when the `work` scope is
+  requested.
+- The browser sign-up page offers to mine for the new account, and `kith work` does the
+  same on all cores of a machine.
+
+Limits:
+- It prices bulk account creation; it doesn't prove a person. Someone with GPUs buys more
+  work per second than a phone does, and a policy that gates on `work` should expect it.
+- Bits are not comparable between hubs unless the hubs agree to trust each other's
+  records; the proof itself is portable, since anyone can recheck it.
+
+## 7.13 Not yet implemented
 
 - A page for the user to review and withdraw remembered consent (the admin API can).
 - Open client registration, and the registration management endpoint (RFC 7592).
@@ -470,4 +626,6 @@ curl -s -X DELETE -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
 - Pushed authorization requests (PAR), DPoP-bound tokens.
 - `claims` request parameter; request objects (JAR).
 - TOTP enrollment from the browser (CLI only today).
+- Adding a passkey, and recovery with the recovery key, for an identity created in the
+  browser (§7.11); profile attributes and email verification for it.
 - Editing clients, and an audit log, through the admin API.

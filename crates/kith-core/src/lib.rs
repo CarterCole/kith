@@ -41,5 +41,6 @@ pub mod totp;
 pub mod util;
 pub mod vault;
 pub mod webauthn;
+pub mod work;
 
 pub use error::{Error, Result};

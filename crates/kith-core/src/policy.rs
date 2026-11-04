@@ -20,7 +20,10 @@ use crate::{Error, Result};
 #[serde(untagged)]
 pub enum SignerPolicy {
     Signer(String),
-    Threshold { threshold: usize, of: Vec<SignerPolicy> },
+    Threshold {
+        threshold: usize,
+        of: Vec<SignerPolicy>,
+    },
 }
 
 impl SignerPolicy {
@@ -37,7 +40,10 @@ impl SignerPolicy {
             SignerPolicy::Signer(id) => crate::keys::SignerRef::parse(id).map(|_| ()),
             SignerPolicy::Threshold { threshold, of } => {
                 if *threshold == 0 || *threshold > of.len() {
-                    return Err(Error::Kel(format!("threshold {threshold} of {} is unsatisfiable", of.len())));
+                    return Err(Error::Kel(format!(
+                        "threshold {threshold} of {} is unsatisfiable",
+                        of.len()
+                    )));
                 }
                 of.iter().try_for_each(|p| p.validate())
             }
@@ -71,7 +77,9 @@ impl SignerPolicy {
 
     /// Commitment used for pre-rotation: `base64url(SHA-256(canonical JSON))`.
     pub fn digest(&self) -> String {
-        b64u(sha256(crate::canon::canonical_of(self).expect("policy is canonicalizable")))
+        b64u(sha256(
+            crate::canon::canonical_of(self).expect("policy is canonicalizable"),
+        ))
     }
 }
 
@@ -91,7 +99,14 @@ mod tests {
             1,
             vec![
                 SignerPolicy::single(&ledger),
-                SignerPolicy::threshold(2, vec![SignerPolicy::single(&a), SignerPolicy::single(&b), SignerPolicy::single(&c)]),
+                SignerPolicy::threshold(
+                    2,
+                    vec![
+                        SignerPolicy::single(&a),
+                        SignerPolicy::single(&b),
+                        SignerPolicy::single(&c),
+                    ],
+                ),
             ],
         );
         p.validate().unwrap();
@@ -107,6 +122,8 @@ mod tests {
     #[test]
     fn rejects_bad_threshold() {
         let a = LocalSigner::generate(KeyType::Ed25519).id;
-        assert!(SignerPolicy::threshold(2, vec![SignerPolicy::single(a)]).validate().is_err());
+        assert!(SignerPolicy::threshold(2, vec![SignerPolicy::single(a)])
+            .validate()
+            .is_err());
     }
 }

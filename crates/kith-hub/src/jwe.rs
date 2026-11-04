@@ -31,7 +31,9 @@ pub enum Secret {
 }
 
 fn bytes(k: &Value, name: &str) -> anyhow::Result<Vec<u8>> {
-    let s = k[name].as_str().ok_or_else(|| anyhow::anyhow!("JWK has no {name}"))?;
+    let s = k[name]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("JWK has no {name}"))?;
     Ok(b64u_decode(s)?)
 }
 
@@ -46,11 +48,24 @@ pub fn recipient_key(jwks: &Value, alg: &str, enc: &str) -> anyhow::Result<Recip
         "ECDH-ES" => ("EC", json!("P-256")),
         _ => anyhow::bail!("id_token_encrypted_response_alg must be RSA-OAEP-256 or ECDH-ES"),
     };
-    let fits = |k: &&Value| k["kty"] == kty && (crv.is_null() || k["crv"] == crv) && k["use"] != "sig" && (k["alg"].is_null() || k["alg"] == alg);
-    let k = jwks["keys"].as_array().and_then(|keys| keys.iter().find(fits)).ok_or_else(|| anyhow::anyhow!("jwks has no {kty} key to encrypt ID tokens to with {alg}"))?;
+    let fits = |k: &&Value| {
+        k["kty"] == kty
+            && (crv.is_null() || k["crv"] == crv)
+            && k["use"] != "sig"
+            && (k["alg"].is_null() || k["alg"] == alg)
+    };
+    let k = jwks["keys"]
+        .as_array()
+        .and_then(|keys| keys.iter().find(fits))
+        .ok_or_else(|| {
+            anyhow::anyhow!("jwks has no {kty} key to encrypt ID tokens to with {alg}")
+        })?;
     let kid = k["kid"].as_str().map(String::from);
     if kty == "RSA" {
-        let key = RsaPublicKey::new(BigUint::from_bytes_be(&bytes(k, "n")?), BigUint::from_bytes_be(&bytes(k, "e")?))?;
+        let key = RsaPublicKey::new(
+            BigUint::from_bytes_be(&bytes(k, "n")?),
+            BigUint::from_bytes_be(&bytes(k, "e")?),
+        )?;
         if key.n().bits() < MIN_RSA_BITS {
             anyhow::bail!("RSA encryption keys must be at least {MIN_RSA_BITS} bits");
         }
@@ -60,8 +75,13 @@ pub fn recipient_key(jwks: &Value, alg: &str, enc: &str) -> anyhow::Result<Recip
     if x.len() != 32 || y.len() != 32 {
         anyhow::bail!("malformed P-256 key");
     }
-    let point = p256::EncodedPoint::from_affine_coordinates(x.as_slice().into(), y.as_slice().into(), false);
-    let key = Option::<p256::PublicKey>::from(p256::PublicKey::from_encoded_point(&point)).ok_or_else(|| anyhow::anyhow!("P-256 key is not on the curve"))?;
+    let point = p256::EncodedPoint::from_affine_coordinates(
+        x.as_slice().into(),
+        y.as_slice().into(),
+        false,
+    );
+    let key = Option::<p256::PublicKey>::from(p256::PublicKey::from_encoded_point(&point))
+        .ok_or_else(|| anyhow::anyhow!("P-256 key is not on the curve"))?;
     Ok(Recipient::P256(key, kid))
 }
 
@@ -96,10 +116,16 @@ pub fn encrypt(to: &Recipient, plaintext: &[u8]) -> anyhow::Result<String> {
             header["kid"] = json!(kid);
             let eph = p256::ecdh::EphemeralSecret::random(&mut rng);
             let point = eph.public_key().to_encoded_point(false);
-            let (x, y) = point.x().zip(point.y()).ok_or_else(|| anyhow::anyhow!("ephemeral key has no coordinates"))?;
+            let (x, y) = point
+                .x()
+                .zip(point.y())
+                .ok_or_else(|| anyhow::anyhow!("ephemeral key has no coordinates"))?;
             header["epk"] = json!({"kty": "EC", "crv": "P-256", "x": b64u(x), "y": b64u(y)});
             // Direct agreement: the derived key is the content key, and no key is sent.
-            (concat_kdf(eph.diffie_hellman(key).raw_secret_bytes(), "A256GCM"), vec![])
+            (
+                concat_kdf(eph.diffie_hellman(key).raw_secret_bytes(), "A256GCM"),
+                vec![],
+            )
         }
     };
     if header["kid"].is_null() {
@@ -109,10 +135,22 @@ pub fn encrypt(to: &Recipient, plaintext: &[u8]) -> anyhow::Result<String> {
     let mut iv = [0u8; 12];
     rng.fill_bytes(&mut iv);
     let sealed = Aes256Gcm::new(&cek.into())
-        .encrypt(&Nonce::from(iv), Payload { msg: plaintext, aad: protected.as_bytes() })
+        .encrypt(
+            &Nonce::from(iv),
+            Payload {
+                msg: plaintext,
+                aad: protected.as_bytes(),
+            },
+        )
         .map_err(|_| anyhow::anyhow!("encryption failed"))?;
     let (ciphertext, tag) = sealed.split_at(sealed.len() - 16);
-    Ok(format!("{protected}.{}.{}.{}.{}", b64u(encrypted_key), b64u(iv), b64u(ciphertext), b64u(tag)))
+    Ok(format!(
+        "{protected}.{}.{}.{}.{}",
+        b64u(encrypted_key),
+        b64u(iv),
+        b64u(ciphertext),
+        b64u(tag)
+    ))
 }
 
 /// Decrypt a compact JWE made by [`encrypt`] (or by any client using the same
@@ -127,25 +165,43 @@ pub fn decrypt(jwe: &str, key: &Secret) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("unsupported enc");
     }
     let cek: [u8; 32] = match (header["alg"].as_str(), key) {
-        (Some("RSA-OAEP-256"), Secret::Rsa(k)) => {
-            k.decrypt(Oaep::new::<Sha256>(), &b64u_decode(encrypted_key)?)?.try_into().map_err(|_| anyhow::anyhow!("content key has the wrong length"))?
-        }
+        (Some("RSA-OAEP-256"), Secret::Rsa(k)) => k
+            .decrypt(Oaep::new::<Sha256>(), &b64u_decode(encrypted_key)?)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("content key has the wrong length"))?,
         (Some("ECDH-ES"), Secret::P256(k)) => {
             let (x, y) = (bytes(&header["epk"], "x")?, bytes(&header["epk"], "y")?);
             if x.len() != 32 || y.len() != 32 {
                 anyhow::bail!("malformed epk");
             }
-            let point = p256::EncodedPoint::from_affine_coordinates(x.as_slice().into(), y.as_slice().into(), false);
-            let epk = Option::<p256::PublicKey>::from(p256::PublicKey::from_encoded_point(&point)).ok_or_else(|| anyhow::anyhow!("epk is not on the curve"))?;
-            concat_kdf(p256::ecdh::diffie_hellman(k.to_nonzero_scalar(), epk.as_affine()).raw_secret_bytes(), "A256GCM")
+            let point = p256::EncodedPoint::from_affine_coordinates(
+                x.as_slice().into(),
+                y.as_slice().into(),
+                false,
+            );
+            let epk = Option::<p256::PublicKey>::from(p256::PublicKey::from_encoded_point(&point))
+                .ok_or_else(|| anyhow::anyhow!("epk is not on the curve"))?;
+            concat_kdf(
+                p256::ecdh::diffie_hellman(k.to_nonzero_scalar(), epk.as_affine())
+                    .raw_secret_bytes(),
+                "A256GCM",
+            )
         }
         _ => anyhow::bail!("alg does not match the key"),
     };
     let mut sealed = b64u_decode(ciphertext)?;
     sealed.extend(b64u_decode(tag)?);
-    let iv: [u8; 12] = b64u_decode(iv)?.try_into().map_err(|_| anyhow::anyhow!("malformed iv"))?;
+    let iv: [u8; 12] = b64u_decode(iv)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("malformed iv"))?;
     Aes256Gcm::new(&cek.into())
-        .decrypt(&Nonce::from(iv), Payload { msg: &sealed, aad: protected.as_bytes() })
+        .decrypt(
+            &Nonce::from(iv),
+            Payload {
+                msg: &sealed,
+                aad: protected.as_bytes(),
+            },
+        )
         .map_err(|_| anyhow::anyhow!("decryption failed"))
 }
 
@@ -166,12 +222,27 @@ mod tests {
         let rsa_jwk = json!({"kty": "RSA", "n": b64u(rsa.n().to_bytes_be()), "e": b64u(rsa.e().to_bytes_be()), "kid": "rsa-1"});
         let jwks = json!({"keys": [sig_only, rsa_jwk, p256_jwk(&ec)]});
 
-        for (alg, secret) in [("RSA-OAEP-256", Secret::Rsa(Box::new(rsa.clone()))), ("ECDH-ES", Secret::P256(ec.clone()))] {
+        for (alg, secret) in [
+            ("RSA-OAEP-256", Secret::Rsa(Box::new(rsa.clone()))),
+            ("ECDH-ES", Secret::P256(ec.clone())),
+        ] {
             let to = recipient_key(&jwks, alg, "A256GCM").unwrap();
             let jwe = encrypt(&to, b"a.signed.jwt").unwrap();
-            let header: Value = serde_json::from_slice(&b64u_decode(jwe.split('.').next().unwrap()).unwrap()).unwrap();
-            assert_eq!((header["alg"].as_str(), header["enc"].as_str(), header["cty"].as_str()), (Some(alg), Some("A256GCM"), Some("JWT")));
-            assert_eq!(header["kid"], if alg == "ECDH-ES" { "ec-1" } else { "rsa-1" });
+            let header: Value =
+                serde_json::from_slice(&b64u_decode(jwe.split('.').next().unwrap()).unwrap())
+                    .unwrap();
+            assert_eq!(
+                (
+                    header["alg"].as_str(),
+                    header["enc"].as_str(),
+                    header["cty"].as_str()
+                ),
+                (Some(alg), Some("A256GCM"), Some("JWT"))
+            );
+            assert_eq!(
+                header["kid"],
+                if alg == "ECDH-ES" { "ec-1" } else { "rsa-1" }
+            );
             assert_eq!(decrypt(&jwe, &secret).unwrap(), b"a.signed.jwt");
 
             // The header is authenticated, and so is the ciphertext.
@@ -180,7 +251,11 @@ mod tests {
             assert!(decrypt(&parts.join("."), &secret).is_err());
         }
         let other = Secret::P256(p256::SecretKey::random(&mut rand::rngs::OsRng));
-        assert!(decrypt(&encrypt(&recipient_key(&jwks, "ECDH-ES", "A256GCM").unwrap(), b"x").unwrap(), &other).is_err());
+        assert!(decrypt(
+            &encrypt(&recipient_key(&jwks, "ECDH-ES", "A256GCM").unwrap(), b"x").unwrap(),
+            &other
+        )
+        .is_err());
     }
 
     #[test]
