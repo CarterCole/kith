@@ -441,6 +441,8 @@ mod tests {
 
     /// §4.2: the text of a stringified number is ECMAScript `Number::toString`.
     #[test]
+    // The literals are exact doubles, chosen to sit on ties; truncating them changes the case.
+    #[allow(clippy::excessive_precision)]
     fn number_text_is_ecmascript_number_to_string() {
         for (f, text) in [
             (12.5, "12.5"),
