@@ -15,7 +15,7 @@
 //! | `GET, POST /oauth/consent`                | consent page, and its Allow / Deny decision     |
 //! | `POST /oauth/register`                    | dynamic client registration (RFC 7591), if enabled |
 //! | `GET  /oauth/upstream/{id}/start`, `…/callback` | sign in through Telegram or another upstream OIDC provider (see [`upstream`]) |
-//! | `POST /oauth/token`                       | code, refresh and RFC 8693 token exchange       |
+//! | `POST /oauth/token`                       | code, refresh and RFC 8693 token exchange; `account_attestation` with the `linked_account` scope |
 //! | `GET  /oauth/userinfo`                    | OIDC userinfo                                   |
 //! | `GET  /oauth/logout`                      | RP-initiated logout                             |
 //! | `GET/PUT /v1/kel/{did}`                   | fetch / append a key event log                  |

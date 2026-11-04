@@ -42,7 +42,7 @@ implementation runs the same files, so a change to behaviour changes a vector fi
 | File | Run by | Regenerate with |
 |------|--------|-----------------|
 | `authz.json` | Rust, JS, Python | edit by hand |
-| `tokens.json` | Rust, JS, Python | `node scripts/token-vectors.mjs` |
+| `tokens.json`, `attestations.json` | Rust, JS, Python | `node scripts/token-vectors.mjs` |
 | `policy-dag.json`, `beacons.json` | Rust, JS | `KITH_WRITE_VECTORS=1 cargo test -p kith-core --test policy_dag_vectors` |
 | `ots.json` | Rust | from the reference client's examples |
 | `sshsig.json` | Rust | `node scripts/sshsig-vectors.mjs` (needs `ssh-keygen`) |

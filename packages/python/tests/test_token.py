@@ -51,6 +51,25 @@ def test_token_vectors(case):
         assert getattr(got, name) == want, name
 
 
+ATTESTATIONS = json.loads((Path(__file__).parents[3] / "spec/test-vectors/attestations.json").read_text())
+
+
+@pytest.mark.parametrize("case", ATTESTATIONS["cases"], ids=lambda c: c["name"])
+def test_attestation_vectors(case):
+    """An app accepts "this is that Facebook account" if and only if the vector says so (spec 7.8.1)."""
+    from kith import AttestationVerifier
+
+    v = ATTESTATIONS
+    verifier = AttestationVerifier(v["issuer"], v["audience"], jwks=v["jwks"], leeway=v["leeway"], now=lambda: v["now"])
+    if not case["valid"]:
+        with pytest.raises(KithAuthError):
+            verifier.verify(case["token"])
+        return
+    got = verifier.verify(case["token"])
+    for name, want in case.get("claims", {}).items():
+        assert getattr(got, name) == want, name
+
+
 def test_bearer_token_reads_the_header_the_same_way_as_js():
     from kith import bearer_token
 

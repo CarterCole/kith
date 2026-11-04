@@ -102,3 +102,63 @@ writeFileSync(
   ) + "\n",
 );
 console.log(`${cases.length} cases (${cases.filter((c) => c.valid).length} valid) -> ${OUT}`);
+
+// Account attestations (spec section 7.8.1): the hub saying which upstream account signed
+// in. Same keys and clock. The audience is the OAuth client it was issued to.
+const ATTEST_OUT = join(dirname(OUT), "attestations.json");
+const CLIENT = "app";
+const attHeader = { typ: "kith-account+jwt", alg: "EdDSA", kid: "k1" };
+const att = {
+  iss: ISSUER, aud: CLIENT, sub: "did:kith:ada", iat: NOW - 10, exp: NOW + 890, jti: "att-1",
+  provider: "facebook", provider_iss: "https://www.facebook.com", account: "1029384756", verified_at: NOW - 30,
+};
+const attWithout = (k) => Object.fromEntries(Object.entries(att).filter(([name]) => name !== k));
+const attExpect = { sub: att.sub, provider: att.provider, provider_iss: att.provider_iss, account: att.account, verified_at: att.verified_at, jti: att.jti };
+const attGood = mint(att, attHeader);
+const [ah0, ap0, as0] = attGood.split(".");
+
+const attestations = [
+  { name: "a good attestation", token: attGood, valid: true, claims: attExpect },
+  { name: "typ application/kith-account+jwt is the same type", token: mint(att, { ...attHeader, typ: "application/kith-account+jwt" }), valid: true, claims: attExpect },
+  { name: "typ in upper case", token: mint(att, { ...attHeader, typ: "KITH-ACCOUNT+JWT" }), valid: true, claims: attExpect },
+  { name: "expired 59 s ago, inside the leeway", token: mint({ ...att, exp: NOW - 59 }, attHeader), valid: true, claims: attExpect },
+  { name: "expired 60 s ago", token: mint({ ...att, exp: NOW - 60 }, attHeader), valid: false },
+  { name: "issued 61 s from now", token: mint({ ...att, iat: NOW + 61 }, attHeader), valid: false },
+  { name: "verified 60 s from now, inside the leeway", token: mint({ ...att, verified_at: NOW + 60 }, attHeader), valid: true, claims: { ...attExpect, verified_at: NOW + 60 } },
+  { name: "verified 61 s from now", token: mint({ ...att, verified_at: NOW + 61 }, attHeader), valid: false },
+  ...["iss", "aud", "sub", "iat", "exp", "jti", "provider", "provider_iss", "account", "verified_at"].map((k) => ({ name: `no ${k}`, token: mint(attWithout(k), attHeader), valid: false })),
+  ...["sub", "jti", "provider", "provider_iss", "account"].map((k) => ({ name: `empty ${k}`, token: mint({ ...att, [k]: "" }, attHeader), valid: false })),
+  { name: "account is not a string", token: mint({ ...att, account: 1029384756 }, attHeader), valid: false },
+  { name: "verified_at is not a number", token: mint({ ...att, verified_at: "yesterday" }, attHeader), valid: false },
+  { name: "another issuer", token: mint({ ...att, iss: "https://evil.example" }, attHeader), valid: false },
+  { name: "another client", token: mint({ ...att, aud: "other" }, attHeader), valid: false },
+  { name: "audience in a list", token: mint({ ...att, aud: [CLIENT] }, attHeader), valid: false },
+  { name: "an access token, even with every attestation claim", token: mint(att, header), valid: false },
+  { name: "typ JWT, the way an ID token is typed", token: mint(att, { ...attHeader, typ: "JWT" }), valid: false },
+  { name: "no typ", token: mint(att, { alg: "EdDSA", kid: "k1" }), valid: false },
+  { name: "alg none, no signature", token: `${enc({ ...attHeader, alg: "none" })}.${ap0}.`, valid: false },
+  { name: "alg HS256 over the same input", token: `${enc({ ...attHeader, alg: "HS256" })}.${ap0}.${as0}`, valid: false },
+  { name: "a kid the JWKS does not have", token: mint(att, { ...attHeader, kid: "k2" }), valid: false },
+  { name: "no kid", token: mint(att, { typ: attHeader.typ, alg: "EdDSA" }), valid: false },
+  { name: "signed by another key under the right kid", token: mint(att, attHeader, stranger), valid: false },
+  { name: "another account swapped in after signing", token: `${ah0}.${enc({ ...att, account: "1" })}.${as0}`, valid: false },
+];
+
+writeFileSync(
+  ATTEST_OUT,
+  JSON.stringify(
+    {
+      description:
+        "Account attestation vectors (spec 7.8.1). Verify `token` against `jwks` as of `now` for `issuer` and `audience` (the client id), with `leeway` seconds of clock tolerance. Accept if and only if `valid`; for accepted tokens, `claims` are values the verifier must return.",
+      now: NOW,
+      leeway: LEEWAY,
+      issuer: ISSUER,
+      audience: CLIENT,
+      jwks: { keys: [jwk] },
+      cases: attestations,
+    },
+    null,
+    2,
+  ) + "\n",
+);
+console.log(`${attestations.length} cases (${attestations.filter((c) => c.valid).length} valid) -> ${ATTEST_OUT}`);

@@ -6,6 +6,14 @@ behaviour, not a promise about compatibility. Versions follow the workspace vers
 
 ## Unreleased
 
+### Added
+
+- **Account attestations.** With the `linked_account` scope, an upstream login returns
+  `account_attestation`, a hub-signed JWT naming the account that signed in (spec
+  §7.8.1), with verifiers in Rust, JS and Python and shared vectors.
+- **Facebook as an upstream provider**: `Upstream::facebook`, and `token_request: "get"`
+  for its code exchange. Not yet run against Facebook itself.
+
 An audit of all three implementations, and the fixes that came out of it. Each fix has a
 test that failed before it. The audit items that are still open are listed in
 [`docs/roadmap.md`](docs/roadmap.md#still-open-from-the-october-2026-audit).

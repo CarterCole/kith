@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
@@ -21,9 +21,10 @@ use kith_core::keys::{KeyType, LocalSigner, SecretKey, VerifyOptions};
 use kith_core::policy::SignerPolicy;
 use kith_core::session::{DeviceSigner, SessionKey};
 use kith_core::util::{b64u, now, random_id, sha256};
+use kith_core::token::verify_account_attestation;
 use kith_core::{jws, totp};
 use kith_hub::oidc::{Consent, Client, RsaSigner, SubjectType};
-use kith_hub::upstream::{verify_id_token, Upstream};
+use kith_hub::upstream::{verify_id_token, TokenRequest, Upstream};
 use kith_hub::{Hub, HubConfig, TT_SESSION};
 
 const ISSUER: &str = "http://localhost:7777";
@@ -31,6 +32,8 @@ const APP_CB: &str = "http://localhost:3000/cb";
 const BOT_ID: &str = "7000000001";
 const BOT_SECRET: &str = "bot-secret";
 const TG_USER: &str = "424242";
+const FB_APP: &str = "1234567890";
+const LINKED: &str = "openid offline_access linked_account";
 
 /// What the provider remembers about a code it handed out.
 struct Issued {
@@ -71,6 +74,20 @@ async fn provider_token(State(p): State<Arc<Provider>>, headers: HeaderMap, Form
     (StatusCode::OK, Json(json!({"access_token": "at", "token_type": "Bearer", "expires_in": 300, "id_token": p.key.sign_jwt(&id).unwrap()})))
 }
 
+/// Facebook's exchange: a GET, no secret in the URL, the PKCE verifier is the proof.
+async fn provider_token_get(State(p): State<Arc<Provider>>, Query(f): Query<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
+    if f.get("client_id").map(String::as_str) != Some(FB_APP) || f.contains_key("client_secret") || !f.contains_key("redirect_uri") {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_request"})));
+    }
+    let issued = p.codes.lock().unwrap().remove(f.get("code").map(String::as_str).unwrap_or_default());
+    let Some(i) = issued.filter(|i| f.get("code_verifier").is_some_and(|v| b64u(sha256(v.as_bytes())) == i.challenge)) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_grant"})));
+    };
+    let t = now();
+    let id = json!({"iss": p.issuer, "sub": i.sub, "aud": FB_APP, "iat": t, "exp": t + 300, "nonce": i.nonce});
+    (StatusCode::OK, Json(json!({"access_token": "at", "token_type": "bearer", "expires_in": 300, "id_token": p.key.sign_jwt(&id).unwrap()})))
+}
+
 async fn start_provider() -> Arc<Provider> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let issuer = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -81,6 +98,7 @@ async fn start_provider() -> Arc<Provider> {
         .route("/.well-known/openid-configuration", get(move || async move { Json(discovery) }))
         .route("/.well-known/jwks.json", get(move || async move { Json(jwks) }))
         .route("/token", post(provider_token))
+        .route("/get-token", get(provider_token_get))
         .route("/userinfo", get(provider_userinfo))
         .with_state(p.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -568,4 +586,98 @@ async fn userinfo_attributes() {
     for reserved in ["aliases", "aal", "email_verified"] {
         assert!(Upstream { attributes: [("x".to_string(), reserved.to_string())].into(), ..p.clone() }.validate().is_err(), "{reserved}");
     }
+}
+
+/// Sign in through the provider asking for `linked_account`; the token response.
+async fn sign_in_linked(w: &World) -> Value {
+    let (verifier, challenge) = pkce();
+    let url = authorize_url(&challenge, "").replace(&enc("openid offline_access"), &enc(LINKED));
+    let page = get_(&w.app, &url, None).await;
+    let request_id = page_data(&page.text())["request_id"].as_str().unwrap().to_string();
+    let r = come_back(w, &visit_provider(w, &request_id, TG_USER, "").await).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.text());
+    redeem(w, &r.location(), &verifier).await
+}
+
+#[tokio::test]
+async fn attestation_names_the_account_that_signed_in() {
+    let mut w = world().await;
+    // Anyone can link any alias: this one was never proved, so it must not be attested.
+    w.publish(EventBody::AliasLink { alias: "https://www.facebook.com#victim".into() });
+    let before = now();
+    let tok = sign_in_linked(&w).await;
+    let att = tok["account_attestation"].as_str().expect("an attestation");
+    let c = verify_account_attestation(att, &w.hub.jwks(), ISSUER, "app", now()).unwrap();
+    assert_eq!((c.sub.as_str(), c.provider.as_str(), c.provider_iss.as_str(), c.account.as_str()), (w.did.as_str(), "telegram", w.provider.issuer.as_str(), TG_USER));
+    assert!(c.verified_at >= before);
+    assert!(verify_account_attestation(att, &w.hub.jwks(), ISSUER, "other-app", now()).is_err(), "bound to the client");
+    assert!(verify_account_attestation(tok["access_token"].as_str().unwrap(), &w.hub.jwks(), ISSUER, "app", now()).is_err(), "an access token is not one");
+
+    // A refresh says when the account was really verified, not when it was refreshed.
+    let refreshed = post_form(&w.app, "/oauth/token", &[("grant_type", "refresh_token"), ("refresh_token", tok["refresh_token"].as_str().unwrap()), ("client_id", "app")]).await.json();
+    let again = verify_account_attestation(refreshed["account_attestation"].as_str().unwrap(), &w.hub.jwks(), ISSUER, "app", now()).unwrap();
+    assert_eq!(again.verified_at, c.verified_at);
+    assert_ne!(again.jti, c.jti);
+
+    // Once the account is unlinked nothing more is said about it.
+    let alias = w.alias(TG_USER);
+    w.publish(EventBody::AliasUnlink { alias });
+    let gone = post_form(&w.app, "/oauth/token", &[("grant_type", "refresh_token"), ("refresh_token", refreshed["refresh_token"].as_str().unwrap()), ("client_id", "app")]).await;
+    assert_eq!(gone.status, StatusCode::BAD_REQUEST, "{}", gone.text());
+    assert!(gone.json()["account_attestation"].is_null());
+}
+
+#[tokio::test]
+async fn no_attestation_without_the_scope() {
+    let w = world().await;
+    let (verifier, challenge) = pkce();
+    let page = get_(&w.app, &authorize_url(&challenge, ""), None).await;
+    let request_id = page_data(&page.text())["request_id"].as_str().unwrap().to_string();
+    let r = come_back(&w, &visit_provider(&w, &request_id, TG_USER, "").await).await;
+    assert!(redeem(&w, &r.location(), &verifier).await["account_attestation"].is_null());
+}
+
+#[tokio::test]
+async fn discovery_lists_the_scope() {
+    let w = world().await;
+    let d = get_(&w.app, "/.well-known/openid-configuration", None).await.json();
+    assert!(d["scopes_supported"].as_array().unwrap().contains(&json!("linked_account")));
+}
+
+#[test]
+fn facebook_preset() {
+    let p = Upstream::facebook(FB_APP);
+    p.validate().unwrap();
+    assert_eq!(p.issuer, "https://www.facebook.com");
+    assert_eq!(p.scope, "openid");
+    assert_eq!(p.client_secret, None, "PKCE proves the exchange; a GET would put a secret in the URL");
+    assert_eq!(p.token_request, TokenRequest::Get);
+    assert_eq!(p.alias("1029384756"), "https://www.facebook.com#1029384756");
+}
+
+#[tokio::test]
+async fn facebook_style_get_exchange() {
+    let mut w = world().await;
+    let i = w.provider.issuer.clone();
+    let p = Upstream { issuer: i.clone(), authorization_endpoint: Some(format!("{i}/auth")), token_endpoint: Some(format!("{i}/get-token")), jwks_uri: Some(format!("{i}/.well-known/jwks.json")), id: "telegram".into(), ..Upstream::facebook(FB_APP) };
+    let mut cfg = w.hub.cfg.clone();
+    cfg.upstreams = vec![p];
+    let kels = (w.did.clone(), w.log.clone());
+    let hub = Hub::open(cfg).unwrap();
+    hub.put_kel(&kels.0, kels.1).unwrap();
+    w.app = kith_hub::router(hub.clone());
+    w.hub = hub;
+    let (verifier, challenge) = pkce();
+    let page = get_(&w.app, &authorize_url(&challenge, ""), None).await;
+    let request_id = page_data(&page.text())["request_id"].as_str().unwrap().to_string();
+    let r = get_(&w.app, &format!("/oauth/upstream/telegram/start?request_id={request_id}"), None).await;
+    let q = query(&r.location());
+    assert_eq!(q["client_id"], FB_APP);
+    assert_eq!(q["code_challenge_method"], "S256");
+    let code = random_id();
+    w.provider.codes.lock().unwrap().insert(code.clone(), Issued { challenge: q["code_challenge"].clone(), nonce: q["nonce"].clone(), sub: TG_USER.into() });
+    let t = Trip { state: q["state"].clone(), code, cookie: r.cookie("kith_upstream").unwrap() };
+    let back = come_back(&w, &t).await;
+    assert_eq!(back.status, StatusCode::SEE_OTHER, "{}", back.text());
+    assert!(redeem(&w, &back.location(), &verifier).await["access_token"].is_string());
 }

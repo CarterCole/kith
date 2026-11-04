@@ -69,6 +69,10 @@
     against Telegram itself.
   - Upstream attributes from the ID token and UserInfo, behind a per-provider
     allowlist.
+  - Signed account attestations (`linked_account` scope, [spec §7.8.1](../spec/07-oidc.md)):
+    the hub vouches for the upstream account a login really came through, with shared
+    vectors (`attestations.json`) in Rust, JS and Python. A Facebook preset uses its OIDC
+    code + PKCE flow. Tested against a stand-in provider, not yet against Facebook.
   - Verified in headless Chrome with a virtual authenticator against `openid-client`.
 - **Hub state and operations** ([spec §7.9–7.10](../spec/07-oidc.md)).
   - One SQLite file holds sessions, codes, refresh tokens, pending sign-in requests,
@@ -162,6 +166,11 @@
   the front-channel sign-out page is tested in process only. The wallet button on the login page has not been
   tested in a browser (the server path is tested). The Grafana config in §7.9 has not
   been tried against a real Grafana.
+- **Account attestations.** Only providers with signed ID tokens: GitHub, X and Discord
+  would need a plain OAuth path, where the hub trusts a profile API over TLS. Attestations
+  go to the client that asked; there is no form a third party can check (`aud` is the
+  client). Linking still happens from the CLI, so a user first has to fail a login to
+  learn their per-app Facebook id.
 - **Co-signer safety.** A time delay plus device notification before co-signing
   `rotate`, as did:plc does with its 72-hour window.
 - **Other.**

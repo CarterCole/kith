@@ -19,6 +19,20 @@ export interface AccessClaims {
   cap?: Capability[];
 }
 
+/** The hub's signed statement that `sub` signed in as `account` at `provider_iss` (spec 7.8.1). */
+export interface AccountAttestation {
+  iss: string;
+  sub: string;
+  aud: string;
+  iat: number;
+  exp: number;
+  jti: string;
+  provider: string;
+  provider_iss: string;
+  account: string;
+  verified_at: number;
+}
+
 export interface VerifierOptions {
   issuer: string;
   audience: string;
@@ -40,20 +54,24 @@ export class KithAuthError extends Error {
   }
 }
 
+function hubKeys(opts: VerifierOptions): JWTVerifyGetKey {
+  const jwks: JWTVerifyGetKey = opts.jwks
+    ? createLocalJWKSet(opts.jwks)
+    : createRemoteJWKSet(new URL(opts.jwksUrl ?? `${opts.issuer.replace(/\/$/, "")}/.well-known/jwks.json`));
+  // A token names its key. With one key in the set jose would pick it without a kid.
+  return (header, token) => {
+    if (typeof header.kid !== "string" || !header.kid) throw new Error('the token has no "kid"');
+    return jwks(header, token);
+  };
+}
+
 /**
  * A verifier for hub access tokens (spec 3.5). It refuses a token that lacks `exp`,
  * `iat`, `sub`, `jti` or `aal`, that has no `kid`, whose `aud` is a list, or that was
  * issued in the future, and then returns the claims with defaults for the optional ones.
  */
 export function createVerifier(opts: VerifierOptions) {
-  const jwks: JWTVerifyGetKey = opts.jwks
-    ? createLocalJWKSet(opts.jwks)
-    : createRemoteJWKSet(new URL(opts.jwksUrl ?? `${opts.issuer.replace(/\/$/, "")}/.well-known/jwks.json`));
-  // A token names its key. With one key in the set jose would pick it without a kid.
-  const keys: JWTVerifyGetKey = (header, token) => {
-    if (typeof header.kid !== "string" || !header.kid) throw new Error('the token has no "kid"');
-    return jwks(header, token);
-  };
+  const keys = hubKeys(opts);
   const tolerance = opts.clockTolerance ?? 60;
   const clock = opts.now ?? (() => Date.now() / 1000);
   return async function verify(token: string): Promise<AccessClaims> {
@@ -79,6 +97,41 @@ export function createVerifier(opts: VerifierOptions) {
       return { ...c, groups: c.groups ?? [], roles: c.roles ?? [], attrs: c.attrs ?? {}, amr: c.amr ?? [] } as AccessClaims;
     } catch (e) {
       throw new KithAuthError(`invalid token: ${(e as Error).message}`);
+    }
+  };
+}
+
+/**
+ * A verifier for account attestations (spec 7.8.1). `audience` is the app's client id.
+ * Same rules as access tokens, with `typ` `kith-account+jwt`. It says who signed in and
+ * when (`verified_at`); how recent that has to be is the app's call.
+ */
+export function createAttestationVerifier(opts: VerifierOptions) {
+  const keys = hubKeys(opts);
+  const tolerance = opts.clockTolerance ?? 60;
+  const clock = opts.now ?? (() => Date.now() / 1000);
+  return async function verify(token: string): Promise<AccountAttestation> {
+    try {
+      const now = clock();
+      const { payload } = await jwtVerify(token, keys, {
+        issuer: opts.issuer,
+        audience: opts.audience,
+        typ: "kith-account+jwt",
+        algorithms: ["EdDSA"],
+        clockTolerance: tolerance,
+        currentDate: new Date(now * 1000),
+        requiredClaims: ["exp", "iat", "sub", "jti", "provider", "provider_iss", "account", "verified_at"],
+      });
+      if (typeof payload.aud !== "string") throw new Error('"aud" must be a single string');
+      for (const k of ["sub", "jti", "provider", "provider_iss", "account"]) {
+        if (typeof payload[k] !== "string" || !payload[k]) throw new Error(`"${k}" must be a non-empty string`);
+      }
+      if (typeof payload.verified_at !== "number") throw new Error('"verified_at" must be a number');
+      if ((payload.iat as number) - tolerance > now) throw new Error('"iat" is in the future');
+      if (payload.verified_at - tolerance > now) throw new Error('"verified_at" is in the future');
+      return payload as unknown as AccountAttestation;
+    } catch (e) {
+      throw new KithAuthError(`invalid attestation: ${(e as Error).message}`);
     }
   };
 }

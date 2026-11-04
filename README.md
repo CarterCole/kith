@@ -87,6 +87,7 @@ kith hub serve --upstreams upstreams.json    # also accept "Sign in with Telegra
 kith hub serve --registration-token "$TOKEN" # let apps register themselves (RFC 7591)
 kith hub serve --admin-token "$TOKEN"        # /v1/admin/…: sessions, consent, clients
 kith alias link 'https://oauth.telegram.org#<your id>'   # let that Telegram account sign in as you
+                                             # apps asking for scope linked_account get a signed attestation of it
 kith name add ada mailto:ada@acme.test       # follow her WebFinger (or DNS) back-link, check her KEL links it, pin it
 kith delegate --to ada --action 'Query.*'    # a name works wherever a DID does
 kith resolve https://acme.test               # just look: both directions checked, and exactly one root must pass

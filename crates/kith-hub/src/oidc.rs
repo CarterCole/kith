@@ -374,7 +374,7 @@ pub(crate) fn enc(s: &str) -> String {
         .collect()
 }
 
-fn dec(s: &str) -> String {
+pub(crate) fn dec(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -443,7 +443,7 @@ pub async fn discovery(State(h): State<Arc<Hub>>) -> Json<Value> {
         "id_token_encryption_enc_values_supported": jwe::ENCS,
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
         "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": ["openid", "profile", "email", "groups", "offline_access"],
+        "scopes_supported": ["openid", "profile", "email", "groups", "offline_access", "linked_account"],
         "claims_supported": ["sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "acr", "amr", "azp", "sid", "name", "preferred_username", "email", "email_verified", "groups", "roles"],
         "acr_values_supported": [format!("{ACR_PREFIX}1"), format!("{ACR_PREFIX}2"), format!("{ACR_PREFIX}3")],
         "prompt_values_supported": ["none", "login", "consent"],
@@ -641,7 +641,10 @@ pub async fn consent_page(State(h): State<Arc<Hub>>, headers: HeaderMap, Query(q
         return expired();
     };
     // Show the values the app would receive, not only the names of the scopes.
-    let claims = h.access_claims(&a, &client.access_audience(), None).map(|c| scoped_claims(&ar.scope, &c)).unwrap_or_default();
+    let mut claims = h.access_claims(&a, &client.access_audience(), None).map(|c| scoped_claims(&ar.scope, &c)).unwrap_or_default();
+    if scope_has(&ar.scope, "linked_account") {
+        claims.insert("linked_account".into(), json!(a.alias));
+    }
     pages::consent(json!({
         "request_id": request_id,
         "client_name": client.display_name(),
@@ -837,6 +840,11 @@ fn issue_tokens(h: &Hub, client: &Client, scope: &str, authn: &Authn, nonce: Opt
         "id_token": id_token,
         "scope": scope,
     });
+    if scope_has(scope, "linked_account") {
+        if let Some(att) = h.account_attestation(&client.client_id, &at.sub, authn)? {
+            resp["account_attestation"] = json!(att);
+        }
+    }
     if scope_has(scope, "offline_access") {
         let rt = random_id();
         h.store.put_refresh(&rt, &RefreshGrant { client_id: client.client_id.clone(), scope: scope.into(), authn: authn.clone(), sid: sid.map(String::from), expires: now() + REFRESH_TTL })?;

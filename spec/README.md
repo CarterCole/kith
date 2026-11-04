@@ -111,6 +111,7 @@ An implementation claims one or more profiles:
 | **Verifier** | The above, plus KEL replay (§1.6), session-chain verification (§3.3), and alias proofs (§5). |
 | **Hub** | The above, plus the endpoints of §2, §3.4 and §7. |
 | **Wallet / agent** | Create and sign KEL events, grants, session tokens and delegations. |
+| **Attestation consumer** | Verify account attestations (§7.8.1). Pass `test-vectors/attestations.json`. |
 
 Current implementations:
 

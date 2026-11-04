@@ -399,6 +399,72 @@ Not yet implemented:
 Tested in process against a stand-in provider (`crates/kith-hub/tests/upstream.rs`).
 Not yet run against Telegram itself.
 
+### 7.8.1 Account attestations
+
+The `aliases` attribute is what an identity says about itself: anyone can link any
+alias (§5.1). An app that needs to know an account is really this person's asks the hub
+to say so. The hub is the oracle here, so the app trusts the hub to have checked.
+
+An app adds the `linked_account` scope. If the login came through an upstream provider,
+the token response carries `account_attestation`, a JWT signed with the hub's EdDSA key
+(in its JWKS), with header `typ: kith-account+jwt`:
+
+```json
+{
+  "iss": "https://hub.example",
+  "sub": "did:kith:…",                       // or the pairwise subject (§7.2)
+  "aud": "app",                              // the client id
+  "iat": 1800000000, "exp": 1800000900, "jti": "…",
+  "provider": "facebook",                    // this hub's id for the provider
+  "provider_iss": "https://www.facebook.com",
+  "account": "1029384756",                   // the ID token's sub
+  "verified_at": 1799999970                  // when the hub verified that ID token
+}
+```
+
+- The hub MUST issue one only for the alias of the login in hand, whose ID token it
+  verified (§7.8). It MUST NOT issue one from the KEL's alias list. A login with a
+  passkey, a wallet or a device key gets none, even when the identity links accounts.
+- The field is absent when there is nothing to attest. Absence proves nothing either way.
+- A provider no longer in the hub's configuration gets none.
+- Consent (§7.3) shows the account before it is released. Pairwise clients get it too if
+  they ask, so the user's agreement is what links the pseudonym to the account.
+- A refresh issues a new attestation with the original `verified_at`, and stops once the
+  alias is unlinked (§7.8, Revocation).
+
+An app MUST verify it as §3.5 says for access tokens, with `typ` `kith-account+jwt`, and
+`aud` equal to its own client id. It MUST also refuse an empty `provider`, `provider_iss`
+or `account`, and a `verified_at` in the future. It compares `provider_iss`, not
+`provider`, and decides itself how old a `verified_at` it accepts. The shared cases are
+`spec/test-vectors/attestations.json`. Verifiers: `verify_account_attestation` (Rust),
+`createAttestationVerifier` (JS), `AttestationVerifier` (Python).
+
+What it does not say: `account` is the provider's `sub`, which some providers scope to
+the app. It proves "the same account this hub saw", not a public handle or a real name.
+
+**Facebook.** `Upstream::facebook(app_id)` is the preset; as a JSON entry:
+
+```json
+{
+  "id": "facebook", "name": "Facebook",
+  "issuer": "https://www.facebook.com",
+  "client_id": "<app id>",
+  "authorization_endpoint": "https://www.facebook.com/v25.0/dialog/oauth",
+  "token_endpoint": "https://graph.facebook.com/v25.0/oauth/access_token",
+  "jwks_uri": "https://www.facebook.com/.well-known/oauth/openid/jwks/",
+  "token_request": "get"
+}
+```
+
+Facebook's discovery document lists neither the code flow nor a token endpoint, so all
+three endpoints are given. `token_request: "get"` sends the code in a URL, as Facebook
+documents. PKCE is the proof, and the hub refuses a `client_secret` on such an entry
+rather than put it in a URL. `sub` is per app (`subject_types_supported: ["pairwise"]`).
+Register `{hub issuer}/oauth/upstream/facebook/callback` as a redirect URI.
+
+Tested against a stand-in that exchanges codes the same way. Not yet run against
+Facebook itself. Providers without ID tokens (GitHub, X, Discord) are not supported.
+
 ## 7.9 Deployment notes
 
 - **State.** The data directory (`--data`, default `.kith-hub`) holds:
