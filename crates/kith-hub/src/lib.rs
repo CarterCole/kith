@@ -15,7 +15,7 @@
 //! | `GET, POST /oauth/consent`                | consent page, and its Allow / Deny decision     |
 //! | `POST /oauth/register`                    | dynamic client registration (RFC 7591), if enabled |
 //! | `GET  /oauth/upstream/{id}/start`, `…/callback` | sign in through Telegram or another upstream OIDC provider (see [`upstream`]) |
-//! | `POST /oauth/token`                       | code, refresh and RFC 8693 token exchange       |
+//! | `POST /oauth/token`                       | code, refresh and RFC 8693 token exchange; `account_attestation` with the `linked_account` scope, `contact_attestations` with `email` or `phone` |
 //! | `GET  /oauth/userinfo`                    | OIDC userinfo                                   |
 //! | `GET  /oauth/logout`                      | RP-initiated logout                             |
 //! | `GET, POST /whoami`                       | the account page, and its passkey sign-in (see [`account`]) |
@@ -23,10 +23,13 @@
 //! | `GET  /v1/did/{did}`                      | DID document                                    |
 //! | `POST /v1/auth/challenge`, `/v1/auth/verify` | API challenge login (signature/passkey/TOTP) |
 //! | `POST /v1/totp/enroll`, `/v1/totp/confirm`| TOTP factor (bearer)                            |
+//! | `DELETE /v1/totp`                         | forget the authenticator: a current code, or an AAL 2 sign-in |
 //! | `POST /v1/cosigner`, `/v1/cosign`         | TOTP-gated co-signer                            |
+//! | `POST, GET, DELETE /v1/contacts`, `POST /v1/contacts/confirm`, `PUT /v1/contacts/public` | verified email and phone contacts (bearer; see [`contacts`]) |
+//! | `GET  /v1/contacts/lookup`                | who holds a published contact, signed           |
 //! | `POST /v1/enroll`, `GET /enroll/{id}`     | enroll a browser passkey as a device            |
 //! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
-//! | `/v1/admin/…`                             | sessions, consent and clients, for the operator (see [`admin`]) |
+//! | `/v1/admin/…`                             | sessions, consent, clients and TOTP resets, for the operator (see [`admin`]) |
 //!
 //! State that must outlive a restart is in one SQLite file in the data directory
 //! (see [`store`]).
@@ -36,10 +39,9 @@
 
 pub mod account;
 pub mod admin;
-pub mod email;
+pub mod contacts;
 pub mod enroll;
 pub mod jwe;
-pub mod mail;
 pub mod oidc;
 pub mod org;
 pub mod pages;
@@ -109,6 +111,9 @@ pub struct HubConfig {
     /// Attempts allowed on `/oauth/login` and `/oauth/register`, per client address.
     pub login_limit: RateLimit,
     pub register_limit: RateLimit,
+    /// Attempts with a TOTP code (`/v1/auth/verify`, `/v1/cosign`, token exchange),
+    /// per client address. The per-identity lockout still applies on top.
+    pub totp_limit: RateLimit,
     /// The hub is behind exactly one reverse proxy: the client address is the last
     /// `X-Forwarded-For` entry, which that proxy appended.
     pub behind_proxy: bool,
@@ -122,11 +127,11 @@ pub struct HubConfig {
     pub signup: bool,
     /// Sign-up attempts allowed per client address.
     pub signup_limit: RateLimit,
-    /// Where verification codes are mailed from; `None` leaves email verification off.
-    pub mailer: Option<mail::Mailer>,
-    pub email_limit: RateLimit,
     /// Proofs of work submitted per client address (spec §7.12).
     pub work_limit: RateLimit,
+    /// Verified email addresses and phone numbers (spec 7.8.2): how codes are sent,
+    /// how long a verification lasts, and limits.
+    pub contacts: contacts::ContactConfig,
 }
 
 impl HubConfig {
@@ -155,6 +160,10 @@ impl HubConfig {
                 max: 20,
                 window_secs: 3600,
             },
+            totp_limit: RateLimit {
+                max: 20,
+                window_secs: 60,
+            },
             behind_proxy: false,
             admin_token: None,
             admin_role: Some("hub-admin".into()),
@@ -163,15 +172,11 @@ impl HubConfig {
                 max: 5,
                 window_secs: 3600,
             },
-            mailer: None,
-            email_limit: RateLimit {
-                max: 10,
-                window_secs: 3600,
-            },
             work_limit: RateLimit {
                 max: 120,
                 window_secs: 60,
             },
+            contacts: contacts::ContactConfig::default(),
         }
     }
 }
@@ -229,12 +234,12 @@ pub struct Hub {
     pub store: store::Store,
     pub(crate) enrollments: Mutex<HashMap<String, enroll::Enrollment>>,
     pub(crate) signups: Mutex<HashMap<String, signup::Attempt>>,
-    pub(crate) email_codes: Mutex<HashMap<String, email::Pending>>,
-    pub(crate) email_proofs: Mutex<HashMap<String, (String, i64)>>,
     pub(crate) upstream: Mutex<upstream::UpstreamState>,
     pub(crate) http: reqwest::Client,
     pub orgs: org::Orgs,
     pub started: i64,
+    #[cfg(feature = "aws")]
+    pub(crate) aws: contacts::aws::Clients,
 }
 
 #[derive(Debug)]
@@ -347,7 +352,28 @@ pub enum Factor {
     },
 }
 
+impl Authn {
+    /// Nothing but an authenticator code vouches for this sign-in: no device that could
+    /// be revoked and no linked account that could be unlinked.
+    pub(crate) fn rests_on_totp_alone(&self) -> bool {
+        self.dev.is_none() && self.alias.is_none() && self.amr == ["otp"]
+    }
+}
+
 impl Hub {
+    /// A sign-in that rests on the authenticator alone ends when it is reset, so that
+    /// resetting it is a way to cut off whoever enrolled it. Anything else is unaffected.
+    pub(crate) fn totp_session_alive(&self, a: &Authn) -> bool {
+        if !a.rests_on_totp_alone() {
+            return true;
+        }
+        match self.store.totp_reset_at(&a.st.did) {
+            Ok(Some(reset)) => a.auth_time > reset,
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
     pub fn open(cfg: HubConfig) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(cfg.data_dir.join("kels"))?;
         let key_path = cfg.data_dir.join("hub-key.json");
@@ -397,6 +423,7 @@ impl Hub {
                 anyhow::bail!("duplicate upstream id {}", u.id);
             }
         }
+        cfg.contacts.validate()?;
         let cfg_dir = cfg.data_dir.clone();
         let hub = Hub {
             cfg,
@@ -415,14 +442,14 @@ impl Hub {
             store,
             enrollments: Mutex::new(HashMap::new()),
             signups: Mutex::new(HashMap::new()),
-            email_codes: Mutex::new(HashMap::new()),
-            email_proofs: Mutex::new(HashMap::new()),
             upstream: Mutex::new(upstream::UpstreamState::default()),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()?,
             orgs: org::Orgs::open(&cfg_dir)?,
             started: now(),
+            #[cfg(feature = "aws")]
+            aws: Default::default(),
         };
         hub.engine()?;
         Ok(Arc::new(hub))
@@ -503,40 +530,71 @@ impl Hub {
     /// after [`TOTP_MAX_FAILURES`] wrong codes the factor is refused for
     /// [`TOTP_LOCKOUT`] seconds. The lockout survives a restart.
     fn check_totp(&self, did: &str, code: &str, require_confirmed: bool) -> ApiResult<()> {
-        let mut rec = self
-            .store
-            .totp(did)?
-            .ok_or_else(|| ApiError::unauthorized("no TOTP enrolled"))?;
-        if require_confirmed && !rec.confirmed {
-            return Err(ApiError::unauthorized("TOTP not confirmed"));
+        enum Verdict {
+            Accepted,
+            Unconfirmed,
+            Locked(i64),
+            Used,
+            Wrong,
         }
         let t = now();
-        if rec.locked_until > t {
-            return Err(ApiError(
+        // One read-modify-write: parallel attempts can't share a failure count or a step.
+        let verdict = self
+            .store
+            .update_totp(did, |rec| {
+                if require_confirmed && !rec.confirmed {
+                    return Verdict::Unconfirmed;
+                }
+                if rec.locked_until > t {
+                    return Verdict::Locked(rec.locked_until - t);
+                }
+                match totp::verify(&rec.secret, code, t, 1) {
+                    Some(step) if step > rec.last_step => {
+                        rec.last_step = step;
+                        rec.failures = 0;
+                        rec.confirmed = true;
+                        Verdict::Accepted
+                    }
+                    Some(_) => Verdict::Used,
+                    None => {
+                        rec.failures += 1;
+                        if rec.failures >= TOTP_MAX_FAILURES {
+                            rec.failures = 0;
+                            rec.locked_until = t + TOTP_LOCKOUT;
+                        }
+                        Verdict::Wrong
+                    }
+                }
+            })?
+            .ok_or_else(|| ApiError::unauthorized("no TOTP enrolled"))?;
+        match verdict {
+            Verdict::Accepted => Ok(()),
+            Verdict::Unconfirmed => Err(ApiError::unauthorized("TOTP not confirmed")),
+            Verdict::Locked(retry) => Err(ApiError(
                 StatusCode::TOO_MANY_REQUESTS,
                 "locked".into(),
                 "too many TOTP failures".into(),
-                Some(json!({"retry_after": rec.locked_until - t})),
-            ));
+                Some(json!({"retry_after": retry})),
+            )),
+            Verdict::Used => Err(ApiError::unauthorized("TOTP code already used")),
+            Verdict::Wrong => Err(ApiError::unauthorized("invalid TOTP code")),
         }
-        match totp::verify(&rec.secret, code, t, 1) {
-            Some(step) if step > rec.last_step => {
-                rec.last_step = step;
-                rec.failures = 0;
-                rec.confirmed = true;
-                self.store.put_totp(did, &rec)?;
-                Ok(())
-            }
-            Some(_) => Err(ApiError::unauthorized("TOTP code already used")),
-            None => {
-                rec.failures += 1;
-                if rec.failures >= TOTP_MAX_FAILURES {
-                    rec.failures = 0;
-                    rec.locked_until = t + TOTP_LOCKOUT;
-                }
-                self.store.put_totp(did, &rec)?;
-                Err(ApiError::unauthorized("invalid TOTP code"))
-            }
+    }
+
+    /// Count a TOTP attempt from `ip` against [`HubConfig::totp_limit`]. The identity's
+    /// own lockout still applies; this stops one address from trying many identities.
+    pub(crate) fn limit_totp(&self, ip: &ClientIp) -> ApiResult<()> {
+        match self
+            .store
+            .hit(&format!("totp|{}", ip.0), self.cfg.totp_limit, now())?
+        {
+            None => Ok(()),
+            Some(retry) => Err(ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited".into(),
+                format!("too many TOTP attempts from your address; try again in {retry}s"),
+                Some(json!({"retry_after": retry})),
+            )),
         }
     }
 
@@ -665,6 +723,7 @@ impl Hub {
                         .values()
                         .filter(|d| {
                             d.kind == DeviceKind::Passkey
+                                && d.has_cap("session")
                                 && device_id.as_ref().is_none_or(|id| &d.id == id)
                         })
                         .collect();
@@ -750,20 +809,17 @@ impl Hub {
             "work".into(),
             json!(self.store.work_for(&a.st.did)?.map_or(0, |(bits, _)| bits)),
         );
-        // A verified address the person gave this hub (spec §7.14).
-        if let Some(e) = self.store.email_for(&a.st.did)? {
-            kel_attrs.insert("email".into(), json!(e));
-            kel_attrs.insert("email_verified".into(), json!(true));
-        }
         let resolve = |kel_attrs: &Map<String, Value>| -> ApiResult<_> {
-            Ok(match self.org_memberships(&a.st.did, kel_attrs)? {
-                Some(found) => found,
-                None => {
-                    let engine = self.engine()?;
-                    let attrs = engine.attributes(&a.st.did, kel_attrs);
-                    (engine.memberships(&a.st.did, &attrs)?, attrs)
-                }
-            })
+            Ok(
+                match self.org_memberships(&a.st.did, a.dev.as_deref(), kel_attrs)? {
+                    Some(found) => found,
+                    None => {
+                        let engine = self.engine()?;
+                        let attrs = engine.attributes(&a.st.did, kel_attrs);
+                        (engine.memberships(&a.st.did, &attrs)?, attrs)
+                    }
+                },
+            )
         };
         let (mut m, mut attrs) = resolve(&kel_attrs)?;
         // Upstream attributes only fill gaps: they never replace what the directory
@@ -956,7 +1012,14 @@ struct VerifyReq {
     factors: Vec<Factor>,
 }
 
-async fn verify(State(h): State<Arc<Hub>>, Json(req): Json<VerifyReq>) -> ApiResult<Json<Value>> {
+async fn verify(
+    State(h): State<Arc<Hub>>,
+    ip: ClientIp,
+    Json(req): Json<VerifyReq>,
+) -> ApiResult<Json<Value>> {
+    if req.factors.iter().any(|f| matches!(f, Factor::Totp { .. })) {
+        h.limit_totp(&ip)?;
+    }
     let ch = h.take_challenge(&req.challenge_id)?;
     let did = ch
         .did
@@ -988,9 +1051,13 @@ pub struct TokenReq {
 
 async fn token(
     State(h): State<Arc<Hub>>,
+    ip: ClientIp,
     headers: HeaderMap,
     Form(req): Form<TokenReq>,
 ) -> ApiResult<Response> {
+    if req.totp.is_some() {
+        h.limit_totp(&ip)?;
+    }
     let body = match req.grant_type.as_str() {
         "urn:ietf:params:oauth:grant-type:token-exchange" => token_exchange(&h, &req)?,
         "authorization_code" => oidc::code_grant(&h, &headers, &req)?,
@@ -1117,6 +1184,42 @@ async fn totp_confirm(
     Ok(Json(json!({"confirmed": true})))
 }
 
+#[derive(Deserialize, Default)]
+struct ResetReq {
+    #[serde(default)]
+    code: Option<String>,
+}
+
+/// `DELETE /v1/totp`: forget the caller's authenticator so a new one can be enrolled.
+/// The caller shows the current code, or has signed in strongly (AAL 2). Otherwise a
+/// weak session, a stolen laptop's say, could swap in its own authenticator and with
+/// it the TOTP gate on the co-signer. Sign-ins that rested on the authenticator alone
+/// end with it. An operator without either uses `DELETE /v1/admin/identities/{did}/totp`.
+async fn totp_reset(
+    State(h): State<Arc<Hub>>,
+    ip: ClientIp,
+    headers: HeaderMap,
+    body: Option<Json<ResetReq>>,
+) -> ApiResult<Json<Value>> {
+    let c = h.bearer(&headers)?;
+    match body.and_then(|Json(b)| b.code) {
+        Some(code) => {
+            h.limit_totp(&ip)?;
+            h.check_totp(&c.sub, &code, true)?;
+        }
+        None if c.aal >= 2 => {}
+        None => {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "forbidden".into(),
+                "resetting the authenticator needs a current code or an AAL 2 sign-in".into(),
+                None,
+            ))
+        }
+    }
+    Ok(Json(json!({"reset": h.store.delete_totp(&c.sub, now())?})))
+}
+
 /// Returns (creating on first call) the hub-held co-signer key for the caller.
 /// Put its id in your manage or rotation policy – e.g. `2 of [passkey, ledger,
 /// cosigner]` – and TOTP becomes a real signer in your multisig.
@@ -1133,7 +1236,12 @@ struct CosignReq {
     event: Event,
 }
 
-async fn cosign(State(h): State<Arc<Hub>>, Json(req): Json<CosignReq>) -> ApiResult<Json<Value>> {
+async fn cosign(
+    State(h): State<Arc<Hub>>,
+    ip: ClientIp,
+    Json(req): Json<CosignReq>,
+) -> ApiResult<Json<Value>> {
+    h.limit_totp(&ip)?;
     let st = h.resolve(&req.did)?;
     if req.event.did.as_deref() != Some(st.did.as_str())
         || req.event.seq != st.seq + 1
@@ -1195,8 +1303,21 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/auth/verify", post(verify))
         .route("/v1/totp/enroll", post(totp_enroll))
         .route("/v1/totp/confirm", post(totp_confirm))
+        .route("/v1/totp", delete(totp_reset))
         .route("/v1/cosigner", post(cosigner))
         .route("/v1/cosign", post(cosign))
+        .route(
+            "/v1/contacts",
+            post(contacts::request_code)
+                .get(contacts::list)
+                .delete(contacts::remove),
+        )
+        .route("/v1/contacts/confirm", post(contacts::confirm))
+        .route(
+            "/v1/contacts/public",
+            axum::routing::put(contacts::set_public),
+        )
+        .route("/v1/contacts/lookup", get(contacts::lookup))
         .route("/v1/enroll", post(enroll::start))
         .route("/v1/enroll/{id}", get(enroll::status))
         .route("/v1/enroll/{id}/key", post(enroll::submit_key))
@@ -1208,8 +1329,6 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/signup", get(signup::page))
         .route("/v1/signup", post(signup::begin))
         .route("/v1/signup/check", post(signup::check))
-        .route("/v1/email/start", post(email::start))
-        .route("/v1/email/verify", post(email::verify))
         .route("/v1/work", post(work::submit))
         .route("/v1/work/{did}", get(work::get))
         .route("/v1/signup/{id}/key", post(signup::submit_key))
@@ -1234,6 +1353,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
             "/v1/admin/identities/{did}/sessions",
             delete(admin::end_sessions_of),
         )
+        .route("/v1/admin/identities/{did}/totp", delete(admin::reset_totp))
         .route("/v1/admin/clients", get(admin::clients))
         .route("/v1/admin/clients/{id}", delete(admin::delete_client))
         .route("/v1/admin/grants/{did}", get(admin::grants))
@@ -1273,4 +1393,90 @@ pub async fn serve(cfg: HubConfig, addr: &str) -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    fn hub() -> Arc<Hub> {
+        let dir = std::env::temp_dir().join(format!("kith-hub-unit-{}", random_id()));
+        Hub::open(HubConfig::new("http://localhost:7777", dir)).unwrap()
+    }
+
+    fn enrolled(h: &Hub, did: &str) -> Vec<u8> {
+        let secret = totp::generate_secret();
+        h.store
+            .put_totp(
+                did,
+                &store::TotpRecord {
+                    secret: secret.clone(),
+                    confirmed: true,
+                    last_step: 0,
+                    failures: 0,
+                    locked_until: 0,
+                },
+            )
+            .unwrap();
+        secret
+    }
+
+    /// Run `f(i)` on `n` threads released at the same moment.
+    fn together<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        let gate = Barrier::new(n);
+        std::thread::scope(|s| {
+            let threads: Vec<_> = (0..n)
+                .map(|i| {
+                    let (gate, f) = (&gate, &f);
+                    s.spawn(move || {
+                        gate.wait();
+                        f(i)
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        })
+    }
+
+    #[test]
+    fn a_totp_code_works_once_even_when_presented_together() {
+        let h = hub();
+        for round in 0..300 {
+            let did = format!("did:kith:race{round}");
+            let code = totp::code_at(&enrolled(&h, &did), now());
+            let accepted = together(4, |_| h.check_totp(&did, &code, true).is_ok())
+                .into_iter()
+                .filter(|ok| *ok)
+                .count();
+            assert_eq!(
+                accepted, 1,
+                "round {round}: one code, accepted {accepted} times"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_totp_codes_presented_together_are_all_counted() {
+        let h = hub();
+        for round in 0..300 {
+            let did = format!("did:kith:count{round}");
+            let secret = enrolled(&h, &did);
+            let valid: Vec<String> = [-30, 0, 30]
+                .iter()
+                .map(|d| totp::code_at(&secret, now() + d))
+                .collect();
+            let wrong = ["000000", "000001"]
+                .iter()
+                .find(|c| !valid.iter().any(|v| v == *c))
+                .unwrap()
+                .to_string();
+            together(4, |_| h.check_totp(&did, &wrong, true).is_err());
+            let failures = h.store.totp(&did).unwrap().unwrap().failures;
+            assert_eq!(
+                failures, 4,
+                "round {round}: four wrong codes, {failures} counted"
+            );
+        }
+    }
 }

@@ -139,6 +139,13 @@ principal. `kith-core` checks this against every vector in `test-vectors/authz.j
 It also checks that withholding any block makes loading fail, rather than succeed
 with less.
 
+A block set that is not shaped as §8.3 says is an error too, never an empty answer: an
+index entry that is not a list, a `members` value that is not a list of set names,
+`rules` missing or not a list of strings, a `version` that is not a 32-bit integer.
+Read as "nothing here", each would drop policies or memberships, and a dropped forbid
+is an open door. A Merkle map deeper than 64 levels (a SHA-256 hash has no more
+nibbles) is an error as well, and a block is read once however many links name it.
+
 `test-vectors/policy-dag.json` pins the root CID of the vector bundle, the blocks, and
 the expected contents of several slices.
 
@@ -182,7 +189,7 @@ Revocation kinds. Each one only ever removes access:
 |------|--------|
 | `principal {id}` | deny everything for the principal |
 | `member {id, set}` | the principal is never a member of `set`; sets that depended on it are recomputed without it |
-| `device {did, device}` | treat the device as revoked before its own KEL catches up |
+| `device {did, device}` | treat the device as revoked before its own KEL catches up: the hub issues no token for a sign-in from it, and a follower denies a request whose token names it in `dev` |
 | `policy {id}` | drop that **permit**. A `policy` revocation naming a forbid is ignored |
 | `token {jti}` | deny that token or session |
 
@@ -266,7 +273,8 @@ condition that errors on a missing `kith` skips the forbid, which fails *open*.
 
 1. If the level is `forked`, `behind` or `stale`, deny with reason `freshness:<level>`.
 2. If the principal is revoked, deny with `revoked:principal`. If the token's `jti` is
-   revoked, deny with `revoked:token`.
+   revoked, deny with `revoked:token`. If the token names a device (`dev`) that is
+   revoked for that principal, deny with `revoked:device`.
 3. Remove revoked permit policies from the slice.
 4. Recompute memberships from the slice with the revoked `(principal, set)` pairs
    excluded (§4.3, where an excluded set never joins).

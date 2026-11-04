@@ -135,11 +135,16 @@ fn uid(kind: &str, id: &str) -> Result<EntityUid> {
     Ok(EntityUid::from_type_name_and_id(t, EntityId::new(id)))
 }
 
-/// Cedar has no null or floating point: drop nulls, stringify non-integers.
+/// Cedar has no null or floating point: drop nulls, stringify non-integers. A float with
+/// no fractional part (`2.0`) is the integer it says, as it already is in JavaScript,
+/// where the two cannot be told apart.
 pub fn cedar_value(v: &Value) -> Option<Value> {
     match v {
         Value::Null => None,
-        Value::Number(n) if n.is_f64() => Some(Value::String(n.to_string())),
+        Value::Number(n) if n.is_f64() => match n.as_f64() {
+            Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 => Some(Value::from(f as i64)),
+            _ => Some(Value::String(n.to_string())),
+        },
         Value::Array(a) => Some(Value::Array(a.iter().filter_map(cedar_value).collect())),
         Value::Object(o) => Some(Value::Object(
             o.iter()
@@ -152,6 +157,41 @@ pub fn cedar_value(v: &Value) -> Option<Value> {
 
 fn cedar_map(m: &Map<String, Value>) -> Value {
     cedar_value(&Value::Object(m.clone())).unwrap_or(json!({}))
+}
+
+/// The pinned text of a stringified number (spec §4.2): ECMAScript `Number::toString`,
+/// the form RFC 8785 §3.2.2.3 uses. It is the shortest digits that read back as `f`,
+/// written plainly when the decimal exponent is in −7 < e < 21 and as `d.ddde+N` or
+/// `d.ddde-N` otherwise.
+pub fn number_text(f: f64) -> String {
+    if f == 0.0 {
+        return "0".into();
+    }
+    let sign = if f < 0.0 { "-" } else { "" };
+    // serde_json prints the shortest digits, as `ddd.ddd` or `d.ddde[+-]N`. `{:e}` is no
+    // substitute: between two equally near candidates it rounds up, where ECMAScript
+    // takes the even digit.
+    let Some(shortest) = serde_json::Number::from_f64(f.abs()).map(|n| n.to_string()) else {
+        return if f.is_nan() { "NaN".into() } else { format!("{sign}Infinity") };
+    };
+    let (mantissa, exp) = shortest.split_once('e').unwrap_or((&shortest, "0"));
+    let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all = format!("{whole}{frac}");
+    let digits = all.trim_start_matches('0');
+    // The decimal point sits after digit `n` of the `k` digits.
+    let n = whole.len() as i32 + exp.parse::<i32>().unwrap() - (all.len() - digits.len()) as i32;
+    let digits = digits.trim_end_matches('0');
+    let k = digits.len() as i32;
+    if (k..=21).contains(&n) {
+        format!("{sign}{digits}{}", "0".repeat((n - k) as usize))
+    } else if (1..=21).contains(&n) {
+        format!("{sign}{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if (-5..=0).contains(&n) {
+        format!("{sign}0.{}{digits}", "0".repeat(-n as usize))
+    } else {
+        let point = if k > 1 { "." } else { "" };
+        format!("{sign}{}{point}{}e{}{}", &digits[..1], &digits[1..], if n > 0 { '+' } else { '-' }, (n - 1).abs())
+    }
 }
 
 fn entity(kind: &str, id: &str, attrs: Value, parents: Vec<(&str, &str)>) -> Value {
@@ -553,5 +593,33 @@ mod tests {
     fn rule_injection_is_rejected() {
         let bad = r#"{"version":1,"groups":{"x":{"rule":"true }; permit(principal, action, resource) when { true"}},"policies":""}"#;
         assert!(Engine::from_json(bad).is_err());
+    }
+
+    /// §4.2: the text of a stringified number is ECMAScript `Number::toString`.
+    #[test]
+    // The literals are exact doubles, chosen to sit on ties; truncating them changes the case.
+    #[allow(clippy::excessive_precision)]
+    fn number_text_is_ecmascript_number_to_string() {
+        for (f, text) in [
+            (12.5, "12.5"),
+            (-12.5, "-12.5"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1e-6, "0.000001"),
+            (1.234e-6, "0.000001234"),
+            (1e-7, "1e-7"),
+            (1.5e-7, "1.5e-7"),
+            (5e-324, "5e-324"),
+            (1259144888929591.25, "1259144888929591.2"), // two candidates equally near: the even digit
+            (9007199254740992.0, "9007199254740992"),
+            (123456789012345680000.0, "123456789012345680000"),
+            (1e21, "1e+21"),
+            (1.5e300, "1.5e+300"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (-0.0, "0"),
+            (f64::NAN, "NaN"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ] {
+            assert_eq!(number_text(f), text);
+        }
     }
 }

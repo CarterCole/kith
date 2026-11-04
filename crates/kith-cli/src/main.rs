@@ -43,6 +43,8 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Parsed once per run, so the size of the hub's many flags costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Create a new root identity with a device, a manage key and 2-of-3 recovery keys.
@@ -154,6 +156,10 @@ enum Cmd {
     Totp(TotpCmd),
     #[command(subcommand)]
     Passkey(PasskeyCmd),
+    /// Email addresses and phone numbers the hub has verified for you. Private unless
+    /// you publish them; apps get them only with your agreement.
+    #[command(subcommand)]
+    Contact(ContactCmd),
     /// Get the hub's TOTP-gated co-signer id for your identity.
     Cosigner,
     /// Decode a JWT (no verification).
@@ -263,6 +269,12 @@ enum AliasCmd {
         file: PathBuf,
         #[arg(long)]
         aud: Option<String>,
+        /// The nonce you gave the prover. Without one, the proof must still be recent.
+        #[arg(long)]
+        nonce: Option<String>,
+        /// Seconds a proof may be old, by its own `iat`.
+        #[arg(long, default_value_t = kith_core::alias::ALIAS_PROOF_MAX_AGE)]
+        max_age: i64,
     },
     /// Publicly link an alias (mailto:, https:, did:web:, eip155:…).
     Link {
@@ -277,10 +289,37 @@ enum TotpCmd {
     Confirm {
         code: String,
     },
+    /// Forget the authenticator so a new one can be enrolled. Needs a current code, or
+    /// a strong (AAL 2) sign-in such as a passkey. Sign-ins that rested on the
+    /// authenticator alone end. An operator can also do it: `DELETE /v1/admin/identities/{did}/totp`.
+    Reset {
+        /// A current code from the authenticator being replaced.
+        #[arg(long)]
+        code: Option<String>,
+    },
     /// Compute the current code for a base32 secret (acts as an authenticator app).
     Code {
         secret: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ContactCmd {
+    /// Send a code to an email address or a phone number (with its + country code).
+    /// Run it again later to check a contact again before it goes stale.
+    Add { address: String },
+    /// Confirm with the code that was sent.
+    Confirm { address: String, code: String },
+    /// Your contacts, whether each is still fresh, and whether it is public.
+    List,
+    /// Let anyone look the contact up and get a signed statement that you hold it.
+    Publish { address: String },
+    /// Stop answering lookups for it.
+    Unpublish { address: String },
+    /// Forget the contact.
+    Remove { address: String },
+    /// Who holds a published contact (no sign-in needed).
+    Lookup { address: String },
 }
 
 #[derive(Subcommand)]
@@ -293,6 +332,10 @@ enum PasskeyCmd {
         /// Don't try to open the browser; just print the link.
         #[arg(long)]
         no_open: bool,
+        /// Add the passkey without asking. Otherwise you compare the fingerprint the
+        /// browser shows with the one printed here, and answer y.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -335,13 +378,6 @@ enum HubCmd {
         /// recovery key the browser makes). Off by default: it opens the registry.
         #[arg(long)]
         signup: bool,
-        /// Mail verification codes from this address through Amazon SES. Needs
-        /// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the environment (a key
-        /// that may only `ses:SendEmail`); `--mail-region` defaults to us-east-1.
-        #[arg(long)]
-        mail_from: Option<String>,
-        #[arg(long, default_value = "us-east-1")]
-        mail_region: String,
         /// The name the hub's pages show (letters, digits and spaces). Default: Kith.
         #[arg(long)]
         brand: Option<String>,
@@ -354,6 +390,27 @@ enum HubCmd {
         /// Seconds between heartbeats.
         #[arg(long, default_value_t = 15)]
         heartbeat: u64,
+        /// Verified contacts: append codes to this file instead of sending them
+        /// (development and tests).
+        #[arg(long)]
+        contact_outbox: Option<PathBuf>,
+        /// Verified contacts: send email through Amazon SES from this verified identity.
+        /// Needs a build with the `aws` feature.
+        #[arg(long, env = "KITH_EMAIL_FROM")]
+        email_from: Option<String>,
+        /// Verified contacts: send texts through AWS End User Messaging SMS from this
+        /// origination identity (a phone number, sender id or pool, by id or ARN).
+        #[arg(long, env = "KITH_SMS_FROM")]
+        sms_from: Option<String>,
+        /// End User Messaging configuration set for texts (protect settings, events).
+        #[arg(long)]
+        sms_configuration_set: Option<String>,
+        /// AWS region for SES and End User Messaging (default: the AWS environment).
+        #[arg(long)]
+        aws_region: Option<String>,
+        /// Only text numbers starting with this E.164 prefix, e.g. +1 (repeatable).
+        #[arg(long = "phone-prefix")]
+        phone_prefixes: Vec<String>,
     },
 }
 
@@ -432,6 +489,7 @@ impl DeviceKey {
                     key: &s.secret,
                     rp_id: "localhost",
                     origin: "http://localhost",
+                    user_verified: true,
                 },
                 ttl,
             )?,
@@ -1005,11 +1063,15 @@ fn main() -> Result<()> {
         behind_proxy,
         signup,
         brand,
-        mail_from,
-        mail_region,
         policy_org,
         beacon,
         heartbeat,
+        contact_outbox,
+        email_from,
+        sms_from,
+        sms_configuration_set,
+        aws_region,
+        phone_prefixes,
     }) = cli.cmd
     {
         // Browsers only allow passkeys on "localhost", not "127.0.0.1", so default to it.
@@ -1048,18 +1110,6 @@ fn main() -> Result<()> {
         cfg.admin_token = admin_token.filter(|t| !t.is_empty());
         cfg.behind_proxy = behind_proxy;
         cfg.signup = signup;
-        if let Some(from) = mail_from {
-            let var = |k: &str| {
-                std::env::var(k)
-                    .map_err(|_| anyhow::anyhow!("--mail-from needs {k} in the environment"))
-            };
-            cfg.mailer = Some(kith_hub::mail::Mailer::Ses {
-                region: mail_region,
-                key: var("AWS_ACCESS_KEY_ID")?,
-                secret: var("AWS_SECRET_ACCESS_KEY")?,
-                from,
-            });
-        }
         if let Some(b) = &brand {
             kith_hub::pages::set_brand(b);
         }
@@ -1069,6 +1119,20 @@ fn main() -> Result<()> {
                     .with_context(|| format!("reading {}", path.display()))?,
             )?;
         }
+        cfg.contacts.phone_prefixes = phone_prefixes;
+        cfg.contacts.delivery = match (contact_outbox, email_from.is_some() || sms_from.is_some()) {
+            (Some(_), true) => bail!(
+                "--contact-outbox and AWS delivery (--email-from, --sms-from) exclude each other"
+            ),
+            (Some(path), false) => kith_hub::contacts::Delivery::Outbox(path),
+            (None, true) => kith_hub::contacts::Delivery::Aws(kith_hub::contacts::AwsDelivery {
+                region: aws_region,
+                email_from,
+                sms_from,
+                sms_configuration_set,
+            }),
+            (None, false) => kith_hub::contacts::Delivery::None,
+        };
         return tokio::runtime::Runtime::new()?.block_on(kith_hub::serve(cfg, &addr));
     }
 
@@ -1482,10 +1546,22 @@ fn main() -> Result<()> {
                 nonce,
             )?)?);
         }
-        Cmd::Alias(AliasCmd::Verify { file, aud }) => {
+        Cmd::Alias(AliasCmd::Verify {
+            file,
+            aud,
+            nonce,
+            max_age,
+        }) => {
             let proof: AliasProof = serde_json::from_str(&std::fs::read_to_string(file)?)?;
             let st = fetch_state(&home.hub()?, &proof.root)?;
-            verify_alias_proof(&proof, &st, aud.as_deref(), None)?;
+            verify_alias_proof(
+                &proof,
+                &st,
+                aud.as_deref(),
+                nonce.as_deref(),
+                now(),
+                max_age,
+            )?;
             println!("valid: {} is an alias of {}", proof.alias, proof.root);
         }
         Cmd::Alias(AliasCmd::Link { alias }) => {
@@ -1567,7 +1643,54 @@ fn main() -> Result<()> {
                     .send()?,
             )?);
         }
-        Cmd::Passkey(PasskeyCmd::Enroll { name, no_open }) => {
+        Cmd::Contact(cmd) => {
+            let hub = home.hub()?;
+            let out = match cmd {
+                ContactCmd::Lookup { address } => check(
+                    http()
+                        .get(format!("{hub}/v1/contacts/lookup"))
+                        .query(&[("address", address)])
+                        .send()?,
+                )?,
+                cmd => {
+                    let auth = bearer(&mut home)?;
+                    let (method, path, body) = match cmd {
+                        ContactCmd::Add { address } => {
+                            (reqwest::Method::POST, "", json!({"address": address}))
+                        }
+                        ContactCmd::Confirm { address, code } => (
+                            reqwest::Method::POST,
+                            "/confirm",
+                            json!({"address": address, "code": code}),
+                        ),
+                        ContactCmd::List => (reqwest::Method::GET, "", Value::Null),
+                        ContactCmd::Publish { address } => (
+                            reqwest::Method::PUT,
+                            "/public",
+                            json!({"address": address, "public": true}),
+                        ),
+                        ContactCmd::Unpublish { address } => (
+                            reqwest::Method::PUT,
+                            "/public",
+                            json!({"address": address, "public": false}),
+                        ),
+                        ContactCmd::Remove { address } => {
+                            (reqwest::Method::DELETE, "", json!({"address": address}))
+                        }
+                        ContactCmd::Lookup { .. } => unreachable!(),
+                    };
+                    let mut req = http()
+                        .request(method, format!("{hub}/v1/contacts{path}"))
+                        .header("authorization", auth);
+                    if !body.is_null() {
+                        req = req.json(&body);
+                    }
+                    check(req.send()?)?
+                }
+            };
+            print(&out);
+        }
+        Cmd::Passkey(PasskeyCmd::Enroll { name, no_open, yes }) => {
             let hub = home.hub()?;
             let auth = bearer(&mut home)?;
             let e = check(
@@ -1604,7 +1727,22 @@ fn main() -> Result<()> {
             };
             let s = poll("key")?;
             let key = s["key"].as_str().unwrap_or_default().to_string();
-            eprintln!("browser created passkey {key}; approving with your manage key");
+            // The link is a bearer secret and the hub reports the key, so look before signing.
+            // The page shows the same code, computed in the browser from the key it made.
+            eprintln!("browser created passkey {key}");
+            eprintln!(
+                "fingerprint {}  (the enrollment page shows the same code)",
+                kith_core::util::key_fingerprint(&key)
+            );
+            if !confirm(
+                "Add it as a device of your identity?",
+                yes,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stderr(),
+            )? {
+                bail!("not approved; nothing was added (pass --yes to skip the question)");
+            }
+            eprintln!("approving with your manage key");
             let st = home.state()?;
             let dev = Device {
                 id: format!("dev_{}", &random_id()[..8]),
@@ -1638,6 +1776,17 @@ fn main() -> Result<()> {
             home.append(ev)?;
             publish(&home)?;
             eprintln!("enrolled passkey as device {} ({name})", dev.id);
+        }
+        Cmd::Totp(TotpCmd::Reset { code }) => {
+            let hub = home.hub()?;
+            let auth = bearer(&mut home)?;
+            let mut req = http()
+                .delete(format!("{hub}/v1/totp"))
+                .header("authorization", auth);
+            if let Some(code) = code {
+                req = req.json(&json!({"code": code}));
+            }
+            print(&check(req.send()?)?);
         }
         Cmd::Totp(TotpCmd::Code { secret }) => {
             println!("{}", totp::code_at(&totp::from_base32(&secret)?, now()))
@@ -1764,5 +1913,53 @@ fn kind_str(k: DeviceKind) -> &'static str {
         DeviceKind::Passkey => "passkey",
         DeviceKind::Hardware => "hardware",
         DeviceKind::Wallet => "wallet",
+    }
+}
+
+/// Ask a yes/no question. `yes` answers it without asking; otherwise only a line that
+/// starts with y or Y counts, so end of input, an empty line or anything else is no.
+fn confirm(
+    question: &str,
+    yes: bool,
+    input: &mut impl std::io::BufRead,
+    out: &mut impl std::io::Write,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    write!(out, "{question} [y/N] ")?;
+    out.flush()?;
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    Ok(line.trim_start().starts_with(['y', 'Y']))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ask(yes: bool, typed: &str) -> bool {
+        confirm("ok?", yes, &mut typed.as_bytes(), &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn only_an_explicit_yes_approves() {
+        assert!(ask(true, ""), "--yes needs no answer");
+        assert!(
+            ask(false, "y\n") && ask(false, "Y\n") && ask(false, "yes\n") && ask(false, "  yes\n")
+        );
+        for no in ["", "\n", "n\n", "no\n", "maybe\n", "x y\n"] {
+            assert!(!ask(false, no), "{no:?} was taken as a yes");
+        }
+    }
+
+    #[test]
+    fn the_question_is_asked_on_the_given_output() {
+        let mut out = Vec::new();
+        confirm("Add it?", false, &mut "n\n".as_bytes(), &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "Add it? [y/N] ");
+        let mut out = Vec::new();
+        confirm("Add it?", true, &mut "".as_bytes(), &mut out).unwrap();
+        assert!(out.is_empty(), "--yes asks nothing");
     }
 }

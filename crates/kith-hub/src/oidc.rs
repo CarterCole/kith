@@ -85,6 +85,51 @@ fn default_enc() -> String {
     "A256GCM".into()
 }
 
+/// Schemes that must never be a redirect or logout target, whatever else they look like.
+const BAD_SCHEMES: &[&str] = &[
+    "javascript",
+    "data",
+    "vbscript",
+    "file",
+    "about",
+    "blob",
+    "ftp",
+    "ws",
+    "wss",
+];
+
+/// May `u` be a redirect or logout target? https, plain http to loopback, or, when
+/// `private_use` is set, a private-use scheme as native apps use (RFC 8252 section 7.1,
+/// `com.example.app:/cb`). Schemes are case-insensitive, so they are compared in lower
+/// case: `HTTP://evil.example` is neither https nor loopback. No fragments, no
+/// whitespace or control characters, and no userinfo in an https authority, where
+/// `https://good.example@evil.example` would name evil.example.
+fn uri_ok(u: &str, private_use: bool) -> bool {
+    if u.contains('#') || u.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let Some((scheme, rest)) = u.split_once(':') else {
+        return false;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+    {
+        return false;
+    }
+    match scheme.as_str() {
+        "https" => rest.strip_prefix("//").is_some_and(|a| {
+            let authority = a.split(['/', '?']).next().unwrap_or_default();
+            !authority.is_empty() && !authority.contains('@')
+        }),
+        "http" => loopback(&format!("http:{rest}")),
+        s if private_use && !BAD_SCHEMES.contains(&s) => rest.starts_with('/'),
+        _ => false,
+    }
+}
+
 fn loopback(u: &str) -> bool {
     ["http://localhost", "http://127.0.0.1", "http://[::1]"]
         .iter()
@@ -163,12 +208,14 @@ impl Client {
             anyhow::bail!("client {} has no redirect_uris", self.client_id);
         }
         for u in &self.redirect_uris {
-            if u.contains('#')
-                || !(u.starts_with("https://")
-                    || loopback(u)
-                    || (!u.starts_with("http:") && u.contains(":/")))
-            {
+            if !uri_ok(u, true) {
                 anyhow::bail!("client {}: redirect_uri {u} must be https, loopback http, or a private-use scheme, with no fragment", self.client_id);
+            }
+        }
+        // The sign-out page sends the browser to these.
+        for u in &self.post_logout_redirect_uris {
+            if !uri_ok(u, true) {
+                anyhow::bail!("client {}: post_logout_redirect_uri {u} must be https, loopback http, or a private-use scheme, with no fragment", self.client_id);
             }
         }
         if !["RS256", "EdDSA"].contains(&self.id_token_signed_response_alg.as_str()) {
@@ -183,7 +230,7 @@ impl Client {
             .iter()
             .chain(&self.frontchannel_logout_uri)
         {
-            if u.contains('#') || !(u.starts_with("https://") || loopback(u)) {
+            if !uri_ok(u, false) {
                 anyhow::bail!(
                     "client {}: logout URI {u} must be https or loopback http, with no fragment",
                     self.client_id
@@ -386,7 +433,7 @@ pub(crate) fn enc(s: &str) -> String {
         .collect()
 }
 
-fn dec(s: &str) -> String {
+pub(crate) fn dec(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -465,8 +512,8 @@ pub async fn discovery(State(h): State<Arc<Hub>>) -> Json<Value> {
         "id_token_encryption_enc_values_supported": jwe::ENCS,
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
         "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": ["openid", "profile", "email", "groups", "work", "offline_access"],
-        "claims_supported": ["sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "acr", "amr", "azp", "sid", "name", "preferred_username", "email", "email_verified", "groups", "roles", "work"],
+        "scopes_supported": ["openid", "profile", "email", "phone", "groups", "work", "offline_access", "linked_account"],
+        "claims_supported": ["sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "acr", "amr", "azp", "sid", "name", "preferred_username", "email", "email_verified", "phone_number", "phone_number_verified", "groups", "roles", "work"],
         "acr_values_supported": [format!("{ACR_PREFIX}1"), format!("{ACR_PREFIX}2"), format!("{ACR_PREFIX}3")],
         "prompt_values_supported": ["none", "login", "consent"],
         "authorization_response_iss_parameter_supported": true,
@@ -578,7 +625,7 @@ pub async fn authorize(
             .and_then(|sid| h.store.session(&sid).ok().flatten().map(|s| (s.authn, sid)));
         if let Some((a, sid)) = existing {
             let fresh = max_age.is_none_or(|m| now() - a.auth_time <= m);
-            if fresh && session_holds(&h, &a).is_some() && a.aal >= min_aal {
+            if fresh && session_holds(&h, &a).is_some() && h.totp_session_alive(&a) && a.aal >= min_aal {
                 if !h.needs_consent(&client, &a.st.did, &req) {
                     return match issue_code(&h, req, a, &sid) {
                         Ok(url) => Redirect::to(&url).into_response(),
@@ -790,10 +837,28 @@ pub async fn consent_page(
         return expired();
     };
     // Show the values the app would receive, not only the names of the scopes.
-    let claims = h
+    let mut claims = h
         .access_claims(&a, &client.access_audience(), None)
         .map(|c| scoped_claims(&ar.scope, &c))
         .unwrap_or_default();
+    if scope_has(&ar.scope, "linked_account") {
+        claims.insert("linked_account".into(), json!(a.alias));
+    }
+    // Verified contacts the scopes would release, and the attestations that go with them.
+    if h.add_contact_claims(&a.st.did, &ar.scope, &mut claims)
+        .is_err()
+    {
+        return expired();
+    }
+    let attested: Vec<String> = h
+        .attested_contacts(&a.st.did, &ar.scope)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.address)
+        .collect();
+    if !attested.is_empty() {
+        claims.insert("contact_attestations".into(), json!(attested));
+    }
     pages::consent(json!({
         "request_id": request_id,
         "client_name": client.display_name(),
@@ -1057,7 +1122,9 @@ fn issue_tokens(
     if let Some(sid) = sid {
         id["sid"] = json!(sid);
     }
-    for (k, v) in scoped_claims(scope, &at) {
+    let mut claims = scoped_claims(scope, &at);
+    h.add_contact_claims(&authn.st.did, scope, &mut claims)?;
+    for (k, v) in claims {
         id[k] = v;
     }
     let mut id_token = h.sign_for(client, "JWT", &id)?;
@@ -1077,6 +1144,15 @@ fn issue_tokens(
         "id_token": id_token,
         "scope": scope,
     });
+    if scope_has(scope, "linked_account") {
+        if let Some(att) = h.account_attestation(&client.client_id, &at.sub, authn)? {
+            resp["account_attestation"] = json!(att);
+        }
+    }
+    let contacts = h.contact_attestations(&client.client_id, &at.sub, &authn.st.did, scope)?;
+    if !contacts.is_empty() {
+        resp["contact_attestations"] = json!(contacts);
+    }
     if scope_has(scope, "offline_access") {
         let rt = random_id();
         h.store.put_refresh(
@@ -1100,6 +1176,9 @@ pub(crate) fn code_grant(h: &Hub, headers: &HeaderMap, req: &TokenReq) -> ApiRes
         .code
         .as_deref()
         .ok_or_else(|| ApiError::bad("invalid_request", "code required"))?;
+    // Spent before anything is compared, on purpose: a code shown by the wrong client
+    // or with the wrong verifier is a sign it leaked (RFC 6749 section 4.1.2), so it
+    // must not stay usable for whoever tries next.
     let grant = h
         .store
         .take_code(code)?
@@ -1141,7 +1220,8 @@ pub(crate) fn refresh_grant(h: &Hub, headers: &HeaderMap, req: &TokenReq) -> Api
         .refresh_token
         .as_deref()
         .ok_or_else(|| ApiError::bad("invalid_request", "refresh_token required"))?;
-    // Rotating: every refresh token is single use.
+    // Rotating: every refresh token is single use, and spent even if the client turns
+    // out to be the wrong one (a token shown by another client has leaked).
     let g = h
         .store
         .take_refresh(rt)?
@@ -1166,6 +1246,11 @@ pub(crate) fn refresh_grant(h: &Hub, headers: &HeaderMap, req: &TokenReq) -> Api
             "the account this session signed in with has been unlinked",
         ));
     }
+    if !h.totp_session_alive(&g.authn) {
+        return Err(ApiError::grant(
+            "the authenticator this session signed in with has been reset",
+        ));
+    }
     let scope = match &req.scope {
         Some(s) if s.split_whitespace().all(|x| scope_has(&g.scope, x)) => s.clone(),
         Some(_) => {
@@ -1187,8 +1272,13 @@ pub async fn userinfo(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResul
     if c.client_id.is_none() {
         return Err(ApiError::unauthorized("not an OpenID Connect access token"));
     }
+    let scope = c.scope.as_deref().unwrap_or_default();
+    let mut claims = scoped_claims(scope, &c);
+    if let Some(did) = h.did_for(&c) {
+        h.add_contact_claims(&did, scope, &mut claims)?;
+    }
     let mut out = json!({"sub": c.sub});
-    for (k, v) in scoped_claims(c.scope.as_deref().unwrap_or_default(), &c) {
+    for (k, v) in claims {
         out[k] = v;
     }
     Ok(Json(out))
@@ -1204,6 +1294,15 @@ pub async fn logout(
 ) -> Response {
     let ended =
         cookie(&headers, SESSION_COOKIE).and_then(|sid| h.store.take_session(&sid).ok().flatten());
+    // Offline access ends with the session, as it does when an operator ends it.
+    if let Some(s) = &ended {
+        if let Err(e) = h.store.revoke_refresh(None, None, Some(&s.id)) {
+            eprintln!(
+                "logout: could not revoke refresh tokens of session {}: {e}",
+                s.id
+            );
+        }
+    }
     let client_id = q.get("client_id").cloned().or_else(|| {
         q.get("id_token_hint")
             .and_then(|t| jws::decode(t).ok())
@@ -1515,6 +1614,75 @@ mod tests {
         c.redirect_uris = vec!["http://evil.example/cb".into()];
         assert!(c.validate().is_err());
         c.redirect_uris = vec!["com.example.app:/cb".into()];
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn uris_are_checked_the_same_way_whatever_the_case_or_scheme() {
+        let with = |redirect: &str, logout: &str| Client {
+            client_id: "app".into(),
+            redirect_uris: vec![redirect.into()],
+            post_logout_redirect_uris: vec![logout.into()],
+            ..Default::default()
+        };
+        let ok = "https://app.example/cb";
+        // Scheme case doesn't turn a plain-http host into a private-use scheme.
+        for bad in [
+            "HTTP://evil.example/cb",
+            "Http://localhost.evil.example/cb",
+            "javascript://example.com/%0Aalert(1)",
+            "JavaScript://example.com/x",
+            "data://text/html,x",
+            "vbscript://x/y",
+            "file:///etc/passwd",
+            "https://good.example@evil.example/cb",
+            "https://app.example/cb#frag",
+            "https://app.example/ cb",
+        ] {
+            assert!(
+                with(bad, "https://app.example/").validate().is_err(),
+                "redirect_uri {bad} was accepted"
+            );
+            assert!(
+                with(ok, bad).validate().is_err(),
+                "post_logout_redirect_uri {bad} was accepted"
+            );
+        }
+        // The same goes for the logout notices the hub or the browser sends.
+        for bad in [
+            "HTTP://evil.example/logout",
+            "javascript://example.com/%0Aalert(1)",
+            "myapp:/logout",
+        ] {
+            let mut c = with(ok, "https://app.example/");
+            c.backchannel_logout_uri = Some(bad.into());
+            assert!(
+                c.validate().is_err(),
+                "backchannel_logout_uri {bad} was accepted"
+            );
+            let mut c = with(ok, "https://app.example/");
+            c.frontchannel_logout_uri = Some(bad.into());
+            assert!(
+                c.validate().is_err(),
+                "frontchannel_logout_uri {bad} was accepted"
+            );
+        }
+        // What is meant to work still does, with a mixed-case scheme too.
+        for good in [
+            "https://app.example/cb",
+            "HTTPS://app.example/cb",
+            "http://localhost:3000/cb",
+            "http://127.0.0.1:8080/",
+            "com.example.app:/cb",
+            "myapp://callback",
+        ] {
+            with(good, good)
+                .validate()
+                .unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        let mut c = with(ok, "https://app.example/");
+        c.backchannel_logout_uri = Some("https://app.example/bc".into());
+        c.frontchannel_logout_uri = Some("http://localhost:3000/fc".into());
         c.validate().unwrap();
     }
 }

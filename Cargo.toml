@@ -11,7 +11,9 @@ license = "Apache-2.0"
 kith-core = { path = "crates/kith-core" }
 kith-hub = { path = "crates/kith-hub" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: read each JSON number as the double nearest to it, as JavaScript and
+# Python do. The default parser can be one ulp off, which spec §4.2 does not allow.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 anyhow = "1"
 base64 = "0.22"

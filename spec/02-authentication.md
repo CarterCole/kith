@@ -17,7 +17,7 @@ The hub turns that evidence into an access token that states how strong it was
 | TOTP | **shared secret** | hub-side factor, optionally a co-signer (§2.6) | **no, only the secret holder** |
 | Upstream OIDC (Telegram; any code + PKCE provider) | federated | hub-side factor, bound by an `alias_link` (§2.7) | only via the upstream IdP |
 | Upstream SAML | federated | planned | only via the upstream IdP |
-| Email / SMS link | shared channel | hub-side factor (planned, AAL1 at most) | no |
+| Email / SMS code | shared channel | a verified contact the hub attests ([§7.8.2](07-oidc.md)); as a login factor, planned (AAL1 at most) | only via the hub's attestation |
 | Passport / mDL | credential | **attributes**, not login (see [passports](../docs/passports.md)) | yes (issuer signature) |
 
 The key distinction is between asymmetric and shared-secret authenticators.
@@ -36,9 +36,13 @@ The key distinction is between asymmetric and shared-secret authenticators.
 4. The client exchanges the session token at `POST /v1/oauth/token` (RFC 8693) for an
    access token, adding an optional `totp` for step-up.
 
-The hub resolves the KEL, checks that the device is active, and verifies grant then
-token. It also rejects replayed `jti` values. Revoking a device breaks every one of its
-sessions immediately.
+The hub resolves the KEL, checks that the device is active and has the `session` cap
+(§1.5), and verifies grant then token. It also rejects replayed `jti` values. Revoking
+a device breaks every one of its sessions immediately.
+
+A grant is worth what the device proved when it signed it. For a passkey the assertion
+must be for the device's `rp_id`, and if it reports user presence but not user
+verification the session is AAL 1, as on the challenge-login path (§2.5).
 
 ## 2.3 Challenge login (signature, passkey, wallet, TOTP)
 
@@ -65,9 +69,23 @@ Challenges are single-use and expire after 5 minutes. The `factors` array accept
 
 | type | Fields | Checks |
 |------|--------|--------|
-| `signature` | `sig` (§1.3) | `sig.signer` is a device or manage signer of the identity, and the signature is over `message` |
-| `webauthn` | `device_id`, `authenticator_data`, `client_data_json`, `signature` | §2.4 with an origin allowlist and RP id |
-| `totp` | `code` | RFC 6238 ±1 step, no step reuse; 5 wrong codes lock the factor for 15 minutes (`429 locked`, with `retry_after`), and the lockout survives a hub restart |
+| `signature` | `sig` (§1.3) | `sig.signer` is a device with the `session` cap, or a manage signer, of the identity, and the signature is over `message` |
+| `webauthn` | `device_id`, `authenticator_data`, `client_data_json`, `signature` | §2.4 with an origin allowlist and RP id, from a passkey device with the `session` cap |
+| `totp` | `code` | RFC 6238 ±1 step, no step reuse; 5 wrong codes lock the factor for 15 minutes (`429 locked`, with `retry_after`), and the lockout survives a hub restart. The check and the update are one step, so parallel attempts cannot share a failure count or use one code twice. Attempts from one address are limited as well (§7.9). |
+
+**Resetting TOTP.** `DELETE /v1/totp` (bearer) forgets the caller's authenticator so a
+new one can be enrolled. It needs a current code in the body (`{"code": "123456"}`), or
+a hub token for a strong sign-in (`aal` 2 or more). Otherwise a stolen laptop, which
+can enroll when nothing is enrolled, could swap in its own authenticator and with it
+the TOTP gate on the co-signer (§2.6). An operator who has neither uses the admin API
+(§7.10). `kith totp reset [--code …]` does the first two.
+
+A sign-in that rests on an authenticator code alone (`amr` is just `otp`, with no
+device and no linked account) has no device whose revocation could end it. Resetting
+the authenticator ends it instead: its SSO session stops working and its refresh
+tokens are refused. That is how someone who finds an authenticator they did not enroll
+cuts off whoever did: revoke the devices, reset TOTP, enroll again. Sign-ins that rest
+on anything else are untouched.
 
 ## 2.4 Passkeys
 

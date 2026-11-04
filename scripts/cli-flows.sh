@@ -20,7 +20,7 @@ $K --home "$D/bob" init --keystore file > "$D/bob.did" 2>/dev/null
 $K --home "$D/ada" keys list | python3 -c 'import sys,json;print("ada keys:", ", ".join(k["role"]+"="+k["where"] for k in json.load(sys.stdin)["keys"]))'
 sed -e "s|__ADA__|$(cat "$D/ada.did")|g" -e "s|__BOB__|$(cat "$D/bob.did")|g" examples/policy/bundle.template.json > "$D/bundle.json"
 
-$K hub serve --addr 127.0.0.1:$PORT --data "$D/hub" --bundle "$D/bundle.json" > "$D/hub.log" 2>&1 &
+$K hub serve --addr 127.0.0.1:$PORT --data "$D/hub" --bundle "$D/bundle.json" --contact-outbox "$D/outbox.jsonl" > "$D/hub.log" 2>&1 &
 HUB=$!
 for _ in $(seq 50); do curl -sf "$KITH_HUB/.well-known/jwks.json" >/dev/null && break; sleep 0.1; done
 $K --home "$D/ada" publish && $K --home "$D/bob" publish
@@ -100,6 +100,24 @@ SEQ=$($K --home "$D/ada" status | python3 -c "import sys,json;print(json.load(sy
 if $K --home "$D/ada" alias new gaming 2>/dev/null; then echo "FAIL: a second private alias took the label gaming"; exit 1; fi
 test "$($K --home "$D/ada" status | python3 -c "import sys,json;print(json.load(sys.stdin)['seq'])")" = "$SEQ" || { echo "FAIL: the refused alias still committed to the KEL"; exit 1; }
 echo "the label gaming cannot be reused, and nothing was committed (good)"
+
+step "verified contacts: private until published; whoever proves a number last holds it"
+# The hub writes codes to an outbox file instead of sending them.
+code() { python3 -c "import sys,json,re;m=[json.loads(l) for l in open('$D/outbox.jsonl') if json.loads(l)['to']==sys.argv[1]];print(re.search(r'\\b\\d{6}\\b',m[-1]['body']).group())" "$1"; }
+$K --home "$D/ada" contact add Ada@Example.com
+$K --home "$D/ada" contact confirm ada@example.com "$(code mailto:ada@example.com)"
+if $K --home "$D/bob" contact lookup ada@example.com 2>/dev/null; then echo "FAIL: a private contact was looked up"; exit 1; fi
+echo "private: nobody can look it up (good)"
+$K --home "$D/ada" contact publish ada@example.com
+$K --home "$D/bob" contact lookup ada@example.com | python3 -c "import sys,json;r=json.load(sys.stdin);assert r['did']==open('$D/ada.did').read().strip(),r;print('published: held by',r['did'])"
+$K --home "$D/ada" contact unpublish ada@example.com
+if $K --home "$D/bob" contact lookup ada@example.com 2>/dev/null; then echo "FAIL: withdrawn contact still public"; exit 1; fi
+echo "withdrawn (good)"
+$K --home "$D/ada" contact add "+1 555 555 0100"
+$K --home "$D/ada" contact confirm +15555550100 "$(code tel:+15555550100)"
+$K --home "$D/bob" contact add +15555550100
+$K --home "$D/bob" contact confirm +15555550100 "$(code tel:+15555550100)"
+$K --home "$D/ada" contact list | python3 -c "import sys,json;c=[x['address'] for x in json.load(sys.stdin)['contacts']];assert c==['mailto:ada@example.com'],c;print('Ada keeps',c,'and lost the number to Bob (good)')"
 
 step "delegation: Ada lets Bob read invoices on her behalf"
 DT=$($K --home "$D/ada" delegate --to bob --action 'Query.*' --action 'Invoice.read')

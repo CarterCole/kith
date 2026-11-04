@@ -14,27 +14,16 @@ use kith_core::kel::{new_inception, verify_log, Device, DeviceKind, KeyState};
 use kith_core::keys::{KeyType, LocalSigner, Scheme, SecretKey, VerifyOptions};
 use kith_core::pdag::{self, Query};
 use kith_core::policy::SignerPolicy;
-use kith_core::revoke::{
-    authorize, Entry, Follower, FreshnessPolicy, Heartbeat, Request, Revocation,
-};
+use kith_core::revoke::{authorize, Entry, FreshnessPolicy, Follower, Heartbeat, Request, Revocation};
 
-const PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../spec/test-vectors/policy-dag.json"
-);
+const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../spec/test-vectors/policy-dag.json");
 
 fn key(seed: u8) -> LocalSigner {
-    LocalSigner::from_secret(
-        SecretKey::from_bytes(KeyType::Ed25519, &[seed; 32]).unwrap(),
-        Scheme::Raw,
-        None,
-    )
-    .unwrap()
+    LocalSigner::from_secret(SecretKey::from_bytes(KeyType::Ed25519, &[seed; 32]).unwrap(), Scheme::Raw, None).unwrap()
 }
 
 fn bundle() -> Bundle {
-    let v: Value =
-        serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
+    let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
     let mut b: Bundle = serde_json::from_value(v["bundle"].clone()).unwrap();
     b.policies.push_str(
         "\n@id(\"pay-needs-fresh\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) unless { context has kith && context.kith.sync_age < 60 };",
@@ -48,24 +37,11 @@ fn generate() -> Value {
     let store = MemStore::new();
     let root = pdag::build(&store, &b).unwrap();
     let queries = [
-        Query::Actions {
-            actions: vec!["Query.invoices".into()],
-            principals: vec![],
-        },
-        Query::Actions {
-            actions: vec!["Mutation.payInvoice".into()],
-            principals: vec!["did:kith:bob".into()],
-        },
-        Query::Actions {
-            actions: vec!["Invoice.read".into(), "Query.invoices".into()],
-            principals: vec!["did:kith:ada".into(), "did:kith:bob".into()],
-        },
-        Query::Principal {
-            id: "did:kith:ada".into(),
-        },
-        Query::Principal {
-            id: "did:kith:nobody".into(),
-        },
+        Query::Actions { actions: vec!["Query.invoices".into()], principals: vec![] },
+        Query::Actions { actions: vec!["Mutation.payInvoice".into()], principals: vec!["did:kith:bob".into()] },
+        Query::Actions { actions: vec!["Invoice.read".into(), "Query.invoices".into()], principals: vec!["did:kith:ada".into(), "did:kith:bob".into()] },
+        Query::Principal { id: "did:kith:ada".into() },
+        Query::Principal { id: "did:kith:nobody".into() },
     ];
     let slices: Vec<Value> = queries
         .iter()
@@ -84,21 +60,8 @@ fn generate() -> Value {
     // ---- an org with an admin key and a revoke-only device
     let admin = key(1);
     let revoker = key(2);
-    let dev = Device {
-        id: "revoker".into(),
-        key: revoker.id.clone(),
-        name: "revoker".into(),
-        kind: DeviceKind::Software,
-        aal: 1,
-        caps: vec!["revoke".into()],
-        rp_id: None,
-        xkey: None,
-    };
-    let mut inc = new_inception(
-        SignerPolicy::single(&admin.id),
-        &SignerPolicy::single(key(3).id),
-        vec![dev],
-    );
+    let dev = Device { id: "revoker".into(), key: revoker.id.clone(), name: "revoker".into(), kind: DeviceKind::Software, aal: 1, caps: vec!["revoke".into()], rp_id: None, xkey: None };
+    let mut inc = new_inception(SignerPolicy::single(&admin.id), &SignerPolicy::single(key(3).id), vec![dev]);
     inc.ts = 1692806000;
     inc.sign(&admin).unwrap();
     inc.sign(&revoker).unwrap();
@@ -111,72 +74,34 @@ fn generate() -> Value {
         e.sign(&admin).unwrap();
         e
     };
-    let e1 = entry(
-        None,
-        1692806100,
-        vec![Revocation::Member {
-            id: "did:kith:ada".into(),
-            set: "Group::finance".into(),
-        }],
-    );
-    let e2 = entry(
-        Some(&e1),
-        1692806110,
-        vec![Revocation::Token {
-            jti: "tok-1".into(),
-        }],
-    );
+    let e1 = entry(None, 1692806100, vec![Revocation::Member { id: "did:kith:ada".into(), set: "Group::finance".into() }]);
+    let e2 = entry(Some(&e1), 1692806110, vec![Revocation::Token { jti: "tok-1".into() }]);
     let e3 = entry(
         Some(&e2),
         1692806120,
         vec![
-            Revocation::Policy {
-                id: "own-invoice".into(),
-            },
-            Revocation::Policy {
-                id: "no-delegated-pay".into(),
-            },
+            Revocation::Policy { id: "own-invoice".into() },
+            Revocation::Policy { id: "no-delegated-pay".into() },
+            Revocation::Device { did: "did:kith:bob".into(), device: "dev_stolen".into() },
         ],
     );
 
     // drand quicknet round 1000, published at 1692806364.
-    let beacons: Value =
-        serde_json::from_str(include_str!("../../../spec/test-vectors/beacons.json")).unwrap();
+    let beacons: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/beacons.json")).unwrap();
     let round = &beacons["drand"]["cases"][0];
-    let beacon = BeaconValue::Drand {
-        chain: beacons["drand"]["chain"].as_str().unwrap().into(),
-        round: 1000,
-        signature: round["signature"].as_str().unwrap().into(),
-    };
+    let beacon = BeaconValue::Drand { chain: beacons["drand"]["chain"].as_str().unwrap().into(), round: 1000, signature: round["signature"].as_str().unwrap().into() };
     let t = round["time"].as_i64().unwrap();
     let mut hb = Heartbeat::new(&org.did, Some(&e3), Some(beacon)).unwrap();
     hb.ts = t + 1;
     hb.sign(&revoker).unwrap();
 
-    let policy = FreshnessPolicy {
-        fresh_for: 60,
-        max_staleness: 600,
-        require_beacon: true,
-    };
-    let slice = pdag::load(
-        &store,
-        &root,
-        &Query::Actions {
-            actions: vec![
-                "Query.invoices".into(),
-                "Mutation.payInvoice".into(),
-                "Invoice.read".into(),
-            ],
-            principals: vec!["did:kith:ada".into(), "did:kith:bob".into()],
-        },
-    )
-    .unwrap();
+    let policy = FreshnessPolicy { fresh_for: 60, max_staleness: 600, require_beacon: true };
+    let slice = pdag::load(&store, &root, &Query::Actions { actions: vec!["Query.invoices".into(), "Mutation.payInvoice".into(), "Invoice.read".into()], principals: vec!["did:kith:ada".into(), "did:kith:bob".into()] }).unwrap();
     let mut f = Follower::new(&org.did, 0, policy);
     for e in [&e1, &e2, &e3] {
         f.apply_entry(&org, e).unwrap();
     }
-    f.apply_heartbeat(&org, &hb, &Verifiers::default(), t + 5)
-        .unwrap();
+    f.apply_heartbeat(&org, &hb, &Verifiers::default(), t + 5).unwrap();
 
     struct Case {
         name: &'static str,
@@ -186,104 +111,36 @@ fn generate() -> Value {
         resource: Value,
         context: Value,
         jti: Option<&'static str>,
+        device: Option<&'static str>,
         actor: Option<&'static str>,
         caps: Option<Value>,
         at: i64,
+        /// What a correct implementation decides. It is asserted below, so rewriting the
+        /// file with `KITH_WRITE_VECTORS` can never bless a changed decision.
+        allowed: bool,
     }
     let op = |a: &str| json!({"type": "Operation", "id": a});
-    let c = |name, principal, aal, action: &'static str, at| Case {
-        name,
-        principal,
-        aal,
-        action,
-        resource: op(action),
-        context: json!({}),
-        jti: None,
-        actor: None,
-        caps: None,
-        at,
-    };
+    let c = |name, principal, aal, action: &'static str, at, allowed| Case { name, principal, aal, action, resource: op(action), context: json!({}), jti: None, device: None, actor: None, caps: None, at, allowed };
     let cases = vec![
-        c(
-            "bob reads invoices",
-            "did:kith:bob",
-            1,
-            "Query.invoices",
-            t + 10,
-        ),
-        c(
-            "ada lost finance, and billing-reader with it",
-            "did:kith:ada",
-            2,
-            "Query.invoices",
-            t + 10,
-        ),
-        Case {
-            jti: Some("tok-1"),
-            ..c(
-                "a revoked token",
-                "did:kith:bob",
-                1,
-                "Query.invoices",
-                t + 10,
-            )
-        },
+        c("bob reads invoices", "did:kith:bob", 1, "Query.invoices", t + 10, true),
+        c("ada lost finance, and billing-reader with it", "did:kith:ada", 2, "Query.invoices", t + 10, false),
+        Case { jti: Some("tok-1"), ..c("a revoked token", "did:kith:bob", 1, "Query.invoices", t + 10, false) },
+        Case { device: Some("dev_stolen"), ..c("a revoked device", "did:kith:bob", 1, "Query.invoices", t + 10, false) },
+        Case { device: Some("dev_laptop"), ..c("another device of the same identity", "did:kith:bob", 1, "Query.invoices", t + 10, true) },
         Case {
             resource: json!({"type": "Invoice", "id": "inv_1", "attrs": {"ownerEmail": "ada@acme.test"}}),
-            ..c(
-                "own-invoice was revoked",
-                "did:kith:ada",
-                1,
-                "Invoice.read",
-                t + 10,
-            )
+            ..c("own-invoice was revoked", "did:kith:ada", 1, "Invoice.read", t + 10, false)
         },
-        Case {
-            context: json!({"amount": 5}),
-            ..c(
-                "bob pays with a fresh view",
-                "did:kith:bob",
-                2,
-                "Mutation.payInvoice",
-                t + 10,
-            )
-        },
+        Case { context: json!({"amount": 5}), ..c("bob pays with a fresh view", "did:kith:bob", 2, "Mutation.payInvoice", t + 10, true) },
         Case {
             context: json!({"amount": 5}),
             actor: Some("did:kith:assistant"),
             caps: Some(json!([{"action": "Mutation.*"}])),
-            ..c(
-                "a forbid survives its revocation",
-                "did:kith:bob",
-                2,
-                "Mutation.payInvoice",
-                t + 10,
-            )
+            ..c("a forbid survives its revocation", "did:kith:bob", 2, "Mutation.payInvoice", t + 10, false)
         },
-        Case {
-            context: json!({"amount": 5}),
-            ..c(
-                "degraded: payments need a view under 60 s",
-                "did:kith:bob",
-                2,
-                "Mutation.payInvoice",
-                t + 300,
-            )
-        },
-        c(
-            "degraded: reads still work",
-            "did:kith:bob",
-            1,
-            "Query.invoices",
-            t + 300,
-        ),
-        c(
-            "stale: everything is denied",
-            "did:kith:bob",
-            1,
-            "Query.invoices",
-            t + 700,
-        ),
+        Case { context: json!({"amount": 5}), ..c("degraded: payments need a view under 60 s", "did:kith:bob", 2, "Mutation.payInvoice", t + 300, false) },
+        c("degraded: reads still work", "did:kith:bob", 1, "Query.invoices", t + 300, true),
+        c("stale: everything is denied", "did:kith:bob", 1, "Query.invoices", t + 700, false),
     ];
     let decisions: Vec<Value> = cases
         .into_iter()
@@ -298,27 +155,13 @@ fn generate() -> Value {
                 actor: c.actor.map(String::from),
                 caps: c.caps.clone().map(|v| serde_json::from_value(v).unwrap()),
             };
-            let mut r = Resource::new(
-                c.resource["type"].as_str().unwrap(),
-                c.resource["id"].as_str().unwrap(),
-            );
+            let mut r = Resource::new(c.resource["type"].as_str().unwrap(), c.resource["id"].as_str().unwrap());
             if let Some(a) = c.resource["attrs"].as_object() {
                 r.attrs = a.clone();
             }
             let level = f.freshness(c.at).level;
-            let d = authorize(
-                &slice,
-                &mut f,
-                &Request {
-                    principal: &p,
-                    jti: c.jti,
-                    action: c.action,
-                    resource: &r,
-                    context: &c.context,
-                },
-                c.at,
-            )
-            .unwrap();
+            let d = authorize(&slice, &mut f, &Request { principal: &p, jti: c.jti, device: c.device, action: c.action, resource: &r, context: &c.context }, c.at).unwrap();
+            assert_eq!(d.allowed, c.allowed, "{}: {:?}", c.name, d.reasons);
             let mut out = json!({
                 "name": c.name, "principal": c.principal, "attrs": attrs, "action": c.action,
                 "resource": c.resource, "context": c.context, "now": c.at,
@@ -327,16 +170,16 @@ fn generate() -> Value {
             if let Some(j) = c.jti {
                 out["jti"] = json!(j);
             }
+            if let Some(dev) = c.device {
+                out["device"] = json!(dev);
+            }
             if let Some(a) = c.actor {
                 out["actor"] = json!(a);
             }
             if let Some(caps) = c.caps {
                 out["caps"] = caps;
             }
-            if d.reasons
-                .iter()
-                .any(|r| r.starts_with("freshness:") || r.starts_with("revoked:"))
-            {
+            if d.reasons.iter().any(|r| r.starts_with("freshness:") || r.starts_with("revoked:")) {
                 out["reasons"] = json!(d.reasons);
             }
             out
@@ -377,21 +220,13 @@ fn policy_dag_vectors() {
     if std::env::var("KITH_WRITE_VECTORS").is_ok() {
         std::fs::write(PATH, serde_json::to_string_pretty(&fresh).unwrap() + "\n").unwrap();
     }
-    let on_disk: Value = serde_json::from_str(
-        &std::fs::read_to_string(PATH).expect("run with KITH_WRITE_VECTORS=1 once"),
-    )
-    .unwrap();
-    // Everything is deterministic: same keys, same timestamps, same bytes.
-    let keys: BTreeMap<&str, ()> = fresh
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(|k| (k.as_str(), ()))
-        .collect();
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(PATH).expect("run with KITH_WRITE_VECTORS=1 once")).unwrap();
+    // Everything is deterministic: same keys, same timestamps, same bytes, and no key
+    // on disk that the generator no longer produces.
+    let keys: BTreeMap<&str, ()> = fresh.as_object().unwrap().keys().map(|k| (k.as_str(), ())).collect();
+    let on_disk_keys: BTreeMap<&str, ()> = on_disk.as_object().unwrap().keys().map(|k| (k.as_str(), ())).collect();
+    assert_eq!(keys, on_disk_keys, "policy-dag.json has different top-level keys than the generator");
     for k in keys.keys() {
-        assert_eq!(
-            fresh[*k], on_disk[*k],
-            "policy-dag.json `{k}` is out of date; rerun with KITH_WRITE_VECTORS=1"
-        );
+        assert_eq!(fresh[*k], on_disk[*k], "policy-dag.json `{k}` is out of date; rerun with KITH_WRITE_VECTORS=1");
     }
 }

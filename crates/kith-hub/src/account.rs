@@ -75,7 +75,7 @@ pub async fn page(State(h): State<Arc<Hub>>, headers: HeaderMap) -> Response {
             "expires": s.expires,
             "via": a.alias,
         },
-        "email": h.store.email_for(&st.did).ok().flatten(),
+        "email": h.store.contacts_of(&st.did).ok().and_then(|cs| cs.into_iter().find(|c| c.address.starts_with("mailto:")).map(|c| c.address.trim_start_matches("mailto:").to_string())),
         "work": h.store.work_for(&st.did).ok().flatten().map_or(0, |(bits, _)| bits),
         "linked": linked,
     }))

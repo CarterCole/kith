@@ -33,15 +33,18 @@ use crate::{Error, Result};
 
 const X25519_CODEC: [u8; 2] = [0xec, 0x01];
 
+/// How many revisions ahead of the one it was given a key will derive. Revisions come
+/// from stored envelopes, and the ratchet recurses once per 65,536 steps, so an envelope
+/// that says it is revision 2^63 would otherwise overflow the stack.
+pub const MAX_REVISION_GAP: u64 = 1 << 26;
+
 /// A device's X25519 key-agreement key.
 #[derive(Clone)]
 pub struct ExchangeKey(x25519_dalek::StaticSecret);
 
 impl ExchangeKey {
     pub fn generate() -> Self {
-        ExchangeKey(x25519_dalek::StaticSecret::random_from_rng(
-            rand::rngs::OsRng,
-        ))
+        ExchangeKey(x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng))
     }
     pub fn from_bytes(b: [u8; 32]) -> Self {
         ExchangeKey(x25519_dalek::StaticSecret::from(b))
@@ -61,12 +64,9 @@ fn encode_xkey(pk: &[u8; 32]) -> String {
 }
 
 pub fn decode_xkey(did: &str) -> Result<[u8; 32]> {
-    let raw = bs58::decode(
-        did.strip_prefix("did:key:z")
-            .ok_or_else(|| Error::Encoding("xkey must be did:key".into()))?,
-    )
-    .into_vec()
-    .map_err(|e| Error::Encoding(e.to_string()))?;
+    let raw = bs58::decode(did.strip_prefix("did:key:z").ok_or_else(|| Error::Encoding("xkey must be did:key".into()))?)
+        .into_vec()
+        .map_err(|e| Error::Encoding(e.to_string()))?;
     raw.strip_prefix(&X25519_CODEC)
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| Error::Encoding("not an x25519 did:key".into()))
@@ -86,16 +86,12 @@ fn seal_key(shared: &[u8], epk: &[u8], rpk: &[u8]) -> [u8; 32] {
     let mut salt = epk.to_vec();
     salt.extend_from_slice(rpk);
     let mut out = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(&salt), shared)
-        .expand(b"kith-seal-v1", &mut out)
-        .expect("32 bytes");
+    Hkdf::<Sha256>::new(Some(&salt), shared).expand(b"kith-seal-v1", &mut out).expect("32 bytes");
     out
 }
 
 fn nonce_of(b: &[u8]) -> Result<Nonce> {
-    let arr: [u8; 12] = b
-        .try_into()
-        .map_err(|_| Error::Encoding("nonce must be 12 bytes".into()))?;
+    let arr: [u8; 12] = b.try_into().map_err(|_| Error::Encoding("nonce must be 12 bytes".into()))?;
     Ok(Nonce::from(arr))
 }
 
@@ -114,37 +110,18 @@ pub fn seal(to_xkey: &str, aad: &[u8], plaintext: &[u8]) -> Result<SealedBox> {
     let key = seal_key(shared.as_bytes(), epk.as_bytes(), &rpk);
     let nonce = random_nonce();
     let ct = ChaCha20Poly1305::new(&key.into())
-        .encrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
+        .encrypt(&Nonce::from(nonce), Payload { msg: plaintext, aad })
         .map_err(|_| Error::Encoding("seal failed".into()))?;
-    Ok(SealedBox {
-        to: to_xkey.into(),
-        epk: b64u(epk.as_bytes()),
-        nonce: b64u(nonce),
-        ct: b64u(ct),
-    })
+    Ok(SealedBox { to: to_xkey.into(), epk: b64u(epk.as_bytes()), nonce: b64u(nonce), ct: b64u(ct) })
 }
 
 pub fn open(key: &ExchangeKey, aad: &[u8], sealed: &SealedBox) -> Result<Vec<u8>> {
-    let epk: [u8; 32] = b64u_decode(&sealed.epk)?
-        .try_into()
-        .map_err(|_| Error::Encoding("epk".into()))?;
+    let epk: [u8; 32] = b64u_decode(&sealed.epk)?.try_into().map_err(|_| Error::Encoding("epk".into()))?;
     let rpk = *x25519_dalek::PublicKey::from(&key.0).as_bytes();
     let shared = key.0.diffie_hellman(&x25519_dalek::PublicKey::from(epk));
     let k = seal_key(shared.as_bytes(), &epk, &rpk);
     ChaCha20Poly1305::new(&k.into())
-        .decrypt(
-            &nonce_of(&b64u_decode(&sealed.nonce)?)?,
-            Payload {
-                msg: &b64u_decode(&sealed.ct)?,
-                aad,
-            },
-        )
+        .decrypt(&nonce_of(&b64u_decode(&sealed.nonce)?)?, Payload { msg: &b64u_decode(&sealed.ct)?, aad })
         .map_err(|_| Error::Signature("cannot open sealed box".into()))
 }
 
@@ -186,12 +163,7 @@ fn aad(group: &str, lineage: u32, revision: u64) -> Vec<u8> {
 
 impl GroupKeyring {
     pub fn new(group: impl Into<String>) -> Self {
-        GroupKeyring {
-            group: group.into(),
-            lineage: 0,
-            revision: 0,
-            ratchet: Ratchet::from_rng(&mut rand::rngs::OsRng),
-        }
+        GroupKeyring { group: group.into(), lineage: 0, revision: 0, ratchet: Ratchet::from_rng(&mut rand::rngs::OsRng) }
     }
 
     /// Advance to a new revision (e.g. each write to the group's content).
@@ -202,19 +174,11 @@ impl GroupKeyring {
     }
 
     pub fn snapshot_key(&self) -> [u8; 32] {
-        self.ratchet
-            .derive_key(&dsi(&self.group, self.lineage))
-            .finalize()
-            .into()
+        self.ratchet.derive_key(&dsi(&self.group, self.lineage)).finalize().into()
     }
 
     pub fn temporal_key(&self) -> TemporalKey {
-        TemporalKey {
-            group: self.group.clone(),
-            lineage: self.lineage,
-            revision: self.revision,
-            ratchet: self.ratchet.clone(),
-        }
+        TemporalKey { group: self.group.clone(), lineage: self.lineage, revision: self.revision, ratchet: self.ratchet.clone() }
     }
 
     /// Start a new lineage that previously shared temporal keys cannot reach.
@@ -227,21 +191,9 @@ impl GroupKeyring {
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Envelope> {
         let nonce = random_nonce();
         let ct = ChaCha20Poly1305::new(&self.snapshot_key().into())
-            .encrypt(
-                &Nonce::from(nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: &aad(&self.group, self.lineage, self.revision),
-                },
-            )
+            .encrypt(&Nonce::from(nonce), Payload { msg: plaintext, aad: &aad(&self.group, self.lineage, self.revision) })
             .map_err(|_| Error::Encoding("encrypt failed".into()))?;
-        Ok(Envelope {
-            group: self.group.clone(),
-            lineage: self.lineage,
-            revision: self.revision,
-            nonce: b64u(nonce),
-            ct: b64u(ct),
-        })
+        Ok(Envelope { group: self.group.clone(), lineage: self.lineage, revision: self.revision, nonce: b64u(nonce), ct: b64u(ct) })
     }
 
     /// Seal the current temporal key to every active device of `member` that has
@@ -252,63 +204,33 @@ impl GroupKeyring {
             .devices
             .values()
             .filter_map(|d| d.xkey.as_deref())
-            .map(|x| {
-                seal(
-                    x,
-                    format!("kith-share|{}|{}", self.group, member.did).as_bytes(),
-                    &tk,
-                )
-            })
+            .map(|x| seal(x, format!("kith-share|{}|{}", self.group, member.did).as_bytes(), &tk))
             .collect()
     }
 }
 
 impl TemporalKey {
-    /// Key for `revision` of this lineage, or `None` if it is before our access began.
+    /// Key for `revision` of this lineage, or `None` if it is before our access began or
+    /// more than [`MAX_REVISION_GAP`] after it.
     pub fn key_at(&self, revision: u64) -> Option<[u8; 32]> {
-        if revision < self.revision {
-            return None;
-        }
+        let gap = revision.checked_sub(self.revision).filter(|g| *g <= MAX_REVISION_GAP)?;
         let mut r = self.ratchet.clone();
-        r.inc_by((revision - self.revision) as usize);
-        Some(
-            r.derive_key(&dsi(&self.group, self.lineage))
-                .finalize()
-                .into(),
-        )
+        r.inc_by(gap as usize);
+        Some(r.derive_key(&dsi(&self.group, self.lineage)).finalize().into())
     }
 
     pub fn decrypt(&self, env: &Envelope) -> Result<Vec<u8>> {
         if env.group != self.group || env.lineage != self.lineage {
-            return Err(Error::Authz(
-                "envelope is from a lineage this key cannot read".into(),
-            ));
+            return Err(Error::Authz("envelope is from a lineage this key cannot read".into()));
         }
-        let key = self
-            .key_at(env.revision)
-            .ok_or_else(|| Error::Authz("revision predates access".into()))?;
+        let key = self.key_at(env.revision).ok_or_else(|| Error::Authz("revision is outside what this key can derive".into()))?;
         ChaCha20Poly1305::new(&key.into())
-            .decrypt(
-                &nonce_of(&b64u_decode(&env.nonce)?)?,
-                Payload {
-                    msg: &b64u_decode(&env.ct)?,
-                    aad: &aad(&env.group, env.lineage, env.revision),
-                },
-            )
+            .decrypt(&nonce_of(&b64u_decode(&env.nonce)?)?, Payload { msg: &b64u_decode(&env.ct)?, aad: &aad(&env.group, env.lineage, env.revision) })
             .map_err(|_| Error::Signature("decryption failed".into()))
     }
 
-    pub fn open_share(
-        key: &ExchangeKey,
-        group: &str,
-        member_did: &str,
-        sealed: &SealedBox,
-    ) -> Result<Self> {
-        Ok(serde_json::from_slice(&open(
-            key,
-            format!("kith-share|{group}|{member_did}").as_bytes(),
-            sealed,
-        )?)?)
+    pub fn open_share(key: &ExchangeKey, group: &str, member_did: &str, sealed: &SealedBox) -> Result<Self> {
+        Ok(serde_json::from_slice(&open(key, format!("kith-share|{group}|{member_did}").as_bytes(), sealed)?)?)
     }
 }
 
@@ -364,12 +286,20 @@ mod tests {
         let tk = TemporalKey::open_share(&xk, "finance", &member.did, &boxes[0]).unwrap();
         let env = ring.encrypt(b"hello").unwrap();
         assert_eq!(tk.decrypt(&env).unwrap(), b"hello");
-        assert!(TemporalKey::open_share(
-            &ExchangeKey::generate(),
-            "finance",
-            &member.did,
-            &boxes[0]
-        )
-        .is_err());
+        assert!(TemporalKey::open_share(&ExchangeKey::generate(), "finance", &member.did, &boxes[0]).is_err());
+    }
+
+    #[test]
+    fn an_absurd_revision_is_refused_not_chased() {
+        let mut ring = GroupKeyring::new("finance");
+        let tk = ring.temporal_key();
+        let mut env = ring.encrypt(b"x").unwrap();
+        env.revision = u64::MAX;
+        assert!(tk.decrypt(&env).is_err());
+        assert!(tk.key_at(u64::MAX).is_none());
+        assert!(tk.key_at(tk.revision + MAX_REVISION_GAP + 1).is_none());
+        assert!(tk.key_at(tk.revision + MAX_REVISION_GAP).is_some(), "the limit itself works");
+        ring.advance();
+        assert_eq!(tk.decrypt(&ring.encrypt(b"y").unwrap()).unwrap(), b"y");
     }
 }

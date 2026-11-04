@@ -37,6 +37,16 @@ try {
   await page.goto(url);
   await shot(page, "1-enroll");
   await page.click("#create");
+  // The page and the terminal show the same code for the key; only then does the user say yes.
+  await page.waitForSelector("#check:not(.hidden)", { timeout: 15000 });
+  const shown = (await page.textContent("#fingerprint"))!.trim();
+  assert.match(shown, /^[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}$/);
+  const deadline = Date.now() + 15000;
+  while (!cliErr.includes(`fingerprint ${shown}`)) {
+    assert.ok(Date.now() < deadline, `the CLI never showed fingerprint ${shown}: ${cliErr}`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  cli.stdin.write("y\n");
   await page.waitForSelector("#confirm:not(.hidden)", { timeout: 15000 });
   await page.click("#confirm");
   await page.waitForFunction(() => document.getElementById("status")!.textContent!.startsWith("Done"));

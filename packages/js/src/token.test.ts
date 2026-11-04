@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
-import { createVerifier, principalFromClaims } from "./token.ts";
+import { createAttestationVerifier, createVerifier, principalFromClaims, KithAuthError } from "./token.ts";
 
 test("verifies an at+jwt and maps claims to a principal", async () => {
   const { publicKey, privateKey } = await generateKeyPair("EdDSA", { crv: "Ed25519" });
@@ -18,3 +19,34 @@ test("verifies an at+jwt and maps claims to a principal", async () => {
   assert.equal(p.actor, "did:kith:agent");
   await assert.rejects(createVerifier({ issuer: "http://hub", audience: "other", jwks: { keys: [jwk] } })(token));
 });
+
+const vectors = JSON.parse(readFileSync(new URL("../../../spec/test-vectors/tokens.json", import.meta.url), "utf8"));
+
+// The same cases every implementation runs (spec 3.5): a resource server accepts a
+// token if and only if the vector says so.
+for (const c of vectors.cases as { name: string; token: string; valid: boolean; claims?: Record<string, unknown> }[]) {
+  test(`token vectors: ${c.name}`, async () => {
+    const verify = createVerifier({ issuer: vectors.issuer, audience: vectors.audience, jwks: vectors.jwks, clockTolerance: vectors.leeway, now: () => vectors.now });
+    if (!c.valid) {
+      await assert.rejects(verify(c.token), KithAuthError);
+      return;
+    }
+    const got = await verify(c.token);
+    for (const [k, v] of Object.entries(c.claims ?? {})) assert.deepEqual((got as any)[k], v, k);
+  });
+}
+
+const attestations = JSON.parse(readFileSync(new URL("../../../spec/test-vectors/attestations.json", import.meta.url), "utf8"));
+
+// An app accepts "this is that account" if and only if the vector says so (spec 7.8.1, 7.8.2).
+for (const c of attestations.cases as { name: string; token: string; valid: boolean; audience?: string; claims?: Record<string, unknown> }[]) {
+  test(`attestation vectors: ${c.name}`, async () => {
+    const verify = createAttestationVerifier({ issuer: attestations.issuer, audience: c.audience ?? attestations.audience, jwks: attestations.jwks, clockTolerance: attestations.leeway, now: () => attestations.now });
+    if (!c.valid) {
+      await assert.rejects(verify(c.token), KithAuthError);
+      return;
+    }
+    const got = await verify(c.token);
+    for (const [k, v] of Object.entries(c.claims ?? {})) assert.deepEqual((got as any)[k], v, k);
+  });
+}

@@ -14,6 +14,9 @@
 //!   the device is revoked.
 //! * A provider supplies **attributes** only when its entry lists them. The hub then
 //!   reads the ID token and the UserInfo endpoint, and keeps just the listed claims.
+//! * With the `linked_account` scope, the client also gets a hub-signed **account
+//!   attestation** naming the account that signed in (spec 7.8.1). The alias list in a
+//!   KEL is self-asserted, so it never produces one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -31,10 +34,11 @@ use sha2::Sha256;
 use kith_core::jws;
 use kith_core::keys::PublicKey;
 use kith_core::session::LEEWAY;
+use kith_core::token::AccountAttestation;
 use kith_core::util::{b64u, b64u_decode, now, random_id, sha256};
 
-use crate::oidc::{cookie, enc, with_params};
-use crate::{pages, ApiError, ApiResult, Factor, Hub};
+use crate::oidc::{cookie, dec, enc, with_params};
+use crate::{pages, ApiError, ApiResult, Authn, Factor, Hub, TOKEN_TTL};
 
 pub const STATE_COOKIE: &str = "kith_upstream";
 pub const PENDING_TTL: i64 = 600;
@@ -42,9 +46,26 @@ const JWKS_TTL: i64 = 3600;
 const JWKS_MIN_REFETCH: i64 = 60;
 /// Attributes the KEL and the login decide. No provider may assert them.
 const RESERVED_ATTRIBUTES: [&str; 4] = ["aliases", "aal", "work", "email_verified"];
+const FACEBOOK_GRAPH_VERSION: &str = "v25.0";
 
 fn default_scope() -> String {
     "openid".into()
+}
+
+/// How the hub presents the authorization code to the token endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenRequest {
+    /// `POST` a form, with HTTP Basic when there is a `client_secret`.
+    #[default]
+    Post,
+    /// `GET` with the parameters in the URL, as Facebook documents. PKCE is the proof,
+    /// so `client_secret` is never sent, which keeps it out of URLs and logs.
+    Get,
+}
+
+fn is_post(t: &TokenRequest) -> bool {
+    *t == TokenRequest::Post
 }
 
 /// An upstream OpenID Connect provider the hub accepts logins from.
@@ -77,6 +98,8 @@ pub struct Upstream {
     /// provider only proves who signed in, and UserInfo is never called.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attributes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_post")]
+    pub token_request: TokenRequest,
 }
 
 fn secure_url(u: &str) -> bool {
@@ -101,6 +124,31 @@ impl Upstream {
             jwks_uri: Some("https://oauth.telegram.org/.well-known/jwks.json".into()),
             userinfo_endpoint: None,
             attributes: BTreeMap::new(),
+            token_request: TokenRequest::Post,
+        }
+    }
+
+    /// Facebook's OIDC code flow with PKCE. Its discovery document doesn't list the
+    /// code flow or a token endpoint, so the endpoints are spelled out. `sub` is per
+    /// app: it identifies the account to this hub, not a public profile.
+    pub fn facebook(app_id: impl Into<String>) -> Self {
+        Upstream {
+            id: "facebook".into(),
+            name: Some("Facebook".into()),
+            issuer: "https://www.facebook.com".into(),
+            client_id: app_id.into(),
+            client_secret: None,
+            scope: default_scope(),
+            authorization_endpoint: Some(format!(
+                "https://www.facebook.com/{FACEBOOK_GRAPH_VERSION}/dialog/oauth"
+            )),
+            token_endpoint: Some(format!(
+                "https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/oauth/access_token"
+            )),
+            jwks_uri: Some("https://www.facebook.com/.well-known/oauth/openid/jwks/".into()),
+            userinfo_endpoint: None,
+            attributes: BTreeMap::new(),
+            token_request: TokenRequest::Get,
         }
     }
 
@@ -133,6 +181,12 @@ impl Upstream {
             if !secure_url(u) {
                 anyhow::bail!("upstream {}: {u} must be https or loopback http", self.id);
             }
+        }
+        if self.token_request == TokenRequest::Get && self.client_secret.is_some() {
+            anyhow::bail!(
+                "upstream {}: token_request get would put client_secret in a URL; leave it out",
+                self.id
+            );
         }
         if !self.scope.split_whitespace().any(|s| s == "openid") {
             anyhow::bail!("upstream {}: scope must include openid", self.id);
@@ -369,6 +423,39 @@ impl Hub {
         (t.created + TICKET_TTL > now()).then_some(t)
     }
 
+    /// The attestation for a login that came through a provider this hub still trusts
+    /// (spec 7.8.1). `None` for any other login, whatever aliases the KEL lists.
+    pub(crate) fn account_attestation(
+        &self,
+        client_id: &str,
+        sub: &str,
+        a: &Authn,
+    ) -> ApiResult<Option<String>> {
+        let Some(alias) = &a.alias else {
+            return Ok(None);
+        };
+        let Some((issuer, account)) = alias.split_once('#') else {
+            return Ok(None);
+        };
+        let Some(p) = self.cfg.upstreams.iter().find(|u| u.issuer == issuer) else {
+            return Ok(None);
+        };
+        let iat = now();
+        let claims = AccountAttestation {
+            iss: self.cfg.issuer.clone(),
+            sub: sub.into(),
+            aud: client_id.into(),
+            iat,
+            exp: iat + TOKEN_TTL,
+            jti: random_id(),
+            provider: p.id.clone(),
+            provider_iss: p.issuer.clone(),
+            account: dec(account),
+            verified_at: a.auth_time,
+        };
+        Ok(Some(self.signer.issue_attestation(&claims)?))
+    }
+
     fn upstream_callback(&self, p: &Upstream) -> String {
         format!("{}/oauth/upstream/{}/callback", self.cfg.issuer, p.id)
     }
@@ -485,19 +572,28 @@ impl Hub {
             ("code_verifier", pending.verifier.as_str()),
         ];
         // Basic for confidential clients (what Telegram documents); public ones rely on PKCE.
-        let body = form
-            .iter()
-            .map(|(k, v)| format!("{k}={}", enc(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        let mut req = self
-            .http
-            .post(&meta.token_endpoint)
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(body);
-        if let Some(secret) = &p.client_secret {
-            req = req.basic_auth(&p.client_id, Some(secret));
-        }
+        let req = match p.token_request {
+            TokenRequest::Get => self.http.get(with_params(
+                &meta.token_endpoint,
+                &form.map(|(k, v)| (k, Some(v))),
+            )),
+            TokenRequest::Post => {
+                let body = form
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", enc(v)))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                let req = self
+                    .http
+                    .post(&meta.token_endpoint)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(body);
+                match &p.client_secret {
+                    Some(secret) => req.basic_auth(&p.client_id, Some(secret)),
+                    None => req,
+                }
+            }
+        };
         let unavailable =
             |e: String| ApiError(StatusCode::BAD_GATEWAY, "upstream_error".into(), e, None);
         let resp = req.send().await.map_err(|e| unavailable(e.to_string()))?;

@@ -267,6 +267,8 @@ export interface Request {
   principal: Principal;
   /** The token's `jti`, if the principal came from a token. */
   jti?: string;
+  /** The token's `dev` claim: the device the principal signed in from, if any. */
+  device?: string;
   action: string;
   resource: Resource;
   context?: Record<string, unknown>;
@@ -283,6 +285,7 @@ export function authorize(slice: Slice, follower: Follower, req: Request, now: n
   if (f.level !== "fresh" && f.level !== "degraded") return deny(`freshness:${f.level}`);
   if (follower.isPrincipalRevoked(req.principal.id)) return deny("revoked:principal");
   if (req.jti && follower.isTokenRevoked(req.jti)) return deny("revoked:token");
+  if (req.device && follower.isDeviceRevoked(req.principal.id, req.device)) return deny("revoked:device");
   const engine = slice.engine(follower.revokedPolicies());
   const attrs = engine.attributes(req.principal.id, req.principal.attrs);
   const m = engine.memberships(req.principal.id, attrs, follower.excludedSets(req.principal.id));

@@ -9,7 +9,7 @@
 //! the same root. A lookup touches one block per level and proves both presence
 //! and absence of a key.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use serde_json::{json, Map, Value};
@@ -40,10 +40,7 @@ pub fn cid_of(bytes: &[u8]) -> String {
     varint(DAG_JSON, &mut raw);
     raw.extend([0x12, 0x20]);
     raw.extend(sha256(bytes));
-    format!(
-        "b{}",
-        data_encoding::BASE32_NOPAD.encode(&raw).to_lowercase()
-    )
+    format!("b{}", data_encoding::BASE32_NOPAD.encode(&raw).to_lowercase())
 }
 
 /// Encode a value as a block: canonical JSON bytes and their CID.
@@ -75,13 +72,9 @@ pub trait BlockPut: BlockGet {
 
 /// Fetch a block and check it hashes to its CID.
 pub fn get_verified(store: &dyn BlockGet, cid: &str) -> Result<Value> {
-    let bytes = store
-        .get(cid)?
-        .ok_or_else(|| Error::NotFound(format!("block {cid}")))?;
+    let bytes = store.get(cid)?.ok_or_else(|| Error::NotFound(format!("block {cid}")))?;
     if cid_of(&bytes) != cid {
-        return Err(Error::Encoding(format!(
-            "block {cid} does not match its hash"
-        )));
+        return Err(Error::Encoding(format!("block {cid} does not match its hash")));
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -130,11 +123,17 @@ impl BlockPut for MemStore {
 /// A directory of `<cid>` files.
 pub struct FsStore(pub std::path::PathBuf);
 
+/// A CID is base32 text. Anything else is not a file name this store will touch.
+fn check_cid_name(cid: &str) -> Result<()> {
+    if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(Error::Encoding(format!("bad cid {cid:?}")));
+    }
+    Ok(())
+}
+
 impl BlockGet for FsStore {
     fn get(&self, cid: &str) -> Result<Option<Vec<u8>>> {
-        if !cid.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return Err(Error::Encoding(format!("bad cid {cid:?}")));
-        }
+        check_cid_name(cid)?;
         match std::fs::read(self.0.join(cid)) {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -145,6 +144,10 @@ impl BlockGet for FsStore {
 
 impl BlockPut for FsStore {
     fn put(&self, cid: &str, bytes: Vec<u8>) -> Result<()> {
+        check_cid_name(cid)?;
+        if cid_of(&bytes) != cid {
+            return Err(Error::Encoding(format!("block does not hash to {cid}")));
+        }
         std::fs::create_dir_all(&self.0).map_err(|e| Error::Encoding(e.to_string()))?;
         std::fs::write(self.0.join(cid), bytes).map_err(|e| Error::Encoding(e.to_string()))
     }
@@ -158,10 +161,7 @@ pub struct Recording<'a> {
 
 impl<'a> Recording<'a> {
     pub fn new(inner: &'a dyn BlockGet) -> Self {
-        Recording {
-            inner,
-            seen: Mutex::new(BTreeMap::new()),
-        }
+        Recording { inner, seen: Mutex::new(BTreeMap::new()) }
     }
     pub fn into_blocks(self) -> BTreeMap<String, Vec<u8>> {
         self.seen.into_inner().unwrap()
@@ -182,11 +182,7 @@ impl BlockGet for Recording<'_> {
 fn nibble(key: &str, depth: usize) -> usize {
     let h = sha256(key.as_bytes());
     let b = h[depth / 2];
-    (if depth.is_multiple_of(2) {
-        b >> 4
-    } else {
-        b & 0x0f
-    }) as usize
+    (if depth.is_multiple_of(2) { b >> 4 } else { b & 0x0f }) as usize
 }
 
 /// Build a Merkle map. Returns the root CID; every node is written to `store`.
@@ -215,11 +211,7 @@ fn build_node(store: &dyn BlockPut, entries: &[(&String, &Value)], depth: usize)
     }
     let mut c = vec![];
     for b in buckets {
-        c.push(if b.is_empty() {
-            Value::Null
-        } else {
-            link(&build_node(store, &b, depth + 1)?)
-        });
+        c.push(if b.is_empty() { Value::Null } else { link(&build_node(store, &b, depth + 1)?) });
     }
     put_value(store, &json!({ "c": c }))
 }
@@ -238,22 +230,18 @@ pub fn map_get(store: &dyn BlockGet, root: &str, key: &str) -> Result<Option<Val
             }
             return Ok(None);
         }
-        let c = node
-            .get("c")
-            .and_then(Value::as_array)
-            .filter(|c| c.len() == 16);
+        // A branch at depth 64 would need a 65th nibble of a hash that has 64. The
+        // builder never makes one, so a store that serves one is lying.
+        if depth == 64 {
+            return Err(Error::Encoding("merkle map too deep".into()));
+        }
+        let c = node.get("c").and_then(Value::as_array).filter(|c| c.len() == 16);
         let Some(c) = c else {
-            return Err(Error::Encoding(format!(
-                "merkle map node {cid} is malformed"
-            )));
+            return Err(Error::Encoding(format!("merkle map node {cid} is malformed")));
         };
         match &c[nibble(key, depth)] {
             Value::Null => return Ok(None),
-            v => {
-                cid = as_link(v)
-                    .ok_or_else(|| Error::Encoding("merkle map child is not a link".into()))?
-                    .to_string()
-            }
+            v => cid = as_link(v).ok_or_else(|| Error::Encoding("merkle map child is not a link".into()))?.to_string(),
         }
     }
     Err(Error::Encoding("merkle map too deep".into()))
@@ -263,7 +251,13 @@ pub fn map_get(store: &dyn BlockGet, root: &str, key: &str) -> Result<Option<Val
 pub fn map_entries(store: &dyn BlockGet, root: &str) -> Result<BTreeMap<String, Value>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![root.to_string()];
+    // A block is read once however many links point at it. Content addressing lets one
+    // child sit under sixteen parents, and without this a few blocks name 16^n paths.
+    let mut seen = BTreeSet::new();
     while let Some(cid) = stack.pop() {
+        if !seen.insert(cid.clone()) {
+            continue;
+        }
         let node = get_verified(store, &cid)?;
         if let Some(e) = node.get("e").and_then(Value::as_array) {
             for pair in e {
@@ -280,31 +274,12 @@ pub fn map_entries(store: &dyn BlockGet, root: &str) -> Result<BTreeMap<String, 
 
 /// Blocks as a JSON object `{cid: block text}` (the test-vector and HTTP bundle form).
 pub fn blocks_to_json(blocks: &BTreeMap<String, Vec<u8>>) -> Value {
-    Value::Object(
-        blocks
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    Value::String(String::from_utf8_lossy(v).into_owned()),
-                )
-            })
-            .collect::<Map<_, _>>(),
-    )
+    Value::Object(blocks.iter().map(|(k, v)| (k.clone(), Value::String(String::from_utf8_lossy(v).into_owned()))).collect::<Map<_, _>>())
 }
 
 pub fn blocks_from_json(v: &Value) -> Result<BTreeMap<String, Vec<u8>>> {
-    let o = v
-        .as_object()
-        .ok_or_else(|| Error::Encoding("blocks must be an object".into()))?;
-    Ok(o.iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                v.as_str().unwrap_or_default().as_bytes().to_vec(),
-            )
-        })
-        .collect())
+    let o = v.as_object().ok_or_else(|| Error::Encoding("blocks must be an object".into()))?;
+    o.iter().map(|(k, v)| v.as_str().map(|s| (k.clone(), s.as_bytes().to_vec())).ok_or_else(|| Error::Encoding(format!("block {k} must be a string")))).collect()
 }
 
 #[cfg(test)]
@@ -316,16 +291,12 @@ mod tests {
         let (cid, bytes) = encode(&json!({"hello": "world"})).unwrap();
         assert_eq!(bytes, br#"{"hello":"world"}"#);
         // Same CID as @ipld/dag-json + multiformats produce for this value.
-        assert_eq!(
-            cid,
-            "baguqeerasords4njcts6vs7qvdjfcvgnume4hqohf65zsfguprqphs3icwea"
-        );
+        assert_eq!(cid, "baguqeerasords4njcts6vs7qvdjfcvgnume4hqohf65zsfguprqphs3icwea");
     }
 
     #[test]
     fn map_shape_is_order_independent_and_proves_absence() {
-        let entries: BTreeMap<String, Value> =
-            (0..100).map(|i| (format!("k{i}"), json!(i))).collect();
+        let entries: BTreeMap<String, Value> = (0..100).map(|i| (format!("k{i}"), json!(i))).collect();
         let a = MemStore::new();
         let root = map_build(&a, &entries).unwrap();
         let b = MemStore::new();
@@ -336,15 +307,9 @@ mod tests {
         let rec = Recording::new(&a);
         assert_eq!(map_get(&rec, &root, "k42").unwrap(), Some(json!(42)));
         let proof = rec.into_blocks();
-        assert!(
-            proof.len() < a.len() / 3,
-            "a lookup touches a path, not the tree"
-        );
+        assert!(proof.len() < a.len() / 3, "a lookup touches a path, not the tree");
         // The proof alone is enough to repeat the lookup.
-        assert_eq!(
-            map_get(&MemStore::from_blocks(proof), &root, "k42").unwrap(),
-            Some(json!(42))
-        );
+        assert_eq!(map_get(&MemStore::from_blocks(proof), &root, "k42").unwrap(), Some(json!(42)));
         assert_eq!(map_get(&a, &root, "nope").unwrap(), None);
         assert_eq!(map_entries(&a, &root).unwrap(), entries);
     }
@@ -353,9 +318,76 @@ mod tests {
     fn tampered_blocks_are_rejected() {
         let s = MemStore::new();
         let root = map_build(&s, &[("a".to_string(), json!(1))].into_iter().collect()).unwrap();
-        s.0.lock()
-            .unwrap()
-            .insert(root.clone(), br#"{"e":[["a",2]]}"#.to_vec());
+        s.0.lock().unwrap().insert(root.clone(), br#"{"e":[["a",2]]}"#.to_vec());
         assert!(map_get(&s, &root, "a").is_err());
+    }
+
+    #[test]
+    fn a_map_that_is_too_deep_is_an_error_not_a_panic() {
+        // One branch more than `map_build` ever makes. Past depth 63 there is no nibble
+        // of the 32-byte hash left to look up, so the walk must stop first.
+        let s = MemStore::new();
+        let mut next = put_value(&s, &json!({"e": []})).unwrap();
+        for depth in (0..=64).rev() {
+            let mut c = vec![Value::Null; 16];
+            c[if depth < 64 { nibble("k", depth) } else { 0 }] = link(&next);
+            next = put_value(&s, &json!({"c": c})).unwrap();
+        }
+        assert!(map_get(&s, &next, "k").is_err());
+    }
+
+    /// A store that gives up after `limit` reads, so a walk that never ends is an error.
+    struct Budget<'a> {
+        inner: &'a MemStore,
+        reads: std::sync::atomic::AtomicUsize,
+        limit: usize,
+    }
+
+    impl BlockGet for Budget<'_> {
+        fn get(&self, cid: &str) -> Result<Option<Vec<u8>>> {
+            if self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= self.limit {
+                return Err(Error::Encoding("read budget exceeded".into()));
+            }
+            self.inner.get(cid)
+        }
+    }
+
+    #[test]
+    fn a_diamond_shaped_map_is_read_once() {
+        // Sixteen links to the same child, twelve levels down: 16^12 paths, 13 blocks.
+        let s = MemStore::new();
+        let mut next = put_value(&s, &json!({"e": [["k", 1]]})).unwrap();
+        for _ in 0..12 {
+            next = put_value(&s, &json!({"c": vec![link(&next); 16]})).unwrap();
+        }
+        let budget = Budget { inner: &s, reads: Default::default(), limit: 1000 };
+        let all = map_entries(&budget, &next).unwrap();
+        assert_eq!(all, BTreeMap::from([("k".to_string(), json!(1))]));
+        assert!(budget.reads.load(std::sync::atomic::Ordering::Relaxed) <= 13);
+    }
+
+    #[test]
+    fn the_file_store_keeps_to_its_directory_and_to_honest_names() {
+        let dir = std::env::temp_dir().join(format!("kith-fsstore-{}", crate::util::random_id()));
+        let fs = FsStore(dir.clone());
+        let (cid, bytes) = encode(&json!({"a": 1})).unwrap();
+        fs.put(&cid, bytes.clone()).unwrap();
+        assert_eq!(fs.get(&cid).unwrap(), Some(bytes.clone()));
+        for bad in ["../escape", "a/b", "", "a b", ".."] {
+            assert!(fs.put(bad, bytes.clone()).is_err(), "{bad:?} was accepted as a name");
+        }
+        assert!(!dir.parent().unwrap().join("escape").exists());
+        // Bytes that do not hash to the name are refused on the way in, as on the way out.
+        let (other, _) = encode(&json!({"b": 2})).unwrap();
+        assert!(fs.put(&other, bytes).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn blocks_that_are_not_text_are_an_error() {
+        assert!(blocks_from_json(&json!({"bafy": "{}"})).is_ok());
+        for bad in [json!({"bafy": 5}), json!({"bafy": null}), json!({"bafy": ["x"]}), json!([1])] {
+            assert!(blocks_from_json(&bad).is_err(), "{bad}");
+        }
     }
 }

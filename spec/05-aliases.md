@@ -195,6 +195,13 @@ To verify, the verifier:
 1. Resolves the root KEL.
 2. Recomputes the commitment and finds it at `seq`.
 3. Checks the alias signature, the `aud`, and the `nonce`.
+4. Checks `iat`: no more than 5 minutes old, and no more than 60 s ahead of the
+   verifier's clock. A verifier that hands out nonces with a longer life may widen
+   the first limit.
+
+The nonce makes the proof the verifier's alone. `iat` is for a verifier that has no
+nonce to give: without it, a proof saved today could be shown as fresh next year.
+`kith alias verify` takes `--nonce` and `--max-age`.
 
 Both sides have now consented: the root committed, and the alias signed.
 

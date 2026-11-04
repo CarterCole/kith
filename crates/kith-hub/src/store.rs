@@ -2,7 +2,8 @@
 //!
 //! Everything a restart used to lose lives here: OpenID Connect sessions, codes,
 //! refresh tokens and pending sign-in requests, remembered consent, dynamically
-//! registered clients, TOTP enrollments with their lockouts, co-signer keys, the
+//! registered clients, TOTP enrollments with their lockouts, co-signer keys, verified
+//! contacts and the codes sent for them (hashed), the
 //! token replay cache and rate-limit counters. Bearer secrets (session cookies,
 //! codes, refresh tokens, request ids) are stored as their SHA-256, so a copy of the
 //! file does not let anyone replay them. KELs stay as files under `kels/` (anyone
@@ -24,6 +25,7 @@ use serde_json::{json, Value};
 use kith_core::keys::{KeyType, LocalSigner};
 use kith_core::util::{b64u, b64u_decode, now, sha256};
 
+use crate::contacts::{ContactRecord, CODE_TRIES};
 use crate::oidc::{AuthRequest, Client, CodeGrant, RefreshGrant, SsoSession};
 use crate::{read_json, RateLimit};
 
@@ -44,11 +46,12 @@ CREATE TABLE IF NOT EXISTS oidc_clients (client_id TEXT PRIMARY KEY, created INT
 CREATE TABLE IF NOT EXISTS totp (did TEXT PRIMARY KEY, secret TEXT NOT NULL, confirmed INTEGER NOT NULL, last_step INTEGER NOT NULL, failures INTEGER NOT NULL, locked_until INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cosigners (did TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS seen_jti (jti TEXT PRIMARY KEY, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS contacts (address TEXT PRIMARY KEY, did TEXT NOT NULL, verified_at INTEGER NOT NULL, public INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS contacts_did ON contacts (did);
+CREATE TABLE IF NOT EXISTS contact_codes (did TEXT NOT NULL, address TEXT NOT NULL, code TEXT NOT NULL, expires INTEGER NOT NULL, failures INTEGER NOT NULL, PRIMARY KEY (did, address));
 CREATE TABLE IF NOT EXISTS rate_limits (bucket TEXT PRIMARY KEY, window_start INTEGER NOT NULL, window_secs INTEGER NOT NULL, count INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS handles (handle TEXT PRIMARY KEY, did TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS provider_links (alias TEXT PRIMARY KEY, did TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS emails (email TEXT PRIMARY KEY, did TEXT NOT NULL, verified INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS emails_did ON emails (did);
 CREATE TABLE IF NOT EXISTS work (did TEXT PRIMARY KEY, bits INTEGER NOT NULL, nonce INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
 ";
@@ -177,6 +180,7 @@ impl Store {
             c.execute("DELETE FROM oidc_sessions WHERE expires <= ?1", params![t])?;
             c.execute("DELETE FROM oidc_refresh WHERE expires <= ?1", params![t])?;
             c.execute("DELETE FROM seen_jti WHERE expires <= ?1", params![t])?;
+            c.execute("DELETE FROM contact_codes WHERE expires <= ?1", params![t])?;
             c.execute(
                 "DELETE FROM rate_limits WHERE window_start + window_secs <= ?1",
                 params![t],
@@ -200,6 +204,7 @@ impl Store {
                 "registered_clients": count("oidc_clients")?,
                 "totp_enrollments": count("totp")?,
                 "cosigners": count("cosigners")?,
+                "contacts": count("contacts")?,
             }))
         })
     }
@@ -500,25 +505,51 @@ impl Store {
     // ------------------------------------------------------------ TOTP, co-signers
 
     pub(crate) fn totp(&self, did: &str) -> anyhow::Result<Option<TotpRecord>> {
-        self.with(|c| {
-            let row: Option<(String, bool, i64, u32, i64)> = c
-                .query_row("SELECT secret, confirmed, last_step, failures, locked_until FROM totp WHERE did = ?1", params![did], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-                .optional()?;
-            Ok(match row {
-                Some((secret, confirmed, last_step, failures, locked_until)) => Some(TotpRecord { secret: b64u_decode(&secret)?, confirmed, last_step, failures, locked_until }),
-                None => None,
-            })
-        })
+        self.with(|c| read_totp(c, did))
     }
 
     pub(crate) fn put_totp(&self, did: &str, r: &TotpRecord) -> anyhow::Result<()> {
+        self.with(|c| write_totp(c, did, r))
+    }
+
+    /// Read `did`'s TOTP record, let `f` change it, and write it back, all while
+    /// holding the connection. Two attempts at once therefore can't both see the
+    /// old failure count or the old last step. `None`: nothing is enrolled.
+    pub(crate) fn update_totp<R>(
+        &self,
+        did: &str,
+        f: impl FnOnce(&mut TotpRecord) -> R,
+    ) -> anyhow::Result<Option<R>> {
         self.with(|c| {
-            Ok(c.execute(
-                "INSERT INTO totp (did, secret, confirmed, last_step, failures, locked_until) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(did) DO UPDATE SET secret = excluded.secret, confirmed = excluded.confirmed, last_step = excluded.last_step, failures = excluded.failures, locked_until = excluded.locked_until",
-                params![did, b64u(&r.secret), r.confirmed, r.last_step, r.failures, r.locked_until],
+            let Some(mut rec) = read_totp(c, did)? else {
+                return Ok(None);
+            };
+            let out = f(&mut rec);
+            write_totp(c, did, &rec)?;
+            Ok(Some(out))
+        })
+    }
+
+    /// Forget `did`'s authenticator and remember when, so that sign-ins which rested
+    /// on it alone (no device to revoke) stop working. `true` if one was enrolled.
+    pub(crate) fn delete_totp(&self, did: &str, t: i64) -> anyhow::Result<bool> {
+        self.with(|c| {
+            let had = c.execute("DELETE FROM totp WHERE did = ?1", params![did])? > 0;
+            c.execute("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![format!("totp_reset|{did}"), t.to_string()])?;
+            Ok(had)
+        })
+    }
+
+    /// When `did`'s authenticator was last reset, if ever.
+    pub(crate) fn totp_reset_at(&self, did: &str) -> anyhow::Result<Option<i64>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![format!("totp_reset|{did}")],
+                |r| r.get::<_, String>(0),
             )
-            .map(drop)?)
+            .optional()?
+            .and_then(|v| v.parse().ok()))
         })
     }
 
@@ -618,48 +649,6 @@ impl Store {
         })
     }
 
-    // ------------------------------------------------------------ verified email
-
-    /// Record a verified address for `did`; `false` when another identity has it.
-    pub(crate) fn put_email(&self, email: &str, did: &str) -> anyhow::Result<bool> {
-        self.with(|c| {
-            Ok(c.execute(
-                "INSERT OR IGNORE INTO emails (email, did, verified) VALUES (?1, ?2, 1)",
-                params![email, did],
-            )? == 1)
-        })
-    }
-
-    pub(crate) fn email_taken(&self, email: &str) -> anyhow::Result<bool> {
-        self.with(|c| {
-            Ok(c.query_row(
-                "SELECT 1 FROM emails WHERE email = ?1",
-                params![email],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-        })
-    }
-
-    pub(crate) fn email_for(&self, did: &str) -> anyhow::Result<Option<String>> {
-        self.with(|c| {
-            Ok(c.query_row(
-                "SELECT email FROM emails WHERE did = ?1 AND verified = 1 ORDER BY rowid LIMIT 1",
-                params![did],
-                |r| r.get(0),
-            )
-            .optional()?)
-        })
-    }
-
-    pub(crate) fn del_email(&self, email: &str) -> anyhow::Result<()> {
-        self.with(|c| {
-            c.execute("DELETE FROM emails WHERE email = ?1", params![email])?;
-            Ok(())
-        })
-    }
-
     // ------------------------------------------------------------ proof of work
 
     /// Keep the best proof seen for `did` (spec §7.12); returns the best now on record.
@@ -699,6 +688,115 @@ impl Store {
         })
     }
 
+    // ------------------------------------------------------------ contacts (spec 7.8.2)
+
+    /// Remember a code sent to `address` for `did`, replacing any earlier one. Only
+    /// its hash is kept.
+    pub(crate) fn put_contact_code(
+        &self,
+        did: &str,
+        address: &str,
+        code: &str,
+        expires: i64,
+    ) -> anyhow::Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO contact_codes (did, address, code, expires, failures) VALUES (?1, ?2, ?3, ?4, 0)
+                 ON CONFLICT(did, address) DO UPDATE SET code = excluded.code, expires = excluded.expires, failures = 0",
+                params![did, address, contact_code_hash(did, address, code), expires],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn drop_contact_code(&self, did: &str, address: &str) -> anyhow::Result<()> {
+        self.with(|c| {
+            Ok(c.execute(
+                "DELETE FROM contact_codes WHERE did = ?1 AND address = ?2",
+                params![did, address],
+            )
+            .map(drop)?)
+        })
+    }
+
+    /// Check a code. The right one is spent and makes `did` the holder of `address`
+    /// as of `t`, taking it from anyone else (who loses `public` with it). A wrong
+    /// one counts, and the code is gone after [`CODE_TRIES`] of them.
+    pub(crate) fn confirm_contact(
+        &self,
+        did: &str,
+        address: &str,
+        code: &str,
+        t: i64,
+    ) -> anyhow::Result<Option<ContactRecord>> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let row: Option<(String, i64, u32)> = tx
+                .query_row("SELECT code, expires, failures FROM contact_codes WHERE did = ?1 AND address = ?2", params![did, address], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?;
+            let Some((want, expires, failures)) = row else { return Ok(None) };
+            if expires <= t {
+                tx.execute("DELETE FROM contact_codes WHERE did = ?1 AND address = ?2", params![did, address])?;
+                tx.commit()?;
+                return Ok(None);
+            }
+            if !crate::oidc::ct_eq(&want, &contact_code_hash(did, address, code)) {
+                if failures + 1 >= CODE_TRIES {
+                    tx.execute("DELETE FROM contact_codes WHERE did = ?1 AND address = ?2", params![did, address])?;
+                } else {
+                    tx.execute("UPDATE contact_codes SET failures = failures + 1 WHERE did = ?1 AND address = ?2", params![did, address])?;
+                }
+                tx.commit()?;
+                return Ok(None);
+            }
+            tx.execute("DELETE FROM contact_codes WHERE did = ?1 AND address = ?2", params![did, address])?;
+            tx.execute(
+                "INSERT INTO contacts (address, did, verified_at, public) VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(address) DO UPDATE SET verified_at = excluded.verified_at,
+                   public = CASE WHEN contacts.did = excluded.did THEN contacts.public ELSE 0 END, did = excluded.did",
+                params![address, did, t],
+            )?;
+            let rec = read_contact(&tx, address)?;
+            tx.commit()?;
+            Ok(rec)
+        })
+    }
+
+    pub(crate) fn contacts_of(&self, did: &str) -> anyhow::Result<Vec<ContactRecord>> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT address, did, verified_at, public FROM contacts WHERE did = ?1 ORDER BY address")?;
+            let rows = stmt.query_map(params![did], |r| Ok(ContactRecord { address: r.get(0)?, did: r.get(1)?, verified_at: r.get(2)?, public: r.get(3)? }))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub(crate) fn contact(&self, address: &str) -> anyhow::Result<Option<ContactRecord>> {
+        self.with(|c| read_contact(c, address))
+    }
+
+    pub(crate) fn set_contact_public(
+        &self,
+        did: &str,
+        address: &str,
+        public: bool,
+    ) -> anyhow::Result<bool> {
+        self.with(|c| {
+            Ok(c.execute(
+                "UPDATE contacts SET public = ?3 WHERE did = ?1 AND address = ?2",
+                params![did, address, public],
+            )? > 0)
+        })
+    }
+
+    pub(crate) fn delete_contact(&self, did: &str, address: &str) -> anyhow::Result<bool> {
+        self.with(|c| {
+            Ok(c.execute(
+                "DELETE FROM contacts WHERE did = ?1 AND address = ?2",
+                params![did, address],
+            )? > 0)
+        })
+    }
+
     /// Count one attempt in `bucket`. `Some(seconds)` when `limit` is exceeded: how
     /// long until the window resets. A limit with `max == 0` never trips.
     pub(crate) fn hit(
@@ -722,6 +820,57 @@ impl Store {
             Ok((count > i64::from(limit.max)).then(|| (start + limit.window_secs - t).max(1)))
         })
     }
+}
+
+/// A code is six digits, so its hash only keeps a copy of the file from being read
+/// off directly; the ten-minute life and five tries are what protect it.
+fn contact_code_hash(did: &str, address: &str, code: &str) -> String {
+    hash(&format!("kith-contact-code|{did}|{address}|{code}"))
+}
+
+fn read_contact(c: &Connection, address: &str) -> anyhow::Result<Option<ContactRecord>> {
+    Ok(c.query_row(
+        "SELECT address, did, verified_at, public FROM contacts WHERE address = ?1",
+        params![address],
+        |r| {
+            Ok(ContactRecord {
+                address: r.get(0)?,
+                did: r.get(1)?,
+                verified_at: r.get(2)?,
+                public: r.get(3)?,
+            })
+        },
+    )
+    .optional()?)
+}
+
+fn read_totp(c: &Connection, did: &str) -> anyhow::Result<Option<TotpRecord>> {
+    let row: Option<(String, bool, i64, u32, i64)> = c
+        .query_row(
+            "SELECT secret, confirmed, last_step, failures, locked_until FROM totp WHERE did = ?1",
+            params![did],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((secret, confirmed, last_step, failures, locked_until)) => Some(TotpRecord {
+            secret: b64u_decode(&secret)?,
+            confirmed,
+            last_step,
+            failures,
+            locked_until,
+        }),
+        None => None,
+    })
+}
+
+fn write_totp(c: &Connection, did: &str, r: &TotpRecord) -> anyhow::Result<()> {
+    c.execute(
+        "INSERT INTO totp (did, secret, confirmed, last_step, failures, locked_until) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(did) DO UPDATE SET secret = excluded.secret, confirmed = excluded.confirmed, last_step = excluded.last_step, failures = excluded.failures, locked_until = excluded.locked_until",
+        params![did, b64u(&r.secret), r.confirmed, r.last_step, r.failures, r.locked_until],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

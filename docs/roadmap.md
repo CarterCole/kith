@@ -26,8 +26,9 @@
 - **Authorization.** Cedar policies with explicit, nested and dynamic groups and roles.
   Identical results in Rust, JS and Python, checked against shared vectors.
 - **GraphQL.** Root, field and row-level enforcement for graphql-js (Yoga, Apollo) and
-  graphql-core (Ariadne, Strawberry, Graphene). Both example APIs return identical
-  results.
+  graphql-core middleware (Ariadne, Graphene). Both example APIs return identical
+  results. `__typename` always works and introspection is open or `authenticated`, the
+  same in both ([spec §4.5](../spec/04-authorization.md)).
 - **Browser client.** Passkey creation, enrollment and login against a live hub, using a
   WebCrypto authenticator in tests.
 - **Vault.** Skip-ratchet group keyrings with join-later, skip-ahead, and re-key, sealed
@@ -78,6 +79,20 @@
     against Telegram itself.
   - Upstream attributes from the ID token and UserInfo, behind a per-provider
     allowlist.
+  - Signed account attestations (`linked_account` scope, [spec §7.8.1](../spec/07-oidc.md)):
+    the hub vouches for the upstream account a login really came through, with shared
+    vectors (`attestations.json`) in Rust, JS and Python. A Facebook preset uses its OIDC
+    code + PKCE flow. Tested against a stand-in provider, not yet against Facebook.
+  - Verified contacts ([spec §7.8.2](../spec/07-oidc.md)): an identity proves an email
+    address or phone number with a six-digit code (`kith contact add`, `confirm`).
+    Private by default: an app gets it only with the user's agreement to its `email`
+    or `phone` scope, as a claim and a signed `kith-account+jwt` in
+    `contact_attestations`. Publishing it makes the hub answer a public lookup with an
+    attestation for `urn:kith:public`, and withdrawing it ends that. Verifications go
+    stale (365 days for email, 90 for phone numbers) until checked again, and whoever
+    proves an address last holds it. Codes go out through Amazon SES and AWS End User
+    Messaging SMS (the `aws` feature) or to an outbox file. Tested in process and with
+    the CLI through the outbox; not yet sent through AWS.
   - Verified in headless Chrome with a virtual authenticator against `openid-client`.
 - **Hub state and operations** ([spec §7.9–7.10](../spec/07-oidc.md)).
   - One SQLite file holds sessions, codes, refresh tokens, pending sign-in requests,
@@ -89,6 +104,43 @@
   - An admin API (admin token, or any identity in the `hub-admin` role): list and end
     sessions, sign an identity out everywhere, list and delete registered clients,
     list and withdraw consent.
+
+- **Hardening pass, October 2026** (an audit of all three implementations; each item
+  has a test that failed first).
+  - Devices act within their `caps`. A device without `session` cannot log in by
+    signature or passkey, sign a grant, or mint a delegation; the hub's revoke-only relay
+    was able to ([spec §1.5](../spec/01-identity.md)).
+  - `device` revocations are enforced: the hub issues no token for that sign-in, and a
+    follower denies a request whose token names it ([§8.9](../spec/08-policy-dag.md)).
+  - TOTP: the check-and-update is one step (parallel guesses were not all counted, and
+    one code could be accepted twice), an address limit covers every place a code is
+    checked, `DELETE /v1/totp` and `kith totp reset` exist, and sign-ins that rested on
+    the authenticator alone end when it is reset ([§2.3](../spec/02-authentication.md)).
+  - OIDC: schemes are compared in lower case (`HTTP://evil.example` was taken for a
+    private-use scheme), script schemes are refused, `post_logout_redirect_uris` are
+    validated, and signing out at the hub ends the session's refresh tokens
+    ([§7.2](../spec/07-oidc.md), [§7.6](../spec/07-oidc.md)). That last one reverses an
+    earlier choice to leave `offline_access` tokens valid.
+  - `kith passkey enroll` shows a fingerprint to compare with the enrollment page and
+    asks before it signs ([§7.7](../spec/07-oidc.md)).
+  - Alias proofs expire (5 minutes by default) and `kith alias verify` takes a nonce;
+    a signer cannot appear twice in a policy; a passkey grant without user verification
+    is AAL 1 and must be for the device's `rp_id`; claim times saturate instead of
+    overflowing.
+  - Access tokens have shared vectors (`tokens.json`) that Rust, JS and Python all run.
+    JS accepted tokens with no `exp`, no `aal` or a future `iat`, and Python raised an
+    uncaught `TypeError` on one without `jti`. All three now agree on the rules in
+    [§3.5](../spec/03-tokens-and-delegation.md), on integral floats (`2.0` is `2`), and
+    on ids with non-ASCII characters (Python denied them).
+  - Malformed input is an error, never a panic or a hang: a Merkle map 65 levels deep,
+    a diamond of shared children, a ratchet revision of 2^63 (it overflowed the stack and
+    aborted the process), non-ASCII in hex and timestamps, a calendar proof that would
+    make the file unreadable, and a policy DAG whose indexes are not lists (which used to
+    read as "no policies", forbids included). The file block store no longer accepts
+    `../` as a name.
+  - CI runs on every push and pull request ([`ci.yml`](../.github/workflows/ci.yml)),
+    with actions pinned to commits; `LICENSE`, `SECURITY.md`, `NOTICE` and `CLAUDE.md`
+    exist.
 
 ## Known gaps in the reference code (not production ready)
 
@@ -145,6 +197,23 @@
   the front-channel sign-out page is tested in process only. The wallet button on the login page has not been
   tested in a browser (the server path is tested). The Grafana config in §7.9 has not
   been tried against a real Grafana.
+- **Account attestations.** Only providers with signed ID tokens: GitHub, X and Discord
+  would need a plain OAuth path, where the hub trusts a profile API over TLS. Attestations
+  go to the client that asked; there is no form a third party can check (`aud` is the
+  client). Linking still happens from the CLI, so a user first has to fail a login to
+  learn their per-app Facebook id.
+- **Verified contacts.**
+  - The AWS path builds and is not yet tested against AWS: no SES identity or SMS
+    origination number has been set up for it.
+  - A takeover is only as quick as the new holder: a recycled number or a domain that
+    changed owners keeps attesting for the old holder until someone else proves it or
+    it goes stale.
+  - No continuity proof yet. A chain of verifications, each also signed by the
+    identity, could show "held without a break since T", and a new holder would start
+    from zero.
+  - `kith resolve` does not follow public contacts, an app cannot ask for a check
+    during sign-in, and verification is CLI only.
+  - Userinfo finds a pairwise client's identity by scanning every KEL.
 - **Co-signer safety.** A time delay plus device notification before co-signing
   `rotate`, as did:plc does with its 72-hour window.
 - **Other.**
@@ -178,6 +247,75 @@
   DNS answers are not DNSSEC-validated. `kith name check` is a command you run, not a
   watcher, and an `alias list` on a home made before labels were unique can still show
   two aliases with one label (`prove` uses the first).
+
+## Still open from the October 2026 audit
+
+Ordered roughly by how much each matters. File and line references are in the audit, not
+repeated here.
+
+- **Dependencies.** `cargo audit` reports nine advisories (2026-10-23):
+  - `rustls` 0.23.45, `rustls-webpki` 0.103.15 and `webpki-roots` 1.0.9 have fixes
+    (`cargo update -p rustls -p rustls-webpki -p webpki-roots`);
+  - `rsa` 0.9.10, RUSTSEC-2023-0071 (the Marvin timing attack), **has no fix**. The hub
+    uses it to sign RS256 ID tokens with a private key, and to verify NIST beacons.
+    Options: sign ID tokens with EdDSA only, or move the private-key operations to
+    `ring`, `aws-lc-rs` or OpenSSL;
+  - `crypto-bigint` and `ctutils` (timing, through `rsa` and the curve crates),
+    `tokio` 1.53.1 (an unsound `AsyncFd`), and a yanked `yoke-derive`.
+- **Secrets at rest.** TOTP seeds, co-signer private keys and clients' `client_secret`
+  are plaintext in SQLite; cookies, codes and refresh tokens are hashed. The hub's key
+  files use the default umask. Encrypt the recoverable ones with a hub key and hash
+  `client_secret`.
+- **TOTP lockout is a lever.** Five wrong codes lock an identity's TOTP for 15 minutes,
+  and anyone can send them using only public KEL data.
+- **Refresh tokens.** No reuse detection or token-family revocation, and a 30-day life
+  that rolls forward with no absolute cap.
+- **Hub exposure.** `PUT /v1/kel`, `PUT /v1/blocks` and `GET /v1/hub` re-verify whole
+  logs for anyone and have no limits; the login-challenge and upstream-state maps are
+  unbounded. Back-channel logout follows redirects (a blind request to loopback). The
+  revocation event stream drops messages when a subscriber lags. 500 responses include
+  internal error text, every lock is `.unwrap()`ed (one panic poisons it for all later
+  requests), the store records a schema version it never reads, and files are written
+  non-atomically (a truncated KEL is skipped at startup).
+- **CLI.** `Home::save` writes the file and then restricts it, so secrets are briefly
+  readable; concurrent `kith` runs can lose updates; tokens and codes are passed as
+  arguments; `device add --out` writes an exported key with the default mode.
+  `main()` is 400 lines, so none of it is unit-tested.
+- **Smaller protocol points.**
+  - one key can have several signer ids (an `eip155` address in any case, an uncompressed
+    SEC1 point, a `#fragment`), and policies compare strings;
+  - KEL timestamps have no upper bound; the `policy_root` CID check is a prefix test;
+  - revoking a device that is also a manage signer leaves its L1 authority;
+  - the vault's `SealedBox` has no sender authentication;
+  - pairwise access tokens still carry `dev` and `amr`;
+  - the WebAuthn sign counter is read and ignored;
+  - a login challenge is not bound to the request that asked for it.
+- **GraphQL.** The row check looks only at the named return type, so interfaces and
+  unions skip it; `subscribe` is not wrapped (only `resolve`); code-first schemas with no
+  `astNode` carry no `@auth`.
+- **Packaging.** `@kith/auth` exports raw `.ts` (there is no build, so it cannot be
+  installed and imported by plain Node), its root entry is Node-only because of the
+  `cedar-wasm` Node build, and `graphql` is a hard peer. A new Cedar policy set is
+  registered for every `Engine` and `authorize()` builds one each call, which the wasm
+  never frees. Python lacks the slice reader and follower, `py.typed` and a Strawberry
+  wrapper. `cedarpy` is `>=4.12` against Cedar 4.13 elsewhere.
+- **Tests.**
+  - the hub uses the wall clock, so no expiry (code, challenge, session, refresh,
+    `max_age`) can be tested without sleeping: inject a clock;
+  - no shared vectors yet for KEL events, session and delegation chains, aliases, vault,
+    TOTP or WebAuthn; no `proptest` or `cargo-fuzz` targets for the parsers
+    (`ots`, `dag`, `sshsig`, `jws`, `canon`, NIST pulses);
+  - untested routes: `GET /v1/did/{did}`, the heartbeat and event-stream routes,
+    `POST /oauth/userinfo`, a 409 from `PUT /v1/kel`, the TOTP factor on
+    `/v1/auth/verify`, every admin `DELETE` without credentials;
+  - the real-process scripts use fixed ports, and `demo.sh` only checks that JS equals
+    Python, not that either is right.
+- **Formatting.** `cargo fmt --check` reports 959 differences on the default settings
+  and 133 on the closest configuration tried (`max_width = 200`, `use_small_heuristics =
+  "Max"`), so CI does not check it. Deciding on one style and reformatting once would
+  fix that.
+- **A threat model chapter** in the spec: trust in the hub, a compromised revoke key,
+  replay, clocks, a malicious DAG publisher, an upstream provider.
 
 ## Open questions (need a decision)
 

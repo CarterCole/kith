@@ -363,13 +363,18 @@
           {
             "kind": "policy",
             "id": "no-delegated-pay"
+          },
+          {
+            "kind": "device",
+            "did": "did:kith:bob",
+            "device": "dev_stolen"
           }
         ],
         "sigs": [
           {
             "signer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
             "alg": "Ed25519",
-            "sig": "AeCH6P3CJNrWuzsm1sy9eLZiGeTeu8NG2PXzDqHDgtsKThNcK6ZNUaDrDeZm31u7TArDwkYM537wtOgUTsAYBg"
+            "sig": "gXBaH_OTB7zgoy9tmGMTGK7Zldx99asejXoEQIfXKkY1_rZOMG4AI9RBcmjdrNP2nOo7D8iRfXqxgrvmN3UfDg"
           }
         ]
       }
@@ -378,7 +383,7 @@
       "v": 1,
       "org": "did:kith:cgzn7lbqho2giftb2h4u25t6xg2u26a32pihqxcjvt3ufo66ezda",
       "seq": 3,
-      "head": "TfezgiCj8sEFp3sG6gP63bA6aDrH2gKMZGN3D2TJhWo",
+      "head": "MVCdXKLw4BG_rvfUXhihwAsV3eg1xua9nhsmOq5UARg",
       "ts": 1692806365,
       "beacon": {
         "type": "drand",
@@ -390,7 +395,7 @@
         {
           "signer": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
           "alg": "Ed25519",
-          "sig": "ZYiaQkWgr1_cDZ8H8W1HdW7zYB2po8365IPDEPt3a1GvM8dM8hVKEPRUGGfCrx70IQyPOsy9tlePi07iUB6BCQ"
+          "sig": "Q5-1Tienj4pDXMiz4KCJBBvUaOu52IKShD8veMhK4D6cf2gCBEympUHHT4ix0TUPD55_DLU1u-8ORVe-eRVQDg"
         }
       ]
     },
@@ -463,6 +468,43 @@
         "reasons": [
           "revoked:token"
         ]
+      },
+      {
+        "name": "a revoked device",
+        "principal": "did:kith:bob",
+        "attrs": {
+          "aal": 1
+        },
+        "action": "Query.invoices",
+        "resource": {
+          "type": "Operation",
+          "id": "Query.invoices"
+        },
+        "context": {},
+        "now": 1692806374,
+        "level": "fresh",
+        "allowed": false,
+        "device": "dev_stolen",
+        "reasons": [
+          "revoked:device"
+        ]
+      },
+      {
+        "name": "another device of the same identity",
+        "principal": "did:kith:bob",
+        "attrs": {
+          "aal": 1
+        },
+        "action": "Query.invoices",
+        "resource": {
+          "type": "Operation",
+          "id": "Query.invoices"
+        },
+        "context": {},
+        "now": 1692806374,
+        "level": "fresh",
+        "allowed": true,
+        "device": "dev_laptop"
       },
       {
         "name": "own-invoice was revoked",

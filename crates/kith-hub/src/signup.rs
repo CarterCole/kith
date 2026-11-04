@@ -56,8 +56,6 @@ pub struct Attempt {
     pending: Option<(String, Event)>,
     /// A provider account that signed in first and is to be linked to the new identity.
     ticket: Option<Ticket>,
-    /// An address the visitor proved they can read (`email::verify`).
-    email: Option<String>,
 }
 
 type Reply = Result<Json<Value>, Response>;
@@ -101,7 +99,7 @@ pub async fn page(State(h): State<Arc<Hub>>, Query(q): Query<HashMap<String, Str
     // Sent here by a provider sign-in that has no identity yet: say which one.
     let provider = q.get("ticket").and_then(|t| h.ticket_name(t));
     pages::signup(
-        json!({"rp_id": h.cfg.rp_id, "provider": provider, "email": h.cfg.mailer.is_some()}),
+        json!({"rp_id": h.cfg.rp_id, "provider": provider}),
     )
 }
 
@@ -125,9 +123,6 @@ pub struct BeginReq {
     /// From a provider sign-in that found no identity; must match this browser's cookie.
     #[serde(default)]
     ticket: Option<String>,
-    /// From `/v1/email/verify`: the address to put on the new identity.
-    #[serde(default)]
-    email_proof: Option<String>,
 }
 
 /// Stateless: lets the page vet a pasted key before it makes a passkey.
@@ -162,16 +157,6 @@ pub async fn begin(
         Some(_) => return Err(expired()),
         None => None,
     };
-    let email = match &req.email_proof {
-        Some(p) => Some(h.take_email_proof(p).ok_or_else(|| {
-            ApiError::bad(
-                "invalid_request",
-                "the email check expired; verify the address again",
-            )
-            .into_response()
-        })?),
-        None => None,
-    };
     let id = random_id();
     let handle = format!("h_{}", random_id());
     {
@@ -193,7 +178,6 @@ pub async fn begin(
                 created: now(),
                 pending: None,
                 ticket,
-                email,
             },
         );
     }
@@ -274,7 +258,7 @@ pub async fn submit_sig(
     Json(req): Json<SigReq>,
 ) -> Result<Response, Response> {
     closed(&h)?;
-    let (handle, key, mut inception, ticket, email) = {
+    let (handle, key, mut inception, ticket) = {
         let mut m = h.signups.lock().unwrap();
         m.retain(|_, a| a.created + SIGNUP_TTL > now());
         let a = m.get(&id).ok_or_else(expired)?;
@@ -286,7 +270,6 @@ pub async fn submit_sig(
             key,
             inception,
             a.ticket.clone(),
-            a.email.clone(),
         )
     };
     if req.sig.signer != key || req.sig.alg != "WebAuthn" {
@@ -329,26 +312,9 @@ pub async fn submit_sig(
             .into_response());
         }
     }
-    if let Some(e) = &email {
-        if !h.store.put_email(e, &did).map_err(api)? {
-            if let Some(t) = &ticket {
-                let _ = h.store.del_provider_link(&t.alias);
-            }
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "exists".into(),
-                "that address was added to another account in the meantime".into(),
-                None,
-            )
-            .into_response());
-        }
-    }
     if let Err(e) = h.put_kel(&did, vec![inception]) {
         if let Some(t) = &ticket {
             let _ = h.store.del_provider_link(&t.alias);
-        }
-        if let Some(a) = &email {
-            let _ = h.store.del_email(a);
         }
         return Err(e.into_response());
     }

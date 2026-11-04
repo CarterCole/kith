@@ -9,6 +9,10 @@ license.workspace = true
 name = "kith"
 path = "src/main.rs"
 
+[features]
+# Send verification codes through Amazon SES and AWS End User Messaging SMS.
+aws = ["kith-hub/aws"]
+
 [dependencies]
 kith-core.workspace = true
 kith-hub.workspace = true

@@ -34,11 +34,7 @@ pub const QUICKNET_PERIOD: i64 = 3;
 pub const DRAND_G1_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// Beacons in the NIST 2.0 format whose pulses are accepted, by `uri` prefix.
-pub const NIST2_ORIGINS: &[&str] = &[
-    "https://beacon.nist.gov/beacon/2.0",
-    "https://beacon.inmetro.gov.br/beacon/2.1",
-    "https://beacon.inmetro.gov.br/beacon/2.0",
-];
+pub const NIST2_ORIGINS: &[&str] = &["https://beacon.nist.gov/beacon/2.0", "https://beacon.inmetro.gov.br/beacon/2.1", "https://beacon.inmetro.gov.br/beacon/2.0"];
 
 /// Inmetro serves no certificates (its endpoint answers 400); this is the one its
 /// open-source beacon hard-codes. SHA-512(DER) = its certificateId `04c5dc3b…`.
@@ -84,38 +80,23 @@ pub struct DrandChain {
 
 impl DrandChain {
     pub fn new(public_key_hex: &str, genesis: i64, period: i64) -> Result<Self> {
-        let pk: [u8; 96] = hex(public_key_hex)?
-            .try_into()
-            .map_err(|_| Error::Encoding("drand public key must be 96 bytes".into()))?;
-        let public_key = Option::from(G2Affine::from_compressed(&pk))
-            .ok_or_else(|| Error::Encoding("drand public key is not a G2 point".into()))?;
-        Ok(DrandChain {
-            public_key,
-            genesis,
-            period,
-        })
+        let pk: [u8; 96] = hex(public_key_hex)?.try_into().map_err(|_| Error::Encoding("drand public key must be 96 bytes".into()))?;
+        let public_key = Option::from(G2Affine::from_compressed(&pk)).ok_or_else(|| Error::Encoding("drand public key is not a G2 point".into()))?;
+        Ok(DrandChain { public_key, genesis, period })
     }
 
     pub fn quicknet() -> Self {
-        Self::new(QUICKNET_PUBLIC_KEY, QUICKNET_GENESIS, QUICKNET_PERIOD)
-            .expect("quicknet key is valid")
+        Self::new(QUICKNET_PUBLIC_KEY, QUICKNET_GENESIS, QUICKNET_PERIOD).expect("quicknet key is valid")
     }
 
     /// Verify an unchained G1 signature for `round`; returns the round's time.
     pub fn verify(&self, round: u64, signature_hex: &str) -> Result<i64> {
-        let sig: [u8; 48] = hex(signature_hex)?
-            .try_into()
-            .map_err(|_| Error::Signature("drand signature must be 48 bytes".into()))?;
-        let sig = Option::<G1Affine>::from(G1Affine::from_compressed(&sig))
-            .ok_or_else(|| Error::Signature("drand signature is not a G1 point".into()))?;
+        let sig: [u8; 48] = hex(signature_hex)?.try_into().map_err(|_| Error::Signature("drand signature must be 48 bytes".into()))?;
+        let sig = Option::<G1Affine>::from(G1Affine::from_compressed(&sig)).ok_or_else(|| Error::Signature("drand signature is not a G1 point".into()))?;
         let msg: [u8; 32] = Sha256::digest(round.to_be_bytes()).into();
-        let h = G1Affine::from(
-            <G1Projective as HashToCurve<ExpandMsgXmd<Sha256>>>::hash_to_curve([msg], DRAND_G1_DST),
-        );
+        let h = G1Affine::from(<G1Projective as HashToCurve<ExpandMsgXmd<Sha256>>>::hash_to_curve([msg], DRAND_G1_DST));
         if round == 0 || pairing(&sig, &G2Affine::generator()) != pairing(&h, &self.public_key) {
-            return Err(Error::Signature(format!(
-                "drand round {round}: bad signature"
-            )));
+            return Err(Error::Signature(format!("drand round {round}: bad signature")));
         }
         Ok(self.genesis + (round as i64 - 1) * self.period)
     }
@@ -134,14 +115,11 @@ pub struct Verifiers {
 impl Default for Verifiers {
     fn default() -> Self {
         let mut v = Verifiers {
-            drand: [(QUICKNET_CHAIN.to_string(), DrandChain::quicknet())]
-                .into_iter()
-                .collect(),
+            drand: [(QUICKNET_CHAIN.to_string(), DrandChain::quicknet())].into_iter().collect(),
             nist_origins: NIST2_ORIGINS.iter().map(|s| s.to_string()).collect(),
             nist_keys: BTreeMap::new(),
         };
-        v.add_nist_certificate(INMETRO_CERT)
-            .expect("pinned Inmetro certificate parses");
+        v.add_nist_certificate(INMETRO_CERT).expect("pinned Inmetro certificate parses");
         v
     }
 }
@@ -151,18 +129,8 @@ impl Verifiers {
     /// Errors if the pulse is not from an allowed origin.
     pub fn nist_certificate_url(&self, pulse: &Value) -> Result<(String, String)> {
         let uri = pulse["uri"].as_str().unwrap_or_default();
-        let base = self
-            .nist_origins
-            .iter()
-            .find(|o| uri.starts_with(&format!("{o}/")))
-            .ok_or_else(|| Error::Unsupported(format!("beacon origin of {uri:?}")))?;
-        Ok((
-            base.clone(),
-            pulse["certificateId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_ascii_lowercase(),
-        ))
+        let base = self.nist_origins.iter().find(|o| uri.starts_with(&format!("{o}/"))).ok_or_else(|| Error::Unsupported(format!("beacon origin of {uri:?}")))?;
+        Ok((base.clone(), pulse["certificateId"].as_str().unwrap_or_default().to_ascii_lowercase()))
     }
 
     /// Add a certificate (PEM, as beacons serve it; leniently parsed). Its id is
@@ -171,8 +139,7 @@ impl Verifiers {
         let der = pem_to_der(pem)?;
         let id = to_hex(&Sha512::digest(&der));
         let spki = spki_of_certificate(&der)?;
-        let key = RsaPublicKey::from_public_key_der(spki)
-            .map_err(|e| Error::Encoding(format!("certificate key: {e}")))?;
+        let key = RsaPublicKey::from_public_key_der(spki).map_err(|e| Error::Encoding(format!("certificate key: {e}")))?;
         self.nist_keys.insert(id.clone(), key);
         Ok(id)
     }
@@ -184,35 +151,20 @@ impl Verifiers {
     fn verify_nist2(&self, p: &Value) -> Result<i64> {
         self.nist_certificate_url(p)?;
         if p["cipherSuite"].as_u64() != Some(0) {
-            return Err(Error::Unsupported(format!(
-                "NIST beacon cipher suite {}",
-                p["cipherSuite"]
-            )));
+            return Err(Error::Unsupported(format!("NIST beacon cipher suite {}", p["cipherSuite"])));
         }
-        let id = p["certificateId"]
-            .as_str()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let key = self
-            .nist_keys
-            .get(&id)
-            .ok_or_else(|| Error::NotFound(format!("beacon certificate {id}")))?;
+        let id = p["certificateId"].as_str().unwrap_or_default().to_ascii_lowercase();
+        let key = self.nist_keys.get(&id).ok_or_else(|| Error::NotFound(format!("beacon certificate {id}")))?;
         let msg = nist2_serialize(p)?;
         let sig = hex(p["signatureValue"].as_str().unwrap_or_default())?;
-        let s =
-            RsaSignature::try_from(sig.as_slice()).map_err(|e| Error::Signature(e.to_string()))?;
-        VerifyingKey::<Sha512>::new(key.clone())
-            .verify(&msg, &s)
-            .map_err(|_| Error::Signature(format!("beacon pulse {}: bad signature", p["uri"])))?;
+        let s = RsaSignature::try_from(sig.as_slice()).map_err(|e| Error::Signature(e.to_string()))?;
+        VerifyingKey::<Sha512>::new(key.clone()).verify(&msg, &s).map_err(|_| Error::Signature(format!("beacon pulse {}: bad signature", p["uri"])))?;
         // outputValue: NIST hashes the raw signature, Inmetro a length-prefixed one.
         let out = hex(p["outputValue"].as_str().unwrap_or_default())?;
         let raw = Sha512::digest([msg.as_slice(), &sig].concat());
-        let prefixed =
-            Sha512::digest([msg.as_slice(), &(sig.len() as u32).to_be_bytes(), &sig].concat());
+        let prefixed = Sha512::digest([msg.as_slice(), &(sig.len() as u32).to_be_bytes(), &sig].concat());
         if out[..] != raw[..] && out[..] != prefixed[..] {
-            return Err(Error::Signature(
-                "beacon pulse: outputValue does not match".into(),
-            ));
+            return Err(Error::Signature("beacon pulse: outputValue does not match".into()));
         }
         parse_utc(p["timeStamp"].as_str().unwrap_or_default())
     }
@@ -221,15 +173,8 @@ impl Verifiers {
 impl BeaconVerifier for Verifiers {
     fn verify(&self, value: &BeaconValue) -> Result<i64> {
         match value {
-            BeaconValue::Drand {
-                chain,
-                round,
-                signature,
-            } => {
-                let c = self
-                    .drand
-                    .get(chain)
-                    .ok_or_else(|| Error::Unsupported(format!("drand chain {chain}")))?;
+            BeaconValue::Drand { chain, round, signature } => {
+                let c = self.drand.get(chain).ok_or_else(|| Error::Unsupported(format!("drand chain {chain}")))?;
                 c.verify(*round, signature)
             }
             BeaconValue::Nist2 { pulse } => self.verify_nist2(pulse),
@@ -243,37 +188,23 @@ impl BeaconVerifier for Verifiers {
 pub fn nist2_serialize(p: &Value) -> Result<Vec<u8>> {
     let mut out = vec![];
     let s = |out: &mut Vec<u8>, v: &Value| -> Result<()> {
-        let b = v
-            .as_str()
-            .ok_or_else(|| Error::Encoding("beacon pulse: missing string field".into()))?
-            .as_bytes();
+        let b = v.as_str().ok_or_else(|| Error::Encoding("beacon pulse: missing string field".into()))?.as_bytes();
         out.extend((b.len() as u32).to_be_bytes());
         out.extend(b);
         Ok(())
     };
     let h = |out: &mut Vec<u8>, v: &Value| -> Result<()> {
-        let b = hex(v
-            .as_str()
-            .ok_or_else(|| Error::Encoding("beacon pulse: missing hex field".into()))?)?;
+        let b = hex(v.as_str().ok_or_else(|| Error::Encoding("beacon pulse: missing hex field".into()))?)?;
         out.extend((b.len() as u32).to_be_bytes());
         out.extend(b);
         Ok(())
     };
     let u32f = |out: &mut Vec<u8>, v: &Value| -> Result<()> {
-        out.extend(
-            (v.as_u64()
-                .ok_or_else(|| Error::Encoding("beacon pulse: missing integer".into()))?
-                as u32)
-                .to_be_bytes(),
-        );
+        out.extend((v.as_u64().ok_or_else(|| Error::Encoding("beacon pulse: missing integer".into()))? as u32).to_be_bytes());
         Ok(())
     };
     let u64f = |out: &mut Vec<u8>, v: &Value| -> Result<()> {
-        out.extend(
-            v.as_u64()
-                .ok_or_else(|| Error::Encoding("beacon pulse: missing integer".into()))?
-                .to_be_bytes(),
-        );
+        out.extend(v.as_u64().ok_or_else(|| Error::Encoding("beacon pulse: missing integer".into()))?.to_be_bytes());
         Ok(())
     };
     s(&mut out, &p["uri"])?;
@@ -287,20 +218,14 @@ pub fn nist2_serialize(p: &Value) -> Result<Vec<u8>> {
     h(&mut out, &p["localRandomValue"])?;
     let ext = &p["external"];
     if !ext.is_object() {
-        return Err(Error::Unsupported(
-            "beacon pulse: `external` must be one object (multi-source pulses are not supported)"
-                .into(),
-        ));
+        return Err(Error::Unsupported("beacon pulse: `external` must be one object (multi-source pulses are not supported)".into()));
     }
     h(&mut out, &ext["sourceId"])?;
     u32f(&mut out, &ext["statusCode"])?;
     h(&mut out, &ext["value"])?;
     let list = p["listValues"].as_array().cloned().unwrap_or_default();
     for t in ["previous", "hour", "day", "month", "year"] {
-        let v = list
-            .iter()
-            .find(|x| x["type"] == t)
-            .ok_or_else(|| Error::Encoding(format!("beacon pulse: no {t} value")))?;
+        let v = list.iter().find(|x| x["type"] == t).ok_or_else(|| Error::Encoding(format!("beacon pulse: no {t} value")))?;
         h(&mut out, &v["value"])?;
     }
     h(&mut out, &p["precommitmentValue"])?;
@@ -308,25 +233,41 @@ pub fn nist2_serialize(p: &Value) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// `YYYY-MM-DDTHH:MM:SS(.fff)Z` → Unix seconds.
+/// `YYYY-MM-DDTHH:MM:SS(.fff)Z` → Unix seconds. Every field is checked: a month 13 or a
+/// second 61 is an error, not a date some days away.
 pub fn parse_utc(s: &str) -> Result<i64> {
     let bad = || Error::Encoding(format!("timestamp {s:?}"));
-    let n = |a: usize, b: usize| {
-        s.get(a..b)
-            .and_then(|x| x.parse::<i64>().ok())
-            .ok_or_else(bad)
-    };
-    if s.len() < 20 || !s.ends_with('Z') || &s[4..5] != "-" || &s[10..11] != "T" {
+    let b = s.as_bytes();
+    // All ASCII, so the byte offsets below are character offsets.
+    if !s.is_ascii() || b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
         return Err(bad());
     }
-    let (y, m, d, hh, mm, ss) = (
-        n(0, 4)?,
-        n(5, 7)?,
-        n(8, 10)?,
-        n(11, 13)?,
-        n(14, 16)?,
-        n(17, 19)?,
-    );
+    // After the seconds: `Z`, or a fraction and then `Z`.
+    let tail = &s[19..];
+    let fraction_ok = tail == "Z" || tail.strip_prefix('.').and_then(|f| f.strip_suffix('Z')).is_some_and(|f| !f.is_empty() && f.bytes().all(|c| c.is_ascii_digit()));
+    if !fraction_ok {
+        return Err(bad());
+    }
+    let n = |a: usize, z: usize| -> Result<i64> {
+        let t = &s[a..z];
+        if t.bytes().all(|c| c.is_ascii_digit()) {
+            t.parse::<i64>().map_err(|_| bad())
+        } else {
+            Err(bad())
+        }
+    };
+    let (y, m, d, hh, mm, ss) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err(bad()),
+    };
+    if !(1..=days).contains(&d) || hh > 23 || mm > 59 || ss > 59 {
+        return Err(bad());
+    }
     // Days from civil (Howard Hinnant).
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -347,14 +288,8 @@ fn to_hex(b: &[u8]) -> String {
 /// PEM → DER, tolerating the quirks beacons serve (CRLF, trailing spaces).
 fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
     use base64::Engine;
-    let body: String = pem
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with("-----"))
-        .collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .map_err(|e| Error::Encoding(format!("certificate PEM: {e}")))
+    let body: String = pem.lines().map(str::trim).filter(|l| !l.starts_with("-----")).collect();
+    base64::engine::general_purpose::STANDARD.decode(body).map_err(|e| Error::Encoding(format!("certificate PEM: {e}")))
 }
 
 /// One DER TLV: (tag, whole element, contents).
@@ -369,11 +304,7 @@ fn tlv(b: &[u8]) -> Result<(u8, &[u8], &[u8])> {
         if n == 0 || n > 4 {
             return Err(bad());
         }
-        let len = b
-            .get(2..2 + n)
-            .ok_or_else(bad)?
-            .iter()
-            .fold(0usize, |a, x| (a << 8) | *x as usize);
+        let len = b.get(2..2 + n).ok_or_else(bad)?.iter().fold(0usize, |a, x| (a << 8) | *x as usize);
         (len, 2 + n)
     };
     let all = b.get(..hdr + len).ok_or_else(bad)?;
@@ -392,10 +323,7 @@ fn spki_of_certificate(der: &[u8]) -> Result<&[u8]> {
     }
     // [0] version (optional), serial, signature alg, issuer, validity, subject, spki
     let skip = usize::from(fields.first().is_some_and(|(t, _)| *t == 0xa0));
-    fields
-        .get(skip + 5)
-        .map(|(_, all)| *all)
-        .ok_or_else(|| Error::Encoding("certificate has no public key".into()))
+    fields.get(skip + 5).map(|(_, all)| *all).ok_or_else(|| Error::Encoding("certificate has no public key".into()))
 }
 
 #[cfg(test)]
@@ -410,44 +338,18 @@ mod tests {
     fn drand_vectors() {
         let v = vectors();
         let d = &v["drand"];
-        let chain = DrandChain::new(
-            d["public_key"].as_str().unwrap(),
-            d["genesis_time"].as_i64().unwrap(),
-            d["period"].as_i64().unwrap(),
-        )
-        .unwrap();
+        let chain = DrandChain::new(d["public_key"].as_str().unwrap(), d["genesis_time"].as_i64().unwrap(), d["period"].as_i64().unwrap()).unwrap();
         let verifiers = Verifiers::default();
         for c in d["cases"].as_array().unwrap() {
-            let value = BeaconValue::Drand {
-                chain: d["chain"].as_str().unwrap().into(),
-                round: c["round"].as_u64().unwrap(),
-                signature: c["signature"].as_str().unwrap().into(),
-            };
+            let value = BeaconValue::Drand { chain: d["chain"].as_str().unwrap().into(), round: c["round"].as_u64().unwrap(), signature: c["signature"].as_str().unwrap().into() };
             let got = verifiers.verify(&value);
-            assert_eq!(
-                got.is_ok(),
-                c["ok"].as_bool().unwrap(),
-                "{}: {got:?}",
-                c["name"]
-            );
+            assert_eq!(got.is_ok(), c["ok"].as_bool().unwrap(), "{}: {got:?}", c["name"]);
             if let Some(t) = c["time"].as_i64() {
                 assert_eq!(got.unwrap(), t);
-                assert_eq!(
-                    chain
-                        .verify(
-                            c["round"].as_u64().unwrap(),
-                            c["signature"].as_str().unwrap()
-                        )
-                        .unwrap(),
-                    t
-                );
+                assert_eq!(chain.verify(c["round"].as_u64().unwrap(), c["signature"].as_str().unwrap()).unwrap(), t);
             }
         }
-        let unknown = BeaconValue::Drand {
-            chain: "00".into(),
-            round: 1,
-            signature: "00".into(),
-        };
+        let unknown = BeaconValue::Drand { chain: "00".into(), round: 1, signature: "00".into() };
         assert!(verifiers.verify(&unknown).is_err());
     }
 
@@ -456,20 +358,11 @@ mod tests {
         let v = vectors();
         let mut verifiers = Verifiers::default();
         for pem in v["nist2"]["certificates"].as_object().unwrap().values() {
-            verifiers
-                .add_nist_certificate(pem.as_str().unwrap())
-                .unwrap();
+            verifiers.add_nist_certificate(pem.as_str().unwrap()).unwrap();
         }
         for c in v["nist2"]["cases"].as_array().unwrap() {
-            let got = verifiers.verify(&BeaconValue::Nist2 {
-                pulse: c["pulse"].clone(),
-            });
-            assert_eq!(
-                got.is_ok(),
-                c["ok"].as_bool().unwrap(),
-                "{}: {got:?}",
-                c["name"]
-            );
+            let got = verifiers.verify(&BeaconValue::Nist2 { pulse: c["pulse"].clone() });
+            assert_eq!(got.is_ok(), c["ok"].as_bool().unwrap(), "{}: {got:?}", c["name"]);
             if let Some(t) = c["time"].as_i64() {
                 assert_eq!(got.unwrap(), t, "{}", c["name"]);
             }
@@ -477,10 +370,7 @@ mod tests {
         // Pulses from origins outside the allowlist are refused before any crypto.
         let mut p = v["nist2"]["cases"][0]["pulse"].clone();
         p["uri"] = "https://evil.example/beacon/2.0/chain/2/pulse/1".into();
-        assert!(matches!(
-            verifiers.verify(&BeaconValue::Nist2 { pulse: p }),
-            Err(Error::Unsupported(_))
-        ));
+        assert!(matches!(verifiers.verify(&BeaconValue::Nist2 { pulse: p }), Err(Error::Unsupported(_))));
     }
 
     #[test]
@@ -488,5 +378,28 @@ mod tests {
         assert_eq!(parse_utc("1970-01-01T00:00:00.000Z").unwrap(), 0);
         assert_eq!(parse_utc("2026-09-27T19:49:00.000Z").unwrap(), 1790538540);
         assert_eq!(parse_utc("2000-02-29T12:00:00Z").unwrap(), 951825600);
+    }
+
+    #[test]
+    fn timestamps_are_checked_and_wide_characters_are_errors() {
+        assert_eq!(parse_utc("2026-10-21T00:00:00Z").unwrap(), 1792540800);
+        assert_eq!(parse_utc("2026-10-21T00:00:00.250Z").unwrap(), 1792540800);
+        assert_eq!(parse_utc("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(parse_utc("2028-02-29T23:59:59Z").unwrap(), 1835481599, "a leap day");
+        for bad in [
+            "2026é10-21T00:00:00Z", "2026-10-21é00:00:00Z", "2026-10-21T00:00:0é", "é026-10-21T00:00:00Z", "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+            "2026-13-01T00:00:00Z", "2026-00-01T00:00:00Z", "2026-02-30T00:00:00Z", "2027-02-29T00:00:00Z", "2026-10-00T00:00:00Z", "2026-10-32T00:00:00Z",
+            "2026-10-21T24:00:00Z", "2026-10-21T00:60:00Z", "2026-10-21T00:00:61Z", "2026-10-21T-1:00:00Z", "2026-10-21T00:00:00", "", "Z",
+        ] {
+            assert!(parse_utc(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_drand_signature_that_is_not_hex_is_an_error() {
+        let chain = DrandChain::quicknet();
+        for bad in ["0é0", "é", "zz", "abc", "", "00"] {
+            assert!(chain.verify(1000, bad).is_err(), "{bad:?}");
+        }
     }
 }

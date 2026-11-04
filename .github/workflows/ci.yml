@@ -1,0 +1,130 @@
+# Runs on every push to main and every pull request: the Rust, JS and Python tests,
+# clippy, a typecheck, and a look at known vulnerabilities in the dependencies.
+#
+# Actions are pinned to a commit, not a tag, so a moved tag cannot change what runs.
+# Update a pin by looking up the new release's commit, for example:
+#   gh api repos/actions/checkout/commits/v5.1.0 --jq .sha
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            test_args: ""
+          # A hosted macOS runner has no login keychain to write to and no Secure Enclave,
+          # which the two keystore tests need. The rest of the CLI is covered.
+          - os: macos-14
+            test_args: "-- --skip keystore::"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Clippy, with warnings as errors
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked ${{ matrix.test_args }}
+
+  js:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/js
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/js/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - name: Typecheck, examples included
+        run: npx tsc --noEmit
+
+  python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/python
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: packages/python/uv.lock
+      - run: uv sync --frozen
+      - run: uv run pytest -q
+
+  # The real processes: a hub and the CLI, TOTP step-up, co-signed recovery, delegation,
+  # revocation. Offline. It waits for fresh TOTP windows, so it takes a few minutes.
+  cli-flows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: scripts/cli-flows.sh
+
+  # Known vulnerabilities in dependencies. A step that finds one shows as failed, but it
+  # does not fail the run: an advisory that is already there should not block an
+  # unrelated change. Read the log.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Rust (cargo audit)
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: JavaScript (npm audit, runtime dependencies)
+        continue-on-error: true
+        working-directory: packages/js
+        run: npm audit --omit=dev
+      - name: Python (pip-audit)
+        continue-on-error: true
+        working-directory: packages/python
+        run: |
+          uv export --frozen --no-dev --no-hashes --no-emit-project --format requirements-txt -o "$RUNNER_TEMP/requirements.txt"
+          uvx pip-audit -r "$RUNNER_TEMP/requirements.txt" --no-deps --disable-pip

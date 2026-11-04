@@ -54,27 +54,17 @@ pub const MAX_BLOCK: usize = 256 * 1024;
 pub enum BeaconSource {
     None,
     /// `{base}/{chain}/public/latest`, e.g. `https://api.drand.sh` + quicknet.
-    Drand {
-        base: String,
-        chain: String,
-    },
+    Drand { base: String, chain: String },
     /// A NIST 2.0-format beacon, e.g. `https://beacon.nist.gov/beacon/2.0`.
-    Nist2 {
-        base: String,
-    },
+    Nist2 { base: String },
 }
 
 impl BeaconSource {
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         Ok(match s {
             "none" => BeaconSource::None,
-            "drand" => BeaconSource::Drand {
-                base: "https://api.drand.sh".into(),
-                chain: kith_core::beacon::QUICKNET_CHAIN.into(),
-            },
-            "nist" => BeaconSource::Nist2 {
-                base: "https://beacon.nist.gov/beacon/2.0".into(),
-            },
+            "drand" => BeaconSource::Drand { base: "https://api.drand.sh".into(), chain: kith_core::beacon::QUICKNET_CHAIN.into() },
+            "nist" => BeaconSource::Nist2 { base: "https://beacon.nist.gov/beacon/2.0".into() },
             other => anyhow::bail!("unknown beacon {other:?} (none, drand, nist)"),
         })
     }
@@ -83,32 +73,16 @@ impl BeaconSource {
         Ok(match self {
             BeaconSource::None => None,
             BeaconSource::Drand { base, chain } => {
-                let v: Value = http
-                    .get(format!("{base}/{chain}/public/latest"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
+                let v: Value = http.get(format!("{base}/{chain}/public/latest")).send().await?.error_for_status()?.json().await?;
                 Some(BeaconValue::Drand {
                     chain: chain.clone(),
-                    round: v["round"]
-                        .as_u64()
-                        .ok_or_else(|| anyhow::anyhow!("drand: no round"))?,
+                    round: v["round"].as_u64().ok_or_else(|| anyhow::anyhow!("drand: no round"))?,
                     signature: v["signature"].as_str().unwrap_or_default().into(),
                 })
             }
             BeaconSource::Nist2 { base } => {
-                let v: Value = http
-                    .get(format!("{base}/pulse/last"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
-                Some(BeaconValue::Nist2 {
-                    pulse: v["pulse"].clone(),
-                })
+                let v: Value = http.get(format!("{base}/pulse/last")).send().await?.error_for_status()?.json().await?;
+                Some(BeaconValue::Nist2 { pulse: v["pulse"].clone() })
             }
         })
     }
@@ -164,20 +138,11 @@ impl Orgs {
     }
 
     pub fn entries(&self, org: &str, after: u64) -> Vec<Entry> {
-        self.chains
-            .lock()
-            .unwrap()
-            .get(org)
-            .map(|c| c.iter().filter(|e| e.seq > after).cloned().collect())
-            .unwrap_or_default()
+        self.chains.lock().unwrap().get(org).map(|c| c.iter().filter(|e| e.seq > after).cloned().collect()).unwrap_or_default()
     }
 
     pub fn latest(&self, org: &str) -> Option<Entry> {
-        self.chains
-            .lock()
-            .unwrap()
-            .get(org)
-            .and_then(|c| c.last().cloned())
+        self.chains.lock().unwrap().get(org).and_then(|c| c.last().cloned())
     }
 
     /// Append the next entry of an org's chain (checked against its KEL).
@@ -192,10 +157,7 @@ impl Orgs {
         }
         chain.push(e.clone());
         let file = self.dir.join(format!("{}.json", st.did.replace(':', "_")));
-        write_json(
-            &file,
-            &serde_json::to_value(&*chain).map_err(kith_core::Error::from)?,
-        )?;
+        write_json(&file, &serde_json::to_value(&*chain).map_err(kith_core::Error::from)?)?;
         drop(chains);
         let _ = self.push.send((st.did.clone(), Push::Entry(e)));
         Ok(())
@@ -209,20 +171,14 @@ impl Orgs {
     pub fn beat(&self, org: &str, beacon: Option<BeaconValue>) -> kith_core::Result<Heartbeat> {
         let mut h = Heartbeat::new(org, self.latest(org).as_ref(), beacon)?;
         h.sign(&self.revoker)?;
-        self.heartbeats
-            .lock()
-            .unwrap()
-            .insert(org.into(), h.clone());
+        self.heartbeats.lock().unwrap().insert(org.into(), h.clone());
         let _ = self.push.send((org.into(), Push::Heartbeat(h.clone())));
         Ok(h)
     }
 
     /// Everything revoked for `org` since its policy root's `revocations_through`.
     pub fn active_revocations(&self, org: &str, through: u64) -> Vec<Revocation> {
-        self.entries(org, through)
-            .into_iter()
-            .flat_map(|e| e.revoke)
-            .collect()
+        self.entries(org, through).into_iter().flat_map(|e| e.revoke).collect()
     }
 }
 
@@ -232,107 +188,48 @@ impl Hub {
         let me = &self.orgs.revoker.id;
         self.kel_dids()
             .into_iter()
-            .filter(|did| {
-                self.resolve(did).is_ok_and(|st| {
-                    st.devices
-                        .values()
-                        .any(|d| &d.key == me && d.has_cap("revoke"))
-                })
-            })
+            .filter(|did| self.resolve(did).is_ok_and(|st| st.devices.values().any(|d| &d.key == me && d.has_cap("revoke"))))
             .collect()
     }
 
     fn policy_head(&self, org: &str) -> ApiResult<(KeyState, kith_core::kel::PolicyHead)> {
-        let st = self.resolve(org).map_err(|e| {
-            ApiError(
-                StatusCode::NOT_FOUND,
-                "not_found".into(),
-                e.to_string(),
-                None,
-            )
-        })?;
-        let head = st.policy.clone().ok_or_else(|| {
-            ApiError(
-                StatusCode::NOT_FOUND,
-                "not_found".into(),
-                format!("{org} has no policy root"),
-                None,
-            )
-        })?;
+        let st = self.resolve(org).map_err(|e| ApiError(StatusCode::NOT_FOUND, "not_found".into(), e.to_string(), None))?;
+        let head = st.policy.clone().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "not_found".into(), format!("{org} has no policy root"), None))?;
         Ok((st, head))
     }
 
     /// A slice of an org's current policy DAG.
-    pub fn slice(
-        &self,
-        org: &str,
-        q: &Query,
-    ) -> ApiResult<(Slice, BTreeMap<String, Vec<u8>>, u64)> {
+    pub fn slice(&self, org: &str, q: &Query) -> ApiResult<(Slice, BTreeMap<String, Vec<u8>>, u64)> {
         let (_, head) = self.policy_head(org)?;
         let (slice, blocks) = pdag::prove(&self.orgs.blocks, &head.root, q)?;
         Ok((slice, blocks, head.revocations_through))
     }
 
-    /// Groups, roles and a revocation verdict for `did` from the configured policy
-    /// org, if there is one. `Ok(None)`: no org configured, use the bundle file.
-    pub(crate) fn org_memberships(
-        &self,
-        did: &str,
-        attrs: &serde_json::Map<String, Value>,
-    ) -> ApiResult<
-        Option<(
-            kith_core::authz::Memberships,
-            serde_json::Map<String, Value>,
-        )>,
-    > {
-        let Some(org) = &self.cfg.policy_org else {
-            return Ok(None);
-        };
+    /// Groups, roles and a revocation verdict for `did`, signing in from `device` (if
+    /// any), from the configured policy org, if there is one. `Ok(None)`: no org
+    /// configured, use the bundle file.
+    pub(crate) fn org_memberships(&self, did: &str, device: Option<&str>, attrs: &serde_json::Map<String, Value>) -> ApiResult<Option<(kith_core::authz::Memberships, serde_json::Map<String, Value>)>> {
+        let Some(org) = &self.cfg.policy_org else { return Ok(None) };
         let (slice, _, through) = self.slice(org, &Query::Principal { id: did.into() })?;
         let revoked = self.orgs.active_revocations(org, through);
-        if revoked
-            .iter()
-            .any(|r| matches!(r, Revocation::Principal { id } if id == did))
-        {
-            return Err(ApiError::unauthorized(
-                "principal revoked by the organization",
-            ));
+        if revoked.iter().any(|r| matches!(r, Revocation::Principal { id } if id == did)) {
+            return Err(ApiError::unauthorized("principal revoked by the organization"));
         }
-        let skip: BTreeSet<String> = revoked
-            .iter()
-            .filter_map(|r| {
-                if let Revocation::Policy { id } = r {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let excluded: BTreeSet<String> = revoked
-            .iter()
-            .filter_map(|r| {
-                if let Revocation::Member { id, set } = r {
-                    (id == did).then(|| set.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        if device.is_some_and(|dev| revoked.iter().any(|r| matches!(r, Revocation::Device { did: d, device: x } if d == did && x == dev))) {
+            return Err(ApiError::unauthorized("device revoked by the organization"));
+        }
+        let skip: BTreeSet<String> = revoked.iter().filter_map(|r| if let Revocation::Policy { id } = r { Some(id.clone()) } else { None }).collect();
+        let excluded: BTreeSet<String> =
+            revoked.iter().filter_map(|r| if let Revocation::Member { id, set } = r { (id == did).then(|| set.clone()) } else { None }).collect();
         let engine = slice.engine_without(&skip)?;
         let attrs = engine.attributes(did, attrs);
-        Ok(Some((
-            engine.memberships_excluding(did, &attrs, &excluded)?,
-            attrs,
-        )))
+        Ok(Some((engine.memberships_excluding(did, &attrs, &excluded)?, attrs)))
     }
 }
 
 /// Sign heartbeats for every served org, forever.
 pub async fn heartbeat_loop(hub: Arc<Hub>) {
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("http client");
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("http client");
     let mut tick = tokio::time::interval(Duration::from_secs(hub.cfg.heartbeat_secs.max(1)));
     loop {
         tick.tick().await;
@@ -370,16 +267,10 @@ pub async fn info(State(h): State<Arc<Hub>>) -> Json<Value> {
 
 /// Proof of possession for the hub's revoker key: sign an org's `add_device` event
 /// that adds exactly that key with exactly the `revoke` capability, nothing else.
-pub async fn sign_revoker(
-    State(h): State<Arc<Hub>>,
-    Json(ev): Json<kith_core::kel::Event>,
-) -> ApiResult<Json<Value>> {
+pub async fn sign_revoker(State(h): State<Arc<Hub>>, Json(ev): Json<kith_core::kel::Event>) -> ApiResult<Json<Value>> {
     let ok = matches!(&ev.body, kith_core::kel::EventBody::AddDevice { device } if device.key == h.orgs.revoker.id && device.caps == ["revoke"]);
     if !ok {
-        return Err(ApiError::bad(
-            "invalid_request",
-            "only an add_device event for this hub's revoker key with caps [\"revoke\"]",
-        ));
+        return Err(ApiError::bad("invalid_request", "only an add_device event for this hub's revoker key with caps [\"revoke\"]"));
     }
     Ok(Json(json!(h.orgs.revoker.sign(&ev.signing_message()?)?)))
 }
@@ -388,10 +279,7 @@ pub async fn put_blocks(State(h): State<Arc<Hub>>, Json(v): Json<Value>) -> ApiR
     let blocks = blocks_from_json(&v)?;
     for (cid, bytes) in &blocks {
         if bytes.len() > MAX_BLOCK || cid_of(bytes) != *cid {
-            return Err(ApiError::bad(
-                "invalid_request",
-                format!("block {cid} is too big or does not match its CID"),
-            ));
+            return Err(ApiError::bad("invalid_request", format!("block {cid} is too big or does not match its CID")));
         }
     }
     for (cid, bytes) in blocks.iter() {
@@ -402,15 +290,9 @@ pub async fn put_blocks(State(h): State<Arc<Hub>>, Json(v): Json<Value>) -> ApiR
 
 pub async fn get_block(State(h): State<Arc<Hub>>, Path(cid): Path<String>) -> ApiResult<Response> {
     let cid = cid.trim_end_matches(".json").to_string();
-    let bytes =
-        h.orgs.blocks.get(&cid)?.ok_or_else(|| {
-            ApiError(StatusCode::NOT_FOUND, "not_found".into(), cid.clone(), None)
-        })?;
+    let bytes = h.orgs.blocks.get(&cid)?.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "not_found".into(), cid.clone(), None))?;
     Ok((
-        [
-            (header::CONTENT_TYPE, "application/vnd.ipld.raw"),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-        ],
+        [(header::CONTENT_TYPE, "application/vnd.ipld.raw"), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")],
         bytes,
     )
         .into_response())
@@ -418,16 +300,10 @@ pub async fn get_block(State(h): State<Arc<Hub>>, Path(cid): Path<String>) -> Ap
 
 pub async fn policy(State(h): State<Arc<Hub>>, Path(org): Path<String>) -> ApiResult<Json<Value>> {
     let (st, head) = h.policy_head(&org)?;
-    Ok(Json(
-        json!({ "org": st.did, "kel_seq": st.seq, "root": head.root, "revocations_through": head.revocations_through, "ts": head.ts }),
-    ))
+    Ok(Json(json!({ "org": st.did, "kel_seq": st.seq, "root": head.root, "revocations_through": head.revocations_through, "ts": head.ts })))
 }
 
-pub async fn slice(
-    State(h): State<Arc<Hub>>,
-    Path(org): Path<String>,
-    Json(q): Json<Query>,
-) -> ApiResult<Json<Value>> {
+pub async fn slice(State(h): State<Arc<Hub>>, Path(org): Path<String>, Json(q): Json<Query>) -> ApiResult<Json<Value>> {
     let (slice, blocks, through) = h.slice(&org, &q)?;
     let mut v = pdag::slice_response(&slice.root, &q, &blocks);
     v["revocations_through"] = json!(through);
@@ -440,27 +316,12 @@ pub struct After {
     after: u64,
 }
 
-pub async fn get_revocations(
-    State(h): State<Arc<Hub>>,
-    Path(org): Path<String>,
-    QueryParams(q): QueryParams<After>,
-) -> Json<Value> {
+pub async fn get_revocations(State(h): State<Arc<Hub>>, Path(org): Path<String>, QueryParams(q): QueryParams<After>) -> Json<Value> {
     Json(json!({ "entries": h.orgs.entries(&org, q.after), "heartbeat": h.orgs.heartbeat(&org) }))
 }
 
-pub async fn post_revocation(
-    State(h): State<Arc<Hub>>,
-    Path(org): Path<String>,
-    Json(e): Json<Entry>,
-) -> ApiResult<Json<Value>> {
-    let st = h.resolve(&org).map_err(|e| {
-        ApiError(
-            StatusCode::NOT_FOUND,
-            "not_found".into(),
-            e.to_string(),
-            None,
-        )
-    })?;
+pub async fn post_revocation(State(h): State<Arc<Hub>>, Path(org): Path<String>, Json(e): Json<Entry>) -> ApiResult<Json<Value>> {
+    let st = h.resolve(&org).map_err(|e| ApiError(StatusCode::NOT_FOUND, "not_found".into(), e.to_string(), None))?;
     let seq = e.seq;
     h.orgs.append(&st, e)?;
     // Push a heartbeat right away so followers learn the new head without waiting.
@@ -471,25 +332,12 @@ pub async fn post_revocation(
     Ok(Json(json!({ "org": org, "seq": seq })))
 }
 
-pub async fn get_heartbeat(
-    State(h): State<Arc<Hub>>,
-    Path(org): Path<String>,
-) -> ApiResult<Json<Value>> {
-    let hb = h.orgs.heartbeat(&org).ok_or_else(|| {
-        ApiError(
-            StatusCode::NOT_FOUND,
-            "not_found".into(),
-            "no heartbeat yet".into(),
-            None,
-        )
-    })?;
+pub async fn get_heartbeat(State(h): State<Arc<Hub>>, Path(org): Path<String>) -> ApiResult<Json<Value>> {
+    let hb = h.orgs.heartbeat(&org).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "not_found".into(), "no heartbeat yet".into(), None))?;
     Ok(Json(json!(hb)))
 }
 
-pub async fn events(
-    State(h): State<Arc<Hub>>,
-    Path(org): Path<String>,
-) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+pub async fn events(State(h): State<Arc<Hub>>, Path(org): Path<String>) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let rx = BroadcastStream::new(h.orgs.push.subscribe());
     let stream = rx.filter_map(move |m| {
         let (o, push) = m.ok()?;

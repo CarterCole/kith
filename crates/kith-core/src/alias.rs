@@ -20,6 +20,10 @@ use crate::keys::{verify_sig, KeyType, LocalSigner, Sig, VerifyOptions};
 use crate::util::{b64u, now, random_id, sha256};
 use crate::{Error, Result};
 
+/// How old, in seconds, an alias proof may be when nothing fresher than its `iat`
+/// (a nonce the verifier chose) vouches for it.
+pub const ALIAS_PROOF_MAX_AGE: i64 = 300;
+
 pub fn commitment(root: &str, alias: &str, salt: &str) -> String {
     let v = json!({"t": "kith-alias-v1", "root": root, "alias": alias, "salt": salt});
     b64u(sha256(crate::canon::to_canonical(&v).expect("canonical")))
@@ -48,13 +52,7 @@ pub struct AliasProof {
     pub sig: Sig,
 }
 
-fn proof_message(
-    root: &str,
-    alias: &str,
-    aud: Option<&str>,
-    nonce: Option<&str>,
-    iat: i64,
-) -> Vec<u8> {
+fn proof_message(root: &str, alias: &str, aud: Option<&str>, nonce: Option<&str>, iat: i64) -> Vec<u8> {
     format!(
         "kith alias link v1\nroot: {root}\nalias: {alias}\naud: {}\nnonce: {}\niat: {iat}",
         aud.unwrap_or("*"),
@@ -65,11 +63,7 @@ fn proof_message(
 
 impl PrivateAlias {
     pub fn generate(label: impl Into<String>) -> Self {
-        PrivateAlias {
-            label: label.into(),
-            signer: LocalSigner::generate(KeyType::Ed25519),
-            salt: random_id(),
-        }
+        PrivateAlias { label: label.into(), signer: LocalSigner::generate(KeyType::Ed25519), salt: random_id() }
     }
 
     pub fn id(&self) -> &str {
@@ -80,44 +74,28 @@ impl PrivateAlias {
         commitment(root, self.id(), &self.salt)
     }
 
-    pub fn prove(
-        &self,
-        root: &str,
-        seq: u64,
-        aud: Option<String>,
-        nonce: Option<String>,
-    ) -> Result<AliasProof> {
+    pub fn prove(&self, root: &str, seq: u64, aud: Option<String>, nonce: Option<String>) -> Result<AliasProof> {
         let iat = now();
-        let sig = self.signer.sign(&proof_message(
-            root,
-            self.id(),
-            aud.as_deref(),
-            nonce.as_deref(),
-            iat,
-        ))?;
-        Ok(AliasProof {
-            v: 1,
-            root: root.into(),
-            alias: self.id().into(),
-            salt: self.salt.clone(),
-            seq,
-            aud,
-            nonce,
-            iat,
-            sig,
-        })
+        let sig = self.signer.sign(&proof_message(root, self.id(), aud.as_deref(), nonce.as_deref(), iat))?;
+        Ok(AliasProof { v: 1, root: root.into(), alias: self.id().into(), salt: self.salt.clone(), seq, aud, nonce, iat, sig })
     }
 }
 
-/// Verify an alias proof against the root identity's current key state.
-pub fn verify_alias_proof(
-    proof: &AliasProof,
-    root: &KeyState,
-    aud: Option<&str>,
-    nonce: Option<&str>,
-) -> Result<()> {
+/// Verify an alias proof against the root identity's current key state at time `now`.
+///
+/// The proof's `iat` must be no older than `max_age` seconds
+/// ([`ALIAS_PROOF_MAX_AGE`]) and no more than [`LEEWAY`](crate::session::LEEWAY) in
+/// the future, so a proof that was saved can't be shown as fresh later. Pass the
+/// `nonce` you handed out as well, if you can: that makes the proof yours alone.
+pub fn verify_alias_proof(proof: &AliasProof, root: &KeyState, aud: Option<&str>, nonce: Option<&str>, now: i64, max_age: i64) -> Result<()> {
     if proof.root != root.did {
         return Err(Error::Signature("proof is for a different root".into()));
+    }
+    if proof.iat > now.saturating_add(crate::session::LEEWAY) {
+        return Err(Error::Signature("alias proof is from the future".into()));
+    }
+    if now.saturating_sub(proof.iat) > max_age {
+        return Err(Error::Signature("alias proof is too old; ask for a fresh one".into()));
     }
     if aud.is_some() && proof.aud.as_deref() != aud {
         return Err(Error::Signature("alias proof audience mismatch".into()));
@@ -126,29 +104,13 @@ pub fn verify_alias_proof(
         return Err(Error::Signature("alias proof nonce mismatch".into()));
     }
     let c = commitment(&proof.root, &proof.alias, &proof.salt);
-    if !root
-        .alias_commitments
-        .iter()
-        .any(|a| a.seq == proof.seq && a.commitment == c)
-    {
+    if !root.alias_commitments.iter().any(|a| a.seq == proof.seq && a.commitment == c) {
         return Err(Error::NotFound("alias commitment not in root KEL".into()));
     }
     if proof.sig.signer != proof.alias {
-        return Err(Error::Signature(
-            "proof must be signed by the alias key".into(),
-        ));
+        return Err(Error::Signature("proof must be signed by the alias key".into()));
     }
-    verify_sig(
-        &proof.sig,
-        &proof_message(
-            &proof.root,
-            &proof.alias,
-            proof.aud.as_deref(),
-            proof.nonce.as_deref(),
-            proof.iat,
-        ),
-        &VerifyOptions::default(),
-    )
+    verify_sig(&proof.sig, &proof_message(&proof.root, &proof.alias, proof.aud.as_deref(), proof.nonce.as_deref(), proof.iat), &VerifyOptions::default())
 }
 
 #[cfg(test)]
@@ -161,27 +123,40 @@ mod tests {
         let mut f = fixture();
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         let alias = PrivateAlias::generate("gaming");
-        let mut ev = next_event(
-            &st,
-            EventBody::AliasCommit {
-                commitment: alias.commitment(&st.did),
-            },
-        );
+        let mut ev = next_event(&st, EventBody::AliasCommit { commitment: alias.commitment(&st.did) });
         ev.sign(&f.device).unwrap(); // a device with the `alias` cap may commit
         f.log.push(ev);
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
-        let proof = alias
-            .prove(
-                &st.did,
-                1,
-                Some("https://shop.example".into()),
-                Some("n1".into()),
-            )
-            .unwrap();
-        verify_alias_proof(&proof, &st, Some("https://shop.example"), Some("n1")).unwrap();
-        assert!(verify_alias_proof(&proof, &st, Some("https://other.example"), None).is_err());
+        let proof = alias.prove(&st.did, 1, Some("https://shop.example".into()), Some("n1".into())).unwrap();
+        let verify = |proof: &AliasProof, aud: Option<&str>, nonce: Option<&str>| verify_alias_proof(proof, &st, aud, nonce, now(), ALIAS_PROOF_MAX_AGE);
+        verify(&proof, Some("https://shop.example"), Some("n1")).unwrap();
+        assert!(verify(&proof, Some("https://other.example"), None).is_err());
+        assert!(verify(&proof, Some("https://shop.example"), Some("n2")).is_err(), "someone else's nonce");
         let mut forged = proof.clone();
         forged.salt = "guess".into();
-        assert!(verify_alias_proof(&forged, &st, None, None).is_err());
+        assert!(verify(&forged, None, None).is_err());
+    }
+
+    /// A proof that carries no verifier-chosen nonce is only good for a few minutes, so
+    /// a copy saved today can't be shown as fresh next year.
+    #[test]
+    fn a_proof_goes_stale() {
+        let mut f = fixture();
+        let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
+        let alias = PrivateAlias::generate("gaming");
+        let mut ev = next_event(&st, EventBody::AliasCommit { commitment: alias.commitment(&st.did) });
+        ev.sign(&f.device).unwrap();
+        f.log.push(ev);
+        let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
+        let proof = alias.prove(&st.did, 1, Some("https://shop.example".into()), None).unwrap();
+        let at = |t: i64| verify_alias_proof(&proof, &st, Some("https://shop.example"), None, t, ALIAS_PROOF_MAX_AGE);
+        at(proof.iat).unwrap();
+        at(proof.iat + ALIAS_PROOF_MAX_AGE).unwrap();
+        assert!(at(proof.iat + ALIAS_PROOF_MAX_AGE + 1).is_err(), "too old");
+        assert!(at(proof.iat + 365 * 86400).is_err(), "a year later");
+        at(proof.iat - crate::session::LEEWAY).unwrap();
+        assert!(at(proof.iat - crate::session::LEEWAY - 1).is_err(), "from the future");
+        // A verifier that hands out nonces with a longer life can widen the window.
+        verify_alias_proof(&proof, &st, Some("https://shop.example"), None, proof.iat + 3600, 7200).unwrap();
     }
 }

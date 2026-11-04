@@ -15,22 +15,6 @@
     <label for="name">Name for the passkey</label>
     <input id="name" autocomplete="off" value="My account" maxlength="64">
     <p class="meta">Only your device sees this name. It is not sent to the hub.</p>
-    <div id="email-box" class="hidden">
-      <label for="email">Email (optional)</label>
-      <input id="email" type="email" autocomplete="email" maxlength="254">
-      <p class="meta">We email a code to confirm it. It is stored here, not in your public identity, and an app sees it only if you allow that.</p>
-      <div class="stack mt">
-        <button id="email-send" class="secondary" type="button">Send code</button>
-      </div>
-      <div id="email-code-box" class="hidden">
-        <label for="email-code">Code from the email</label>
-        <input id="email-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
-        <div class="stack mt">
-          <button id="email-verify" class="secondary" type="button">Verify</button>
-        </div>
-      </div>
-      <p id="email-ok" class="meta hidden">Verified: <code id="email-shown"></code></p>
-    </div>
     <div class="stack mt">
       <button id="start" class="primary" type="button">Continue</button>
     </div>
@@ -209,43 +193,7 @@ function chooseMode(m) {
 let fileKey;
 for (const r of document.querySelectorAll('input[name="mode"]')) r.onchange = () => r.checked && chooseMode(r.value);
 
-// Optional email, proved with a mailed code. The proof goes along when the account is made.
-let emailId = null, emailProof = null;
-if (D.email) $("email-box").classList.remove("hidden");
-$("email-send").onclick = async () => {
-  $("email-send").disabled = true;
-  try {
-    const r = await postJSON("/v1/email/start", { email: $("email").value });
-    if (!r.ok) throw new Error(r.body.error_description || "could not send a code");
-    emailId = r.body.id;
-    $("email-code-box").classList.remove("hidden");
-    status("We sent a code. It works for ten minutes.", "ok");
-  } catch (e) {
-    status("Error: " + e.message, "error");
-  }
-  $("email-send").disabled = false;
-};
-$("email-verify").onclick = async () => {
-  $("email-verify").disabled = true;
-  try {
-    const r = await postJSON("/v1/email/verify", { id: emailId, code: $("email-code").value });
-    if (!r.ok) throw new Error(r.body.error_description || "that code didn't work");
-    emailProof = r.body.proof;
-    $("email-shown").textContent = r.body.email;
-    for (const id of ["email", "email-send", "email-code-box"]) $(id).classList.add("hidden");
-    $("email-ok").classList.remove("hidden");
-    status("");
-  } catch (e) {
-    status("Error: " + e.message, "error");
-  }
-  $("email-verify").disabled = false;
-};
-
 $("start").onclick = async () => {
-  if (D.email && $("email").value.trim() && !emailProof) {
-    status("Verify your email first, or clear the field to skip it.", "error");
-    return;
-  }
   $("start").disabled = true;
   try {
     fileKey = await freshFileKey();
@@ -423,7 +371,7 @@ $("create").onclick = async () => {
   $("create").disabled = true;
   $("saved").disabled = true;
   try {
-    const begun = await postJSON("/v1/signup", { ...(ticket ? { ticket } : {}), ...(emailProof ? { email_proof: emailProof } : {}) });
+    const begun = await postJSON("/v1/signup", { ...(ticket ? { ticket } : {}) });
     if (!begun.ok) throw new Error(begun.body.error_description || "could not start sign-up");
     const { id, handle, rp_id } = begun.body;
 

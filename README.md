@@ -64,7 +64,7 @@ scripts/demo.sh        # hub + JS API + Python API, CLI logins, TOTP step-up, de
 scripts/cli-flows.sh   # devices, passkeys, aliases, delegation, revocation, TOTP co-signed recovery
 scripts/oidc-demo.sh   # real Chrome + virtual passkey: enroll from the browser, OIDC sign-in, SSO, step-up, logout
 scripts/policy-dag-demo.sh  # org publishes a policy DAG, provable slices, revocation push, drand-verified freshness
-scripts/test-all.sh    # unit tests (Rust, JS, Python) incl. shared conformance vectors
+scripts/test-all.sh    # unit tests (Rust, JS, Python) incl. shared conformance vectors; CI runs it too
 ```
 
 You need a recent stable Rust, Node 23.6+ (it runs TypeScript directly) and uv. The demo
@@ -94,11 +94,17 @@ kith hub serve --signup                      # let anyone create an account at /
 kith work --bits 24                          # spend compute on your identity; the hub records the best proof
 kith hub serve --admin-token "$TOKEN"        # /v1/admin/…: sessions, consent, clients
 kith alias link 'https://oauth.telegram.org#<your id>'   # let that Telegram account sign in as you
+                                             # apps asking for scope linked_account get a signed attestation of it
 kith name add ada mailto:ada@acme.test       # follow her WebFinger (or DNS) back-link, check her KEL links it, pin it
 kith delegate --to ada --action 'Query.*'    # a name works wherever a DID does
 kith resolve https://acme.test               # just look: both directions checked, and exactly one root must pass
 kith name check                              # re-resolve pinned names; report any that moved or became ambiguous
-kith passkey enroll                          # create a passkey in your browser, approve it here
+kith passkey enroll                          # create a passkey in your browser; compare its fingerprint, answer y
+kith totp reset [--code 123456]              # forget the authenticator (a current code, or a passkey sign-in)
+kith contact add ada@example.com             # the hub sends a code; private unless you publish it
+kith contact confirm ada@example.com 123456  # apps with scope email (or phone) get it, with a signed attestation
+kith contact publish ada@example.com         # anyone can `kith contact lookup` it; `unpublish` withdraws
+kith hub serve --email-from no-reply@example.com --sms-from +15555550199   # send codes with SES and End User Messaging (build with --features aws)
 ```
 
 **Any existing app, through OpenID Connect** ([spec](spec/07-oidc.md))
@@ -130,7 +136,7 @@ kithGraphQL(schema, { engine: new Engine(bundle) });   // root fields default-de
 createYoga({ schema, context: kithContextFactory(createVerifier({ issuer: HUB, audience: "api://invoices" })) });
 ```
 
-**GraphQL server, Python** (Ariadne, Strawberry, Graphene, anything on graphql-core)
+**GraphQL server, Python** (Ariadne, Graphene, anything that takes graphql-core middleware)
 
 ```python
 from kith import Engine, Verifier
@@ -183,7 +189,7 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 |------|------|
 | `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
 | `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
-| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, OpenID Connect provider with passkey login and enrollment pages, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
+| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email and phone contacts, OpenID Connect provider with passkey login and enrollment pages, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
 | `crates/kith-cli` | `kith` binary |
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |
@@ -194,3 +200,6 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 ready. On Linux the CLI stores keys in plaintext (macOS uses the keychain and Secure
 Enclave), and the hub has no TLS of its own. See
 [the roadmap](docs/roadmap.md#known-gaps-in-the-reference-code-not-production-ready).
+
+Licensed under the [Apache License 2.0](LICENSE). To report a security problem, see
+[`SECURITY.md`](SECURITY.md).
