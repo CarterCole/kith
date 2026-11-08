@@ -39,6 +39,9 @@ $K --home "$D/ada" policy slice --org "$ACME" --action Query.invoices
 step "Ada's grants, straight from the DAG"
 $K --home "$D/ada" policy grants --org "$ACME" | python3 -c "import sys,json; g=json.load(sys.stdin); print({k: g[k] for k in ('groups','roles','revoked')}); print('policies:', [p['id'] for p in g['policies']])"
 
+step "who signed for Ada's roles, and why she has them"
+$K --home "$D/ada" policy why --org "$ACME" | python3 -c "import sys,json; g=json.load(sys.stdin); c=g['committed_by']; print('policy_root event', c['kel_seq'], 'signed by', [(s['device'] or s['signer'][:20]+'…') for s in c['signers']]); [print(' ', s['set'], s['why']) for s in g['sets']]"
+
 step "the hub issues tokens from the DAG"
 $K --home "$D/ada" login --aud api://invoices
 

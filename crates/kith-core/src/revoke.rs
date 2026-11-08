@@ -110,8 +110,14 @@ impl Entry {
         if self.v != 1 || self.org != org.did || self.seq == 0 || (self.seq == 1) != self.prev.is_none() {
             return Err(Error::Token(format!("malformed revocation entry {}", self.seq)));
         }
-        if !org.may_revoke(&signed_by(&self.sigs, &self.signing_message()?)?) {
+        let signed = signed_by(&self.sigs, &self.signing_message()?)?;
+        if !org.may_revoke(&signed) {
             return Err(Error::Signature(format!("revocation {} is not signed by a revoker of {}", self.seq, org.did)));
+        }
+        // Dropping a membership can lift a forbid that names the set, so only the manage
+        // policy may do it. A revoke-only key can deny, never grant (spec §8.6).
+        if self.revoke.iter().any(|r| matches!(r, Revocation::Member { .. })) && !org.manage.is_satisfied_by(&signed) {
+            return Err(Error::Signature(format!("revocation {} drops a membership, which needs the manage policy of {}", self.seq, org.did)));
         }
         Ok(())
     }
@@ -381,9 +387,11 @@ pub struct Request<'a> {
 /// Decide with revocations and freshness applied (spec §8.9):
 ///
 /// 1. a stale, behind or forked view denies everything;
-/// 2. a revoked principal, token or device is denied;
+/// 2. a revoked principal, actor, token or device is denied;
 /// 3. memberships are recomputed from the slice with revoked memberships excluded
-///    (so anything that came through them goes too), whatever the token claimed;
+///    (so anything that came through them goes too), whatever the token claimed. The
+///    request must also be allowed with every membership in place, so an exclusion
+///    can't turn off a forbid that names the set;
 /// 4. revoked permit policies are dropped;
 /// 5. policies see `context.kith = {sync_age, degraded, revocation_seq}`.
 pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64) -> Result<AuthzDecision> {
@@ -396,6 +404,9 @@ pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64
     if follower.is_principal_revoked(&principal.id) {
         return deny("revoked:principal");
     }
+    if principal.actor.as_deref().is_some_and(|a| follower.is_principal_revoked(a)) {
+        return deny("revoked:actor");
+    }
     if jti.is_some_and(|j| follower.is_token_revoked(j)) {
         return deny("revoked:token");
     }
@@ -404,14 +415,25 @@ pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64
     }
     let engine = slice.engine_without(&follower.revoked_policies())?;
     let attrs = engine.attributes(&principal.id, &principal.attrs);
-    let m = engine.memberships_excluding(&principal.id, &attrs, &follower.excluded_sets(&principal.id))?;
-    let p = Principal { attrs, groups: m.groups, roles: m.roles, ..principal.clone() };
+    let excluded = follower.excluded_sets(&principal.id);
+    let m = engine.memberships_excluding(&principal.id, &attrs, &excluded)?;
     let mut ctx = match context {
         Value::Object(o) => o.clone(),
         _ => Map::new(),
     };
     ctx.insert("kith".into(), f.cedar_context());
-    engine.authorize(&p, action, resource, &Value::Object(ctx))
+    let ctx = Value::Object(ctx);
+    let p = Principal { attrs: attrs.clone(), groups: m.groups, roles: m.roles, ..principal.clone() };
+    let reduced = engine.authorize(&p, action, resource, &ctx)?;
+    if excluded.is_empty() || !reduced.allowed {
+        return Ok(reduced);
+    }
+    // A forbid or an `unless` may name an excluded set, and dropping the membership
+    // would turn it off. Revocations only ever remove access (spec §8.7), so the answer
+    // must also be allowed with every membership in place.
+    let all = engine.memberships(&principal.id, &attrs)?;
+    let full = engine.authorize(&Principal { groups: all.groups, roles: all.roles, ..p }, action, resource, &ctx)?;
+    Ok(if full.allowed { reduced } else { AuthzDecision { allowed: false, reasons: full.reasons, errors: full.errors } })
 }
 
 #[cfg(test)]
@@ -513,6 +535,52 @@ mod tests {
         let other = entry(&o, Some(&e2), vec![]);
         assert!(f.apply_entry(&o.state, &other).is_err());
         assert_eq!(f.freshness(100).level, Level::Forked);
+    }
+
+    #[test]
+    fn member_revocations_need_the_manage_policy() {
+        let o = org();
+        let r = vec![Revocation::Member { id: "did:kith:ada".into(), set: "Group::finance".into() }];
+        let mut by_revoker = Entry::new(&o.state.did, None, r.clone()).unwrap();
+        by_revoker.sign(&o.revoker).unwrap();
+        assert!(by_revoker.verify(&o.state).is_err(), "a revoke-only key drops no memberships");
+        assert!(entry(&o, None, r).verify(&o.state).is_ok(), "the manage policy can");
+        let mut deny_only = Entry::new(&o.state.did, None, vec![Revocation::Token { jti: "t".into() }, Revocation::Principal { id: "did:kith:eve".into() }]).unwrap();
+        deny_only.sign(&o.revoker).unwrap();
+        assert!(deny_only.verify(&o.state).is_ok(), "the other kinds only deny");
+    }
+
+    /// A forbid and an `unless` both name sets. Dropping a membership must still never
+    /// turn a deny into an allow (spec §8.7).
+    #[test]
+    fn excluding_a_membership_never_allows_more() {
+        let bundle: Bundle = serde_json::from_value(json!({
+            "version": 1,
+            "groups": {
+                "suspended": {"members": ["did:kith:ada"]},
+                "staff": {"members": ["did:kith:ada"]}
+            },
+            "policies": "@id(\"read\")\npermit(principal, action == Action::\"Query.invoices\", resource);\n@id(\"no-suspended\")\nforbid(principal in Group::\"suspended\", action, resource);\n@id(\"not-staff\")\npermit(principal, action == Action::\"Query.reports\", resource) unless { principal in Group::\"staff\" };"
+        }))
+        .unwrap();
+        let store = MemStore::new();
+        let root = build(&store, &bundle).unwrap();
+        let actions = ["Query.invoices", "Query.reports"];
+        let slice = load(&store, &root, &Query::Actions { actions: actions.iter().map(|a| a.to_string()).collect(), principals: vec!["did:kith:ada".into()] }).unwrap();
+        let o = org();
+        let mut f = Follower::new(&o.state.did, 0, FreshnessPolicy { fresh_for: 30, max_staleness: 3600, require_beacon: true });
+        let ada = Principal { id: "did:kith:ada".into(), ..Default::default() };
+        let decide = |f: &mut Follower, action: &str| authorize(&slice, f, &Request { principal: &ada, jti: None, device: None, action, resource: &Resource::new("Operation", action), context: &json!({}) }, 1000).unwrap().allowed;
+        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000).unwrap();
+        for a in actions {
+            assert!(!decide(&mut f, a), "{a} is denied to begin with");
+        }
+        let e1 = entry(&o, None, vec![Revocation::Member { id: "did:kith:ada".into(), set: "Group::suspended".into() }, Revocation::Member { id: "did:kith:ada".into(), set: "Group::staff".into() }]);
+        f.apply_entry(&o.state, &e1).unwrap();
+        f.apply_heartbeat(&o.state, &heartbeat(&o, Some(&e1), 1000), &ClockBeacon, 1000).unwrap();
+        for a in actions {
+            assert!(!decide(&mut f, a), "revoking memberships allowed {a}");
+        }
     }
 
     #[test]

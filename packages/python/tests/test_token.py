@@ -49,6 +49,13 @@ def test_token_vectors(case):
     got = verifier.verify(case["token"])
     for name, want in case.get("claims", {}).items():
         assert getattr(got, name) == want, name
+    if "resource_org" in case:
+        # A resource server configured with an org keeps memberships only from that org (spec 10.8).
+        scoped = Verifier(VECTORS["issuer"], VECTORS["audience"], jwks=VECTORS["jwks"], leeway=VECTORS["leeway"], now=lambda: VECTORS["now"], org=case["resource_org"]).verify(case["token"])
+        assert scoped.groups == case["groups_kept"]
+        if not case["groups_kept"]:
+            assert scoped.roles == []
+        assert scoped.sub == got.sub
 
 
 ATTESTATIONS = json.loads((Path(__file__).parents[3] / "spec/test-vectors/attestations.json").read_text())

@@ -128,12 +128,18 @@ async function checkSigned(org: OrgState, sigs: Sig[], msg: string, what: string
     signed.add(s.signer);
   }
   if (!mayRevoke(org, signed)) throw new Error(`${what} is not signed by a revoker of ${org.did}`);
+  return signed;
 }
 
 export async function verifyEntry(org: OrgState, e: Entry): Promise<string> {
   if (e.v !== 1 || e.org !== org.did || !(e.seq >= 1) || (e.seq === 1) !== (e.prev === undefined)) throw new Error(`malformed revocation entry ${e.seq}`);
   const d = await entryDigest(e);
-  await checkSigned(org, e.sigs, `kith revocation v1\norg: ${e.org}\nseq: ${e.seq}\ndigest: ${d}`, `revocation ${e.seq}`);
+  const signed = await checkSigned(org, e.sigs, `kith revocation v1\norg: ${e.org}\nseq: ${e.seq}\ndigest: ${d}`, `revocation ${e.seq}`);
+  // Dropping a membership can lift a forbid that names the set, so only the manage
+  // policy may do it. A revoke-only key can deny, never grant (spec §8.6).
+  if (e.revoke.some((r) => r.kind === "member") && !satisfied(org.manage, signed)) {
+    throw new Error(`revocation ${e.seq} drops a membership, which needs the manage policy of ${org.did}`);
+  }
   return d;
 }
 
@@ -277,20 +283,32 @@ export interface Request {
 /**
  * Decide with revocations and freshness applied (spec §8.9). Memberships are always
  * recomputed from the slice, so a token's `groups`/`roles` claims can't outlive a
- * revocation. Policies see `context.kith = {sync_age, degraded, revocation_seq}`.
+ * revocation, and the request must also be allowed with every membership in place, so
+ * an exclusion can't turn off a forbid. A revoked actor is denied like a revoked
+ * principal. Policies see `context.kith = {sync_age, degraded, revocation_seq}`.
  */
 export function authorize(slice: Slice, follower: Follower, req: Request, now: number): Decision {
   const deny = (why: string): Decision => ({ allowed: false, reasons: [why], errors: [] });
   const f = follower.freshness(now);
   if (f.level !== "fresh" && f.level !== "degraded") return deny(`freshness:${f.level}`);
   if (follower.isPrincipalRevoked(req.principal.id)) return deny("revoked:principal");
+  if (req.principal.actor && follower.isPrincipalRevoked(req.principal.actor)) return deny("revoked:actor");
   if (req.jti && follower.isTokenRevoked(req.jti)) return deny("revoked:token");
   if (req.device && follower.isDeviceRevoked(req.principal.id, req.device)) return deny("revoked:device");
   const engine = slice.engine(follower.revokedPolicies());
   const attrs = engine.attributes(req.principal.id, req.principal.attrs);
-  const m = engine.memberships(req.principal.id, attrs, follower.excludedSets(req.principal.id));
+  const excluded = follower.excludedSets(req.principal.id);
+  const m = engine.memberships(req.principal.id, attrs, excluded);
   const kith = { sync_age: f.age ?? Number.MAX_SAFE_INTEGER, degraded: f.level !== "fresh", revocation_seq: f.seq };
-  return engine.authorize({ ...req.principal, attrs, groups: m.groups, roles: m.roles }, req.action, req.resource, { ...(req.context ?? {}), kith });
+  const context = { ...(req.context ?? {}), kith };
+  const reduced = engine.authorize({ ...req.principal, attrs, groups: m.groups, roles: m.roles }, req.action, req.resource, context);
+  if (excluded.size === 0 || !reduced.allowed) return reduced;
+  // A forbid or an `unless` may name an excluded set, and dropping the membership would
+  // turn it off. Revocations only ever remove access (spec §8.7), so the answer must
+  // also be allowed with every membership in place.
+  const all = engine.memberships(req.principal.id, attrs);
+  const full = engine.authorize({ ...req.principal, attrs, groups: all.groups, roles: all.roles }, req.action, req.resource, context);
+  return full.allowed ? reduced : { ...full, allowed: false };
 }
 
 /**

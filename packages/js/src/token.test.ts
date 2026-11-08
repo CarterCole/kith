@@ -24,7 +24,7 @@ const vectors = JSON.parse(readFileSync(new URL("../../../spec/test-vectors/toke
 
 // The same cases every implementation runs (spec 3.5): a resource server accepts a
 // token if and only if the vector says so.
-for (const c of vectors.cases as { name: string; token: string; valid: boolean; claims?: Record<string, unknown> }[]) {
+for (const c of vectors.cases as { name: string; token: string; valid: boolean; claims?: Record<string, unknown>; resource_org?: string; groups_kept?: string[] }[]) {
   test(`token vectors: ${c.name}`, async () => {
     const verify = createVerifier({ issuer: vectors.issuer, audience: vectors.audience, jwks: vectors.jwks, clockTolerance: vectors.leeway, now: () => vectors.now });
     if (!c.valid) {
@@ -33,6 +33,13 @@ for (const c of vectors.cases as { name: string; token: string; valid: boolean; 
     }
     const got = await verify(c.token);
     for (const [k, v] of Object.entries(c.claims ?? {})) assert.deepEqual((got as any)[k], v, k);
+    if (c.resource_org) {
+      // A resource server configured with an org keeps memberships only from that org (spec 10.8).
+      const scoped = await createVerifier({ issuer: vectors.issuer, audience: vectors.audience, jwks: vectors.jwks, clockTolerance: vectors.leeway, now: () => vectors.now, org: c.resource_org })(c.token);
+      assert.deepEqual(scoped.groups, c.groups_kept, "groups_kept");
+      if (!c.groups_kept?.length) assert.deepEqual(scoped.roles, [], "roles dropped too");
+      assert.equal(scoped.sub, got.sub, "still authenticates");
+    }
   });
 }
 

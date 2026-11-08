@@ -9,6 +9,10 @@ export interface AccessClaims {
   iat: number;
   exp: number;
   jti: string;
+  /** The org whose policy produced `groups` and `roles`. Absent for memberships from a bundle file (spec 10.8). */
+  org?: string;
+  /** The policy root and newest revocation entry those memberships were computed from. */
+  pol?: { root: string; rev: number };
   groups: string[];
   roles: string[];
   attrs: Record<string, unknown>;
@@ -41,6 +45,11 @@ export interface VerifierOptions {
   /** Static keys instead of fetching (tests, air-gapped). */
   jwks?: JSONWebKeySet;
   clockTolerance?: number;
+  /**
+   * Take `groups` and `roles` only from tokens that say this org produced them (spec 10.8).
+   * Any other token still authenticates `sub`, with no memberships.
+   */
+  org?: string;
   /** Seconds since the epoch. Defaults to the system clock; tests pin it. */
   now?: () => number;
 }
@@ -93,12 +102,29 @@ export function createVerifier(opts: VerifierOptions) {
       if (typeof payload.jti !== "string" || !payload.jti) throw new Error('"jti" must be a non-empty string');
       if (!Number.isInteger(payload.aal) || (payload.aal as number) < 1 || (payload.aal as number) > 3) throw new Error('"aal" must be 1, 2 or 3');
       if ((payload.iat as number) - tolerance > now) throw new Error('"iat" is in the future');
+      if (payload.org !== undefined && (typeof payload.org !== "string" || !payload.org)) throw new Error('"org" must be a non-empty string');
+      if (payload.pol !== undefined) {
+        const pol = payload.pol as { root?: unknown; rev?: unknown } | null;
+        if (payload.org === undefined) throw new Error('"pol" needs an "org"');
+        if (!pol || typeof pol !== "object" || typeof pol.root !== "string" || !pol.root || !Number.isInteger(pol.rev) || (pol.rev as number) < 0) {
+          throw new Error('"pol" must be {root, rev}');
+        }
+      }
       const c = payload as unknown as Partial<AccessClaims>;
-      return { ...c, groups: c.groups ?? [], roles: c.roles ?? [], attrs: c.attrs ?? {}, amr: c.amr ?? [] } as AccessClaims;
+      const claims = { ...c, groups: c.groups ?? [], roles: c.roles ?? [], attrs: c.attrs ?? {}, amr: c.amr ?? [] } as AccessClaims;
+      return opts.org === undefined ? claims : forOrg(claims, opts.org);
     } catch (e) {
       throw new KithAuthError(`invalid token: ${(e as Error).message}`);
     }
   };
+}
+
+/**
+ * The claims as a resource server configured with `org` may rely on them (spec 10.8):
+ * `groups` and `roles` survive only if the token says `org` produced them.
+ */
+export function forOrg(c: AccessClaims, org: string): AccessClaims {
+  return c.org === org ? c : { ...c, groups: [], roles: [] };
 }
 
 /**

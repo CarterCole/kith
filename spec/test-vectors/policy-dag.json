@@ -51,25 +51,27 @@
         }
       }
     },
-    "policies": "@id(\"read-invoices\")\npermit(principal in Role::\"billing-reader\", action == Action::\"Query.invoices\", resource);\n@id(\"pay\")\npermit(principal in Role::\"billing-admin\", action == Action::\"Mutation.payInvoice\", resource) when { context has amount && context.amount < 10000 };\n@id(\"own-invoice\")\npermit(principal, action == Action::\"Invoice.read\", resource) when { principal has email && resource has ownerEmail && resource.ownerEmail == principal.email };\n@id(\"no-delegated-pay\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) when { context has actor };\n@id(\"pay-needs-fresh\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) unless { context has kith && context.kith.sync_age < 60 };"
+    "policies": "@id(\"read-invoices\")\npermit(principal in Role::\"billing-reader\", action == Action::\"Query.invoices\", resource);\n@id(\"pay\")\npermit(principal in Role::\"billing-admin\", action == Action::\"Mutation.payInvoice\", resource) when { context has amount && context.amount < 10000 };\n@id(\"own-invoice\")\npermit(principal, action == Action::\"Invoice.read\", resource) when { principal has email && resource has ownerEmail && resource.ownerEmail == principal.email };\n@id(\"no-delegated-pay\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) when { context has actor };\n@id(\"pay-needs-fresh\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) unless { context has kith && context.kith.sync_age < 60 };\n@id(\"reports\")\npermit(principal, action == Action::\"Query.reports\", resource);\n@id(\"no-finance-reports\")\nforbid(principal in Group::\"finance\", action == Action::\"Query.reports\", resource);"
   },
-  "root": "baguqeeradugc2ui73ar6etjw54l47nnk3iy5cc4p4aledq4b4bqa2qfjtbva",
+  "root": "baguqeeraxdtwwhmv65pi4ha7wjoorvhamx3owcixh2rdyqzmdqf2hgoolhda",
   "blocks": {
-    "baguqeera2tvxovc3et5e7unexat6acybmedc4bg6gsucfzwardvexaw2yveq": "{\"e\":[[\"Invoice.read\",[{\"/\":\"baguqeeraevchbbnhd6ivjs67omnc52sfvkw724a5mvt4ng5lqst7dl3yuwja\"}]],[\"Mutation.payInvoice\",[{\"/\":\"baguqeerayoehbkboeyztp5ms62x2x75xl5upd35yijrfqvjr7yshi6l4bega\"},{\"/\":\"baguqeera5ltebnlrfjsuau2ynejf5vkytm6afolyb2yapwhawo4tew6dtj7q\"},{\"/\":\"baguqeeraqpk2hwvzl76hc3g3b4cintafcdkkdl5kjfjjrjrkqfdd6cwwauuq\"}]],[\"Query.invoices\",[{\"/\":\"baguqeerazd2lsldupepz3grafzyn44pbtqt6a7je3egrerrycjlepexfa5la\"}]]]}",
-    "baguqeera3255tlkn755tedzsr3cxhvk3wyldplulkkm6skh5ym6cgaw47uvq": "{\"e\":[[\"*\",[{\"/\":\"baguqeerayoehbkboeyztp5ms62x2x75xl5upd35yijrfqvjr7yshi6l4bega\"},{\"/\":\"baguqeeraevchbbnhd6ivjs67omnc52sfvkw724a5mvt4ng5lqst7dl3yuwja\"},{\"/\":\"baguqeeraqpk2hwvzl76hc3g3b4cintafcdkkdl5kjfjjrjrkqfdd6cwwauuq\"}]],[\"Role::billing-admin\",[{\"/\":\"baguqeera5ltebnlrfjsuau2ynejf5vkytm6afolyb2yapwhawo4tew6dtj7q\"}]],[\"Role::billing-reader\",[{\"/\":\"baguqeerazd2lsldupepz3grafzyn44pbtqt6a7je3egrerrycjlepexfa5la\"}]]]}",
     "baguqeera5ltebnlrfjsuau2ynejf5vkytm6afolyb2yapwhawo4tew6dtj7q": "{\"effect\":\"permit\",\"id\":\"pay\",\"refs\":[\"Role::billing-admin\"],\"text\":\"@id(\\\"pay\\\")\\npermit(principal in Role::\\\"billing-admin\\\", action == Action::\\\"Mutation.payInvoice\\\", resource) when { context has amount && context.amount < 10000 };\"}",
     "baguqeera6lwnwfyu5yme37tpneg6a2rr4ss75ah6npep4gc72lbe4ozis2rq": "{\"dependents\":[],\"deps\":[\"Role::billing-admin\"],\"kind\":\"Group\",\"members\":[],\"name\":\"vip\",\"rule\":\"principal in Role::\\\"billing-admin\\\"\"}",
     "baguqeeraa44zynqdrlr35ucb3w66h66ljpty5hezjbsgefhdm3yp5vdbvaxq": "{\"e\":[[\"Group::contractors\",{\"/\":\"baguqeeraopswbpmd7gyelczqyt7nbhnk5tzcpcbvrqmxxhxniuunke4yvj7a\"}],[\"Group::finance\",{\"/\":\"baguqeeraphirmkbxvxot6skph7ibzmqcyshdxgnjjzyibqsxt3aj6l3phjbq\"}],[\"Group::staff\",{\"/\":\"baguqeeraiftuqvahglbbuscnyv66gyb3txqazpu5hbprgbrfoxgkrgouh65a\"}],[\"Group::strong\",{\"/\":\"baguqeerazeebpvtrivnwbld3j6dx7nghcmvu77actfzh5cerygg5bwp74waq\"}],[\"Group::vip\",{\"/\":\"baguqeera6lwnwfyu5yme37tpneg6a2rr4ss75ah6npep4gc72lbe4ozis2rq\"}],[\"Role::billing-admin\",{\"/\":\"baguqeerahtnr5ywwowp7ocx7fkfggv256ptottrau6jmlyyrfmi74nde7guq\"}],[\"Role::billing-reader\",{\"/\":\"baguqeeramws2n7pmqlzij75ryisxgjf55ipwsijixshdg3dc5sk7w6kemo7q\"}]]}",
     "baguqeerabn5twdolcfkoivn3wwai4wfgn2l2wy2d3ef57rvea4zslfkqbuuq": "{\"e\":[[\"did:kith:ada\",[\"Group::finance\"]],[\"did:kith:bob\",[\"Group::contractors\"]]]}",
-    "baguqeeradugc2ui73ar6etjw54l47nnk3iy5cc4p4aledq4b4bqa2qfjtbva": "{\"actions\":{\"/\":\"baguqeera2tvxovc3et5e7unexat6acybmedc4bg6gsucfzwardvexaw2yveq\"},\"directory\":{\"/\":\"baguqeeraot2elo6akunqqvz7ayrojia4447ncryjxnsxnzwmuj6ts4ltfmuq\"},\"kith\":\"kith-policy-dag/1\",\"members\":{\"/\":\"baguqeerabn5twdolcfkoivn3wwai4wfgn2l2wy2d3ef57rvea4zslfkqbuuq\"},\"principals\":{\"/\":\"baguqeera3255tlkn755tedzsr3cxhvk3wyldplulkkm6skh5ym6cgaw47uvq\"},\"rules\":[\"Group::staff\",\"Group::strong\",\"Group::vip\",\"Role::billing-admin\"],\"sets\":{\"/\":\"baguqeeraa44zynqdrlr35ucb3w66h66ljpty5hezjbsgefhdm3yp5vdbvaxq\"},\"version\":1}",
     "baguqeeraevchbbnhd6ivjs67omnc52sfvkw724a5mvt4ng5lqst7dl3yuwja": "{\"effect\":\"permit\",\"id\":\"own-invoice\",\"refs\":[],\"text\":\"@id(\\\"own-invoice\\\")\\npermit(principal, action == Action::\\\"Invoice.read\\\", resource) when { principal has email && resource has ownerEmail && resource.ownerEmail == principal.email };\"}",
+    "baguqeerah33w4utrf5hvaryjaup5eggevtenrrzlfr5lhmkrsvkxzv2x2ycq": "{\"e\":[[\"Invoice.read\",[{\"/\":\"baguqeeraevchbbnhd6ivjs67omnc52sfvkw724a5mvt4ng5lqst7dl3yuwja\"}]],[\"Mutation.payInvoice\",[{\"/\":\"baguqeerayoehbkboeyztp5ms62x2x75xl5upd35yijrfqvjr7yshi6l4bega\"},{\"/\":\"baguqeera5ltebnlrfjsuau2ynejf5vkytm6afolyb2yapwhawo4tew6dtj7q\"},{\"/\":\"baguqeeraqpk2hwvzl76hc3g3b4cintafcdkkdl5kjfjjrjrkqfdd6cwwauuq\"}]],[\"Query.invoices\",[{\"/\":\"baguqeerazd2lsldupepz3grafzyn44pbtqt6a7je3egrerrycjlepexfa5la\"}]],[\"Query.reports\",[{\"/\":\"baguqeerawdirfne6bjl37qjbz764xz5icquweqzqmfy4mp5l64hrhfxtxphq\"},{\"/\":\"baguqeeraiknqmem5jyyxollqrz6t4f32eimxp2zvwtk4ibmasai6pbdof5uq\"}]]]}",
     "baguqeerahtnr5ywwowp7ocx7fkfggv256ptottrau6jmlyyrfmi74nde7guq": "{\"dependents\":[\"Group::vip\"],\"deps\":[\"Group::finance\",\"Group::strong\"],\"kind\":\"Role\",\"members\":[],\"name\":\"billing-admin\",\"rule\":\"principal in Group::\\\"finance\\\" && principal in Group::\\\"strong\\\"\"}",
     "baguqeeraiftuqvahglbbuscnyv66gyb3txqazpu5hbprgbrfoxgkrgouh65a": "{\"dependents\":[],\"deps\":[],\"kind\":\"Group\",\"members\":[],\"name\":\"staff\",\"rule\":\"principal has email && principal.email like \\\"*@acme.test\\\"\"}",
+    "baguqeeraiknqmem5jyyxollqrz6t4f32eimxp2zvwtk4ibmasai6pbdof5uq": "{\"effect\":\"permit\",\"id\":\"reports\",\"refs\":[],\"text\":\"@id(\\\"reports\\\")\\npermit(principal, action == Action::\\\"Query.reports\\\", resource);\"}",
     "baguqeeramws2n7pmqlzij75ryisxgjf55ipwsijixshdg3dc5sk7w6kemo7q": "{\"dependents\":[],\"deps\":[\"Group::finance\"],\"kind\":\"Role\",\"members\":[\"group:finance\"],\"name\":\"billing-reader\"}",
     "baguqeeraopswbpmd7gyelczqyt7nbhnk5tzcpcbvrqmxxhxniuunke4yvj7a": "{\"dependents\":[\"Group::finance\"],\"deps\":[],\"kind\":\"Group\",\"members\":[\"did:kith:bob\"],\"name\":\"contractors\"}",
     "baguqeeraot2elo6akunqqvz7ayrojia4447ncryjxnsxnzwmuj6ts4ltfmuq": "{\"e\":[[\"did:kith:ada\",{\"attrs\":{\"department\":\"finance\",\"email\":\"ada@acme.test\"}}],[\"did:kith:bob\",{\"attrs\":{\"email\":\"bob@partner.test\"}}]]}",
     "baguqeeraphirmkbxvxot6skph7ibzmqcyshdxgnjjzyibqsxt3aj6l3phjbq": "{\"dependents\":[\"Role::billing-admin\",\"Role::billing-reader\"],\"deps\":[\"Group::contractors\"],\"kind\":\"Group\",\"members\":[\"did:kith:ada\",\"group:contractors\"],\"name\":\"finance\"}",
     "baguqeeraqpk2hwvzl76hc3g3b4cintafcdkkdl5kjfjjrjrkqfdd6cwwauuq": "{\"effect\":\"forbid\",\"id\":\"pay-needs-fresh\",\"refs\":[],\"text\":\"@id(\\\"pay-needs-fresh\\\")\\nforbid(principal, action == Action::\\\"Mutation.payInvoice\\\", resource) unless { context has kith && context.kith.sync_age < 60 };\"}",
+    "baguqeerawdirfne6bjl37qjbz764xz5icquweqzqmfy4mp5l64hrhfxtxphq": "{\"effect\":\"forbid\",\"id\":\"no-finance-reports\",\"refs\":[\"Group::finance\"],\"text\":\"@id(\\\"no-finance-reports\\\")\\nforbid(principal in Group::\\\"finance\\\", action == Action::\\\"Query.reports\\\", resource);\"}",
+    "baguqeeraxdtwwhmv65pi4ha7wjoorvhamx3owcixh2rdyqzmdqf2hgoolhda": "{\"actions\":{\"/\":\"baguqeerah33w4utrf5hvaryjaup5eggevtenrrzlfr5lhmkrsvkxzv2x2ycq\"},\"directory\":{\"/\":\"baguqeeraot2elo6akunqqvz7ayrojia4447ncryjxnsxnzwmuj6ts4ltfmuq\"},\"kith\":\"kith-policy-dag/1\",\"members\":{\"/\":\"baguqeerabn5twdolcfkoivn3wwai4wfgn2l2wy2d3ef57rvea4zslfkqbuuq\"},\"principals\":{\"/\":\"baguqeeraxdzjo5jruf3dusacg63wybmaqaygjgrfrsrt6sfgjmy4ovizzuwq\"},\"rules\":[\"Group::staff\",\"Group::strong\",\"Group::vip\",\"Role::billing-admin\"],\"sets\":{\"/\":\"baguqeeraa44zynqdrlr35ucb3w66h66ljpty5hezjbsgefhdm3yp5vdbvaxq\"},\"version\":1}",
+    "baguqeeraxdzjo5jruf3dusacg63wybmaqaygjgrfrsrt6sfgjmy4ovizzuwq": "{\"e\":[[\"*\",[{\"/\":\"baguqeerayoehbkboeyztp5ms62x2x75xl5upd35yijrfqvjr7yshi6l4bega\"},{\"/\":\"baguqeeraevchbbnhd6ivjs67omnc52sfvkw724a5mvt4ng5lqst7dl3yuwja\"},{\"/\":\"baguqeeraqpk2hwvzl76hc3g3b4cintafcdkkdl5kjfjjrjrkqfdd6cwwauuq\"},{\"/\":\"baguqeeraiknqmem5jyyxollqrz6t4f32eimxp2zvwtk4ibmasai6pbdof5uq\"}]],[\"Group::finance\",[{\"/\":\"baguqeerawdirfne6bjl37qjbz764xz5icquweqzqmfy4mp5l64hrhfxtxphq\"}]],[\"Role::billing-admin\",[{\"/\":\"baguqeera5ltebnlrfjsuau2ynejf5vkytm6afolyb2yapwhawo4tew6dtj7q\"}]],[\"Role::billing-reader\",[{\"/\":\"baguqeerazd2lsldupepz3grafzyn44pbtqt6a7je3egrerrycjlepexfa5la\"}]]]}",
     "baguqeerayoehbkboeyztp5ms62x2x75xl5upd35yijrfqvjr7yshi6l4bega": "{\"effect\":\"forbid\",\"id\":\"no-delegated-pay\",\"refs\":[],\"text\":\"@id(\\\"no-delegated-pay\\\")\\nforbid(principal, action == Action::\\\"Mutation.payInvoice\\\", resource) when { context has actor };\"}",
     "baguqeerazd2lsldupepz3grafzyn44pbtqt6a7je3egrerrycjlepexfa5la": "{\"effect\":\"permit\",\"id\":\"read-invoices\",\"refs\":[\"Role::billing-reader\"],\"text\":\"@id(\\\"read-invoices\\\")\\npermit(principal in Role::\\\"billing-reader\\\", action == Action::\\\"Query.invoices\\\", resource);\"}",
     "baguqeerazeebpvtrivnwbld3j6dx7nghcmvu77actfzh5cerygg5bwp74waq": "{\"dependents\":[\"Role::billing-admin\"],\"deps\":[],\"kind\":\"Group\",\"members\":[],\"name\":\"strong\",\"rule\":\"principal has aal && principal.aal >= 2\"}"
@@ -93,12 +95,12 @@
       ],
       "directory": [],
       "proof": [
-        "baguqeera2tvxovc3et5e7unexat6acybmedc4bg6gsucfzwardvexaw2yveq",
         "baguqeeraa44zynqdrlr35ucb3w66h66ljpty5hezjbsgefhdm3yp5vdbvaxq",
-        "baguqeeradugc2ui73ar6etjw54l47nnk3iy5cc4p4aledq4b4bqa2qfjtbva",
+        "baguqeerah33w4utrf5hvaryjaup5eggevtenrrzlfr5lhmkrsvkxzv2x2ycq",
         "baguqeeramws2n7pmqlzij75ryisxgjf55ipwsijixshdg3dc5sk7w6kemo7q",
         "baguqeeraopswbpmd7gyelczqyt7nbhnk5tzcpcbvrqmxxhxniuunke4yvj7a",
         "baguqeeraphirmkbxvxot6skph7ibzmqcyshdxgnjjzyibqsxt3aj6l3phjbq",
+        "baguqeeraxdtwwhmv65pi4ha7wjoorvhamx3owcixh2rdyqzmdqf2hgoolhda",
         "baguqeerazd2lsldupepz3grafzyn44pbtqt6a7je3egrerrycjlepexfa5la"
       ]
     },
@@ -127,15 +129,15 @@
         "did:kith:bob"
       ],
       "proof": [
-        "baguqeera2tvxovc3et5e7unexat6acybmedc4bg6gsucfzwardvexaw2yveq",
         "baguqeera5ltebnlrfjsuau2ynejf5vkytm6afolyb2yapwhawo4tew6dtj7q",
         "baguqeeraa44zynqdrlr35ucb3w66h66ljpty5hezjbsgefhdm3yp5vdbvaxq",
-        "baguqeeradugc2ui73ar6etjw54l47nnk3iy5cc4p4aledq4b4bqa2qfjtbva",
+        "baguqeerah33w4utrf5hvaryjaup5eggevtenrrzlfr5lhmkrsvkxzv2x2ycq",
         "baguqeerahtnr5ywwowp7ocx7fkfggv256ptottrau6jmlyyrfmi74nde7guq",
         "baguqeeraopswbpmd7gyelczqyt7nbhnk5tzcpcbvrqmxxhxniuunke4yvj7a",
         "baguqeeraot2elo6akunqqvz7ayrojia4447ncryjxnsxnzwmuj6ts4ltfmuq",
         "baguqeeraphirmkbxvxot6skph7ibzmqcyshdxgnjjzyibqsxt3aj6l3phjbq",
         "baguqeeraqpk2hwvzl76hc3g3b4cintafcdkkdl5kjfjjrjrkqfdd6cwwauuq",
+        "baguqeeraxdtwwhmv65pi4ha7wjoorvhamx3owcixh2rdyqzmdqf2hgoolhda",
         "baguqeerayoehbkboeyztp5ms62x2x75xl5upd35yijrfqvjr7yshi6l4bega",
         "baguqeerazeebpvtrivnwbld3j6dx7nghcmvu77actfzh5cerygg5bwp74waq"
       ]
@@ -166,14 +168,14 @@
         "did:kith:bob"
       ],
       "proof": [
-        "baguqeera2tvxovc3et5e7unexat6acybmedc4bg6gsucfzwardvexaw2yveq",
         "baguqeeraa44zynqdrlr35ucb3w66h66ljpty5hezjbsgefhdm3yp5vdbvaxq",
-        "baguqeeradugc2ui73ar6etjw54l47nnk3iy5cc4p4aledq4b4bqa2qfjtbva",
         "baguqeeraevchbbnhd6ivjs67omnc52sfvkw724a5mvt4ng5lqst7dl3yuwja",
+        "baguqeerah33w4utrf5hvaryjaup5eggevtenrrzlfr5lhmkrsvkxzv2x2ycq",
         "baguqeeramws2n7pmqlzij75ryisxgjf55ipwsijixshdg3dc5sk7w6kemo7q",
         "baguqeeraopswbpmd7gyelczqyt7nbhnk5tzcpcbvrqmxxhxniuunke4yvj7a",
         "baguqeeraot2elo6akunqqvz7ayrojia4447ncryjxnsxnzwmuj6ts4ltfmuq",
         "baguqeeraphirmkbxvxot6skph7ibzmqcyshdxgnjjzyibqsxt3aj6l3phjbq",
+        "baguqeeraxdtwwhmv65pi4ha7wjoorvhamx3owcixh2rdyqzmdqf2hgoolhda",
         "baguqeerazd2lsldupepz3grafzyn44pbtqt6a7je3egrerrycjlepexfa5la"
       ]
     },
@@ -184,10 +186,12 @@
       },
       "policies": [
         "no-delegated-pay",
+        "no-finance-reports",
         "own-invoice",
         "pay",
         "pay-needs-fresh",
-        "read-invoices"
+        "read-invoices",
+        "reports"
       ],
       "sets": [
         "Group::contractors",
@@ -202,20 +206,22 @@
         "did:kith:ada"
       ],
       "proof": [
-        "baguqeera3255tlkn755tedzsr3cxhvk3wyldplulkkm6skh5ym6cgaw47uvq",
         "baguqeera5ltebnlrfjsuau2ynejf5vkytm6afolyb2yapwhawo4tew6dtj7q",
         "baguqeera6lwnwfyu5yme37tpneg6a2rr4ss75ah6npep4gc72lbe4ozis2rq",
         "baguqeeraa44zynqdrlr35ucb3w66h66ljpty5hezjbsgefhdm3yp5vdbvaxq",
         "baguqeerabn5twdolcfkoivn3wwai4wfgn2l2wy2d3ef57rvea4zslfkqbuuq",
-        "baguqeeradugc2ui73ar6etjw54l47nnk3iy5cc4p4aledq4b4bqa2qfjtbva",
         "baguqeeraevchbbnhd6ivjs67omnc52sfvkw724a5mvt4ng5lqst7dl3yuwja",
         "baguqeerahtnr5ywwowp7ocx7fkfggv256ptottrau6jmlyyrfmi74nde7guq",
         "baguqeeraiftuqvahglbbuscnyv66gyb3txqazpu5hbprgbrfoxgkrgouh65a",
+        "baguqeeraiknqmem5jyyxollqrz6t4f32eimxp2zvwtk4ibmasai6pbdof5uq",
         "baguqeeramws2n7pmqlzij75ryisxgjf55ipwsijixshdg3dc5sk7w6kemo7q",
         "baguqeeraopswbpmd7gyelczqyt7nbhnk5tzcpcbvrqmxxhxniuunke4yvj7a",
         "baguqeeraot2elo6akunqqvz7ayrojia4447ncryjxnsxnzwmuj6ts4ltfmuq",
         "baguqeeraphirmkbxvxot6skph7ibzmqcyshdxgnjjzyibqsxt3aj6l3phjbq",
         "baguqeeraqpk2hwvzl76hc3g3b4cintafcdkkdl5kjfjjrjrkqfdd6cwwauuq",
+        "baguqeerawdirfne6bjl37qjbz764xz5icquweqzqmfy4mp5l64hrhfxtxphq",
+        "baguqeeraxdtwwhmv65pi4ha7wjoorvhamx3owcixh2rdyqzmdqf2hgoolhda",
+        "baguqeeraxdzjo5jruf3dusacg63wybmaqaygjgrfrsrt6sfgjmy4ovizzuwq",
         "baguqeerayoehbkboeyztp5ms62x2x75xl5upd35yijrfqvjr7yshi6l4bega",
         "baguqeerazd2lsldupepz3grafzyn44pbtqt6a7je3egrerrycjlepexfa5la",
         "baguqeerazeebpvtrivnwbld3j6dx7nghcmvu77actfzh5cerygg5bwp74waq"
@@ -230,7 +236,8 @@
         "no-delegated-pay",
         "own-invoice",
         "pay",
-        "pay-needs-fresh"
+        "pay-needs-fresh",
+        "reports"
       ],
       "sets": [
         "Group::contractors",
@@ -242,19 +249,20 @@
       ],
       "directory": [],
       "proof": [
-        "baguqeera3255tlkn755tedzsr3cxhvk3wyldplulkkm6skh5ym6cgaw47uvq",
         "baguqeera5ltebnlrfjsuau2ynejf5vkytm6afolyb2yapwhawo4tew6dtj7q",
         "baguqeera6lwnwfyu5yme37tpneg6a2rr4ss75ah6npep4gc72lbe4ozis2rq",
         "baguqeeraa44zynqdrlr35ucb3w66h66ljpty5hezjbsgefhdm3yp5vdbvaxq",
         "baguqeerabn5twdolcfkoivn3wwai4wfgn2l2wy2d3ef57rvea4zslfkqbuuq",
-        "baguqeeradugc2ui73ar6etjw54l47nnk3iy5cc4p4aledq4b4bqa2qfjtbva",
         "baguqeeraevchbbnhd6ivjs67omnc52sfvkw724a5mvt4ng5lqst7dl3yuwja",
         "baguqeerahtnr5ywwowp7ocx7fkfggv256ptottrau6jmlyyrfmi74nde7guq",
         "baguqeeraiftuqvahglbbuscnyv66gyb3txqazpu5hbprgbrfoxgkrgouh65a",
+        "baguqeeraiknqmem5jyyxollqrz6t4f32eimxp2zvwtk4ibmasai6pbdof5uq",
         "baguqeeraopswbpmd7gyelczqyt7nbhnk5tzcpcbvrqmxxhxniuunke4yvj7a",
         "baguqeeraot2elo6akunqqvz7ayrojia4447ncryjxnsxnzwmuj6ts4ltfmuq",
         "baguqeeraphirmkbxvxot6skph7ibzmqcyshdxgnjjzyibqsxt3aj6l3phjbq",
         "baguqeeraqpk2hwvzl76hc3g3b4cintafcdkkdl5kjfjjrjrkqfdd6cwwauuq",
+        "baguqeeraxdtwwhmv65pi4ha7wjoorvhamx3owcixh2rdyqzmdqf2hgoolhda",
+        "baguqeeraxdzjo5jruf3dusacg63wybmaqaygjgrfrsrt6sfgjmy4ovizzuwq",
         "baguqeerayoehbkboeyztp5ms62x2x75xl5upd35yijrfqvjr7yshi6l4bega",
         "baguqeerazeebpvtrivnwbld3j6dx7nghcmvu77actfzh5cerygg5bwp74waq"
       ]
@@ -368,13 +376,17 @@
             "kind": "device",
             "did": "did:kith:bob",
             "device": "dev_stolen"
+          },
+          {
+            "kind": "principal",
+            "id": "did:kith:mallory"
           }
         ],
         "sigs": [
           {
             "signer": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
             "alg": "Ed25519",
-            "sig": "gXBaH_OTB7zgoy9tmGMTGK7Zldx99asejXoEQIfXKkY1_rZOMG4AI9RBcmjdrNP2nOo7D8iRfXqxgrvmN3UfDg"
+            "sig": "UdmdZZOBFZ9W9QF5rb8HVA9iJX_mvlSY2nqKTnethG8_SwEPv8cmb-NkiViN4GDy4kTAo0OpbGcNBxwn1WfCBw"
           }
         ]
       }
@@ -383,7 +395,7 @@
       "v": 1,
       "org": "did:kith:cgzn7lbqho2giftb2h4u25t6xg2u26a32pihqxcjvt3ufo66ezda",
       "seq": 3,
-      "head": "MVCdXKLw4BG_rvfUXhihwAsV3eg1xua9nhsmOq5UARg",
+      "head": "i-RV1hx5KNriwDTa21RmL5y7DNXEU842Vj4XVxIM6Bs",
       "ts": 1692806365,
       "beacon": {
         "type": "drand",
@@ -395,7 +407,7 @@
         {
           "signer": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
           "alg": "Ed25519",
-          "sig": "Q5-1Tienj4pDXMiz4KCJBBvUaOu52IKShD8veMhK4D6cf2gCBEympUHHT4ix0TUPD55_DLU1u-8ORVe-eRVQDg"
+          "sig": "9MYa_IfuzKlngHlfvssXseSgFiVF--mpb3B0YKeQ6Q03YQW3Egw8-SxA1rwDVJWu4ZHRnJd9Qv8Br0h8zpUGAw"
         }
       ]
     },
@@ -409,7 +421,8 @@
       "actions": [
         "Query.invoices",
         "Mutation.payInvoice",
-        "Invoice.read"
+        "Invoice.read",
+        "Query.reports"
       ],
       "principals": [
         "did:kith:ada",
@@ -565,6 +578,47 @@
           {
             "action": "Mutation.*"
           }
+        ]
+      },
+      {
+        "name": "a member revocation does not lift a forbid on the set",
+        "principal": "did:kith:ada",
+        "attrs": {
+          "aal": 2
+        },
+        "action": "Query.reports",
+        "resource": {
+          "type": "Operation",
+          "id": "Query.reports"
+        },
+        "context": {},
+        "now": 1692806374,
+        "level": "fresh",
+        "allowed": false
+      },
+      {
+        "name": "a revoked actor acts for no one",
+        "principal": "did:kith:bob",
+        "attrs": {
+          "aal": 1
+        },
+        "action": "Query.invoices",
+        "resource": {
+          "type": "Operation",
+          "id": "Query.invoices"
+        },
+        "context": {},
+        "now": 1692806374,
+        "level": "fresh",
+        "allowed": false,
+        "actor": "did:kith:mallory",
+        "caps": [
+          {
+            "action": "*"
+          }
+        ],
+        "reasons": [
+          "revoked:actor"
         ]
       },
       {

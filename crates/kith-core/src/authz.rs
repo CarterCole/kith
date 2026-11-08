@@ -75,6 +75,19 @@ pub struct Memberships {
     pub roles: Vec<String>,
 }
 
+/// Why a principal is in a set (spec §4.3, §10.8). The first reason found wins, in the
+/// order the evaluation reaches them: listed by id, then through a nested set, then by rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "via", rename_all = "snake_case")]
+pub enum Basis {
+    /// The principal's id is in the set's `members`.
+    Listed,
+    /// `group:<name>` (or `role:<name>`) is in `members`, and the principal is in it.
+    Nested { set: String },
+    /// The set's dynamic rule held.
+    Rule,
+}
+
 /// The authenticated principal as the policy engine sees it.
 #[derive(Debug, Clone, Default)]
 pub struct Principal {
@@ -249,6 +262,13 @@ impl Engine {
     /// Memberships with some sets (`Group::x`, `Role::x`) ruled out, as revocations
     /// require. An excluded set never joins, so neither do sets that depended on it.
     pub fn memberships_excluding(&self, id: &str, attrs: &Map<String, Value>, excluded: &BTreeSet<String>) -> Result<Memberships> {
+        Ok(self.explain_memberships(id, attrs, excluded)?.0)
+    }
+
+    /// [`Self::memberships_excluding`], and for each set (`Group::x`, `Role::x`) the
+    /// reason the principal is in it.
+    pub fn explain_memberships(&self, id: &str, attrs: &Map<String, Value>, excluded: &BTreeSet<String>) -> Result<(Memberships, BTreeMap<String, Basis>)> {
+        let mut why = BTreeMap::new();
         let mut groups = BTreeSet::new();
         let mut roles = BTreeSet::new();
         let limit = self.bundle.groups.len() + self.bundle.roles.len() + 1;
@@ -265,15 +285,25 @@ impl Engine {
                     if current.contains(name) || excluded.contains(&format!("{kind}::{name}")) {
                         continue;
                     }
-                    let explicit = def.members.iter().any(|m| {
-                        m == id || m.strip_prefix("group:").is_some_and(|g| groups.contains(g)) || m.strip_prefix("role:").is_some_and(|r| roles.contains(r))
+                    let explicit = def.members.iter().find_map(|m| {
+                        if m == id {
+                            return Some(Basis::Listed);
+                        }
+                        let (kind, name) = m.split_once(':')?;
+                        let held = match kind {
+                            "group" => groups.contains(name),
+                            "role" => roles.contains(name),
+                            _ => false,
+                        };
+                        held.then(|| Basis::Nested { set: format!("{}::{name}", if kind == "group" { "Group" } else { "Role" }) })
                     });
-                    let dynamic = def.rule.is_some() && {
+                    let dynamic = explicit.is_none() && def.rule.is_some() && {
                         let req = Request::new(uid("User", id)?, uid("Action", MEMBER_ACTION)?, uid(kind, name)?, Context::empty(), None)
                             .map_err(|e| Error::Authz(e.to_string()))?;
                         self.authorizer.is_authorized(&req, &self.membership, &entities).decision() == Decision::Allow
                     };
-                    if explicit || dynamic {
+                    if let Some(basis) = explicit.or(dynamic.then_some(Basis::Rule)) {
+                        why.insert(format!("{kind}::{name}"), basis);
                         if kind == "Group" {
                             groups.insert(name.clone());
                         } else {
@@ -287,7 +317,7 @@ impl Engine {
                 break;
             }
         }
-        Ok(Memberships { groups: groups.into_iter().collect(), roles: roles.into_iter().collect() })
+        Ok((Memberships { groups: groups.into_iter().collect(), roles: roles.into_iter().collect() }, why))
     }
 
     /// Evaluate `action` on `resource` for `principal`. Delegated principals must also
@@ -344,6 +374,21 @@ mod tests {
       },
       "policies": "@id(\"read-invoices\")\npermit(principal in Role::\"billing-reader\", action == Action::\"Query.invoices\", resource);\n@id(\"pay\")\npermit(principal in Role::\"billing-admin\", action == Action::\"Mutation.payInvoice\", resource) when { context has amount && context.amount < 10000 };\n@id(\"own-invoice\")\npermit(principal, action == Action::\"Invoice.read\", resource) when { resource has ownerId && resource.ownerId == principal.email };\n@id(\"no-delegated-pay\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) when { context has actor };"
     }"#;
+
+    #[test]
+    fn memberships_say_why() {
+        let e = Engine::from_json(BUNDLE).unwrap();
+        let mut attrs = e.attributes("did:kith:bob", &Map::new());
+        attrs.insert("aal".into(), json!(2));
+        let (m, why) = e.explain_memberships("did:kith:bob", &attrs, &BTreeSet::new()).unwrap();
+        assert_eq!(m, e.memberships("did:kith:bob", &attrs).unwrap(), "the same answer");
+        assert_eq!(why["Group::contractors"], Basis::Listed);
+        assert_eq!(why["Group::finance"], Basis::Nested { set: "Group::contractors".into() });
+        assert_eq!(why["Role::billing-reader"], Basis::Nested { set: "Group::finance".into() });
+        assert_eq!(why["Group::strong"], Basis::Rule);
+        assert_eq!(why["Role::billing-admin"], Basis::Rule);
+        assert_eq!(why.len(), m.groups.len() + m.roles.len(), "every membership has a reason");
+    }
 
     fn principal(e: &Engine, id: &str, aal: i64) -> Principal {
         let mut attrs = e.attributes(id, &Map::new());

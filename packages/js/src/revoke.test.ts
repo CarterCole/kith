@@ -54,6 +54,22 @@ test("gaps, forks and forged signatures", async () => {
   assert.equal(await entryDigest(e1), e2.prev);
 });
 
+test("only the manage policy may drop a membership", async () => {
+  // The vectors' revoke-only device key is Ed25519 with a seed of 32 × 0x02.
+  const seed = new Uint8Array(32).fill(2);
+  const revoker = r.org.devices.find((d: { caps: string[] }) => d.caps.includes("revoke")).key;
+  const signAsRevoker = async (e: Entry): Promise<Entry> => {
+    const unsigned = { ...e, sigs: [] };
+    const msg = new TextEncoder().encode(`kith revocation v1\norg: ${e.org}\nseq: ${e.seq}\ndigest: ${await entryDigest(unsigned)}`);
+    return { ...unsigned, sigs: [{ signer: revoker, alg: "Ed25519", sig: b64u(ed25519.sign(msg, seed)) }] };
+  };
+  const [e1] = r.entries as Entry[];
+  assert.equal(e1.revoke[0].kind, "member");
+  await assert.rejects(new Follower(r.org.did, 0, r.freshness).applyEntry(r.org, await signAsRevoker(e1)), /manage policy/);
+  const tokenOnly = await signAsRevoker({ ...e1, revoke: [{ kind: "token", jti: "t" }] });
+  await new Follower(r.org.did, 0, r.freshness).applyEntry(r.org, tokenOnly);
+});
+
 test("a heartbeat claiming a beacon it doesn't have is rejected", async () => {
   const f = new Follower(r.org.did, 0, r.freshness);
   const hb = { ...r.heartbeat, beacon: { ...r.heartbeat.beacon, round: r.heartbeat.beacon.round + 1 } };

@@ -65,7 +65,17 @@ Issued At: …
 Expiration Time: …
 ```
 
-Challenges are single-use and expire after 5 minutes. The `factors` array accepts:
+Challenges are single-use and expire after 5 minutes.
+
+A device key signs grants (§3.2) as well as challenges, and a grant's signing input is
+just bytes. So a client MUST check that the message has exactly this shape before it
+signs: these eight lines, its own DID, `Version: 1`, a nonce, and times that are
+current and at most 10 minutes apart. Otherwise a hub could send the signing input of a
+grant for a session key it holds and get a device-signed grant back. A JWS signing
+input never contains a space or a newline, so it never passes. The reference CLI does
+this check (`session::check_login_challenge`).
+
+The `factors` array accepts:
 
 | type | Fields | Checks |
 |------|--------|--------|

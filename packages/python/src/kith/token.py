@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 import jwt
@@ -33,6 +33,17 @@ class AccessClaims:
     act: dict | None = None
     cap: list[dict] | None = None
     cnf: dict | None = None
+    # The org whose policy produced groups and roles, and the policy root and newest
+    # revocation entry they came from. Absent for memberships from a bundle file (spec 10.8).
+    org: str | None = None
+    pol: dict | None = None
+
+    def for_org(self, org: str) -> "AccessClaims":
+        """The claims as a resource server configured with ``org`` may rely on them (spec 10.8):
+        groups and roles survive only if the token says ``org`` produced them."""
+        if self.org == org:
+            return self
+        return replace(self, groups=[], roles=[])
 
     def principal(self) -> Principal:
         return Principal(
@@ -87,7 +98,9 @@ class Verifier:
         jwks: dict | None = None,
         leeway: int = 60,
         now: Callable[[], float] = time.time,
+        org: str | None = None,
     ):
+        self.org = org
         self.issuer = issuer
         self.audience = audience
         self.leeway = leeway
@@ -127,7 +140,8 @@ class Verifier:
         except jwt.PyJWTError as e:
             raise KithAuthError(f"invalid token: {e}") from e
         known = self._claims.__dataclass_fields__.keys()
-        return self._claims(**{k: v for k, v in c.items() if k in known})
+        claims = self._claims(**{k: v for k, v in c.items() if k in known})
+        return claims.for_org(self.org) if self.org is not None and isinstance(claims, AccessClaims) else claims
 
     def _check(self, c: dict) -> None:
         now = self._now()
@@ -150,6 +164,15 @@ class Verifier:
     def _check_extra(self, c: dict, now: float) -> None:
         if type(c["aal"]) is not int or not 1 <= c["aal"] <= 3:
             raise KithAuthError('invalid token: "aal" must be 1, 2 or 3')
+        if "org" in c and (not isinstance(c["org"], str) or not c["org"]):
+            raise KithAuthError('invalid token: "org" must be a non-empty string')
+        if "pol" in c:
+            pol = c["pol"]
+            if "org" not in c:
+                raise KithAuthError('invalid token: "pol" needs an "org"')
+            ok = isinstance(pol, dict) and isinstance(pol.get("root"), str) and pol["root"] and type(pol.get("rev")) is int and pol["rev"] >= 0
+            if not ok:
+                raise KithAuthError('invalid token: "pol" must be {root, rev}')
 
 
 class AttestationVerifier(Verifier):

@@ -18,6 +18,16 @@ pub struct Actor {
     pub act: Option<Box<Actor>>,
 }
 
+/// Which policy produced a token's `groups` and `roles` (spec §10.8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyRef {
+    /// The DAG root the memberships were computed from, as committed by the org's
+    /// `policy_root` event.
+    pub root: String,
+    /// The newest revocation entry applied.
+    pub rev: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccessClaims {
     pub iss: String,
@@ -31,6 +41,12 @@ pub struct AccessClaims {
     pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// The org whose policy produced `groups` and `roles`. Absent when the hub took
+    /// them from a bundle file: such memberships have no provenance (spec §10.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pol: Option<PolicyRef>,
     #[serde(default)]
     pub groups: Vec<String>,
     #[serde(default)]
@@ -52,6 +68,19 @@ pub struct AccessClaims {
     /// Proof-of-possession binding (RFC 7800 / DPoP `jkt`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cnf: Option<Value>,
+}
+
+impl AccessClaims {
+    /// The claims as a resource server configured with `org` may rely on them (spec
+    /// §10.8): `groups` and `roles` survive only if the token says `org` produced them.
+    /// Otherwise they are dropped and the token still authenticates `sub`.
+    pub fn for_org(mut self, org: &str) -> Self {
+        if self.org.as_deref() != Some(org) {
+            self.groups.clear();
+            self.roles.clear();
+        }
+        self
+    }
 }
 
 /// JOSE `typ` of an account attestation. Nothing else the hub signs has this type, so
@@ -135,6 +164,9 @@ pub fn verify_access_token(token: &str, jwks: &Value, issuer: &str, audience: &s
     if !(1..=3).contains(&c.aal) {
         return Err(Error::Token("aal must be 1, 2 or 3".into()));
     }
+    if c.org.as_deref() == Some("") || (c.pol.is_some() && c.org.is_none()) || c.pol.as_ref().is_some_and(|p| p.root.is_empty()) {
+        return Err(Error::Token("org must not be empty, and pol needs an org and a root".into()));
+    }
     check_times(c.iat, c.exp, nbf, now)?;
     Ok(c)
 }
@@ -212,6 +244,8 @@ mod tests {
             jti: "t1".into(),
             client_id: None,
             scope: None,
+            org: None,
+            pol: None,
             groups: vec![],
             roles: vec![],
             attrs: Map::new(),
@@ -246,6 +280,31 @@ mod tests {
         assert!(matches!(check(&h, &claims(NOW - 100, NOW - 60)), Err(Error::Expired)), "the leeway is used up");
         assert!(matches!(wrong(&|c| c.iat = NOW + 61), Err(Error::Expired)), "issued in the future");
         assert!(check(&h, &claims(NOW + 60, NOW + 900)).is_ok(), "issued in the future within the leeway");
+    }
+
+    #[test]
+    fn provenance_claims_are_checked_and_scope_memberships_to_one_org() {
+        let h = HubSigner::generate();
+        let mut c = claims(NOW - 10, NOW + 890);
+        c.groups = vec!["finance".into()];
+        c.roles = vec!["billing-reader".into()];
+        c.org = Some("did:kith:acme".into());
+        c.pol = Some(PolicyRef { root: "bagu123456789".into(), rev: 4 });
+        let got = check(&h, &c).unwrap();
+        assert_eq!(got, c, "the claims survive the round trip");
+        assert_eq!(got.clone().for_org("did:kith:acme").roles, ["billing-reader"]);
+        let other = got.clone().for_org("did:kith:globex");
+        assert!(other.groups.is_empty() && other.roles.is_empty(), "another org's token carries no memberships here");
+        assert_eq!(other.sub, "did:kith:ada", "but it still says who signed in");
+        let mut bundle_file = c.clone();
+        bundle_file.org = None;
+        bundle_file.pol = None;
+        assert!(check(&h, &bundle_file).unwrap().for_org("did:kith:acme").roles.is_empty(), "no provenance, no memberships");
+        let mut bad = c.clone();
+        bad.org = None;
+        assert!(check(&h, &bad).is_err(), "pol without org");
+        bad.org = Some(String::new());
+        assert!(check(&h, &bad).is_err(), "empty org");
     }
 
     #[test]
@@ -298,6 +357,15 @@ mod tests {
                     assert_eq!(i64::from(claims.aal), want["aal"].as_i64().unwrap(), "{name}");
                     assert_eq!(claims.jti, want["jti"].as_str().unwrap(), "{name}");
                     assert_eq!(json!(claims.groups), want["groups"], "{name}");
+                    let got = serde_json::to_value(&claims).unwrap();
+                    for k in ["org", "pol", "roles"] {
+                        if want.get(k).is_some() {
+                            assert_eq!(got[k], want[k], "{name}: {k}");
+                        }
+                    }
+                    if let Some(org) = c["resource_org"].as_str() {
+                        assert_eq!(json!(claims.for_org(org).groups), c["groups_kept"], "{name}: groups_kept");
+                    }
                 }
                 (false, Err(_)) => {}
                 (true, Err(e)) => panic!("{name}: refused: {e}"),

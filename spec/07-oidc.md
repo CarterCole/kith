@@ -284,6 +284,11 @@ CLI      polls; appends the proof-of-possession signature; publishes the KEL
   `xxxx-xxxx-xxxx`. The CLI prints the same code for the key the hub reports and asks
   `[y/N]` before it signs; `--yes` skips the question. The person looking at both
   screens is the check.
+- To create the passkey on another device, such as a phone, `kith passkey enroll --qr`
+  shows the enrollment URL as a QR code in the terminal instead of opening a browser.
+  The phone must reach the hub over HTTPS at a host under its RP id. The code is the
+  URL and nothing more: it is the same bearer capability, and the fingerprint check
+  above still decides.
 - The passkey is stored as a `passkey` device with `rp_id` equal to the hub's RP id and
   AAL2.
 - Only the passkey is ever in the browser, and only the CLI ever holds the manage key.
@@ -659,4 +664,7 @@ curl -s -X DELETE -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
 - Pushed authorization requests (PAR), DPoP-bound tokens.
 - `claims` request parameter; request objects (JAR).
 - TOTP enrollment from the browser (CLI only today).
+- Linking started from the new device: a phone shows a QR code and a device that can
+  reach the manage key approves it. Today the CLI holding the manage key starts every
+  enrollment (§7.7).
 - Editing clients, and an audit log, through the admin API.

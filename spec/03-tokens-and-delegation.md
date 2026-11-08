@@ -25,8 +25,10 @@ payload { "iss": "<did>", "dev": "<device id>", "cnf": { "jwk": <session public 
 ```
 
 The grant is signed by the device key named in `dev`. Its lifetime is typically 12
-hours. That limits how long a stolen session key is useful, while device revocation
-stays immediate.
+hours, and a verifier MUST refuse a grant whose `exp - iat` is over 24 hours. That
+limits how long a stolen session key is useful, while device revocation stays
+immediate. It also bounds the damage if a device is ever tricked into signing a grant
+it didn't mean to (§2.3).
 
 ## 3.3 Session and delegation tokens (session key → anyone)
 
@@ -89,6 +91,13 @@ has these claims:
 - `act.sub` is the actor. Nested `act` claims record earlier actors, per RFC 8693.
 - `cap` is the delegated capabilities.
 - `aal` is the actor's.
+- `dev` is the delegator's device that signed the delegation's grant. The org's
+  `device` revocations (§8.7) therefore stop that device's delegations, at the hub and
+  at followers, as they stop its sign-ins.
+
+With a policy org configured, the hub also refuses the exchange when the org has
+revoked the actor (`principal`) or the actor's device (`device`). A revoked identity
+acts for no one.
 
 ## 3.5 Access token (RFC 9068 profile)
 
@@ -99,6 +108,7 @@ has these claims:
 {
   "iss": "https://hub.example", "aud": "api://invoices", "sub": "did:kith:…",
   "iat": …, "exp": … (15 min), "jti": …,
+  "org": "did:kith:acme…"?, "pol": { "root": "bagu…", "rev": 10 }?,
   "groups": ["finance", "staff", "strong-auth"],
   "roles": ["billing-admin", "billing-reader"],
   "attrs": { "email": "ada@acme.test", "department": "finance", "aal": 2, "aliases": [] },
@@ -117,6 +127,8 @@ A resource server MUST check all of these, and refuse the token if any fails:
   between them.
 - `exp`, `iat`, `sub`, `jti` and `aal` are present. `sub` and `jti` are non-empty
   strings and `aal` is the integer 1, 2 or 3.
+- `org`, if present, is a non-empty string. `pol`, if present, is `{root, rev}` with a
+  non-empty string `root` and an integer `rev` of 0 or more, and needs an `org`.
 - The times fit the clock, with 60 s of leeway each way. `iat` is not in the future.
   A token is expired once `exp` plus the leeway is reached (RFC 7519 §4.1.4, "now must
   be before `exp`"). `nbf`, if present, is not in the future.
@@ -127,7 +139,8 @@ implementation runs it.
 It then builds the principal from these fields:
 - `id` = `sub`;
 - `attrs` = `attrs` plus `aal` and `amr`;
-- `groups`, `roles`;
+- `groups`, `roles`. A resource server configured with an org takes these only from a
+  token whose `org` is that org (§10.8), and otherwise uses none;
 - `actor` = `act.sub`;
 - `caps` = `cap`.
 
@@ -135,5 +148,3 @@ It then builds the principal from these fields:
 - DPoP (RFC 9449) binding, with `cnf.jkt` set to the session key thumbprint.
 - Per-audience claim release, so a token only carries the attributes and groups that
   audience's policies reference.
-- `org` and `pol` claims naming the org and policy root that `groups` and `roles` came
-  from (§10.8, draft).

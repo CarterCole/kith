@@ -625,23 +625,25 @@ impl Hub {
         let mut kel_attrs = Map::new();
         kel_attrs.insert("aliases".into(), json!(a.st.aliases));
         kel_attrs.insert("aal".into(), json!(a.aal));
+        // Memberships from an org carry its name and the root they came from (spec §10.8).
+        // Memberships from the bundle file carry nothing: they have no provenance.
         let resolve = |kel_attrs: &Map<String, Value>| -> ApiResult<_> {
             Ok(match self.org_memberships(&a.st.did, a.dev.as_deref(), kel_attrs)? {
-                Some(found) => found,
+                Some(found) => (found.memberships, found.attrs, Some((found.org, found.pol))),
                 None => {
                     let engine = self.engine()?;
                     let attrs = engine.attributes(&a.st.did, kel_attrs);
-                    (engine.memberships(&a.st.did, &attrs)?, attrs)
+                    (engine.memberships(&a.st.did, &attrs)?, attrs, None)
                 }
             })
         };
-        let (mut m, mut attrs) = resolve(&kel_attrs)?;
+        let (mut m, mut attrs, mut provenance) = resolve(&kel_attrs)?;
         // Upstream attributes only fill gaps: they never replace what the directory
         // or the KEL says. Group rules see them, so memberships are worked out again.
         let extra: Vec<_> = a.attrs.iter().filter(|(k, _)| !attrs.contains_key(*k)).collect();
         if !extra.is_empty() {
             kel_attrs.extend(extra.into_iter().map(|(k, v)| (k.clone(), v.clone())));
-            (m, attrs) = resolve(&kel_attrs)?;
+            (m, attrs, provenance) = resolve(&kel_attrs)?;
         }
         let iat = now();
         let (act, cap) = match delegation {
@@ -657,6 +659,8 @@ impl Hub {
             jti: random_id(),
             client_id: None,
             scope: None,
+            org: provenance.as_ref().map(|(org, _)| org.clone()),
+            pol: provenance.map(|(_, pol)| pol),
             groups: m.groups,
             roles: m.roles,
             attrs,
@@ -759,7 +763,7 @@ async fn challenge(State(h): State<Arc<Hub>>, Json(req): Json<ChallengeReq>) -> 
     let (rp, iss, did) = (h.cfg.rp_id.clone(), h.cfg.issuer.clone(), req.did.clone());
     // CAIP-122 / SIWE-shaped so wallets render it sensibly.
     let (id, message, exp) = h.new_challenge(Some(req.did.clone()), |id, iat, exp| {
-        format!("{rp} wants you to sign in with your Kith identity:\n{did}\n\nURI: {iss}\nVersion: 1\nNonce: {id}\nIssued At: {iat}\nExpiration Time: {exp}")
+        session::login_challenge(&rp, &did, &iss, id, iat, exp)
     });
     Ok(Json(json!({"challenge_id": id, "message": message, "expires_at": exp})))
 }
@@ -850,13 +854,17 @@ fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
             let actor_token = req.actor_token.as_deref().ok_or_else(|| ApiError::bad("invalid_request", "delegation requires actor_token"))?;
             let actor = session::verify_session_token(actor_token, &h.cfg.issuer, h, t).map_err(ApiError::unauthorized)?;
             h.check_jti(actor.claims["jti"].as_str().unwrap_or_default(), actor.claims["exp"].as_i64().unwrap_or(t))?;
-            let (_, d) = session::verify_delegation(subject, &h.cfg.issuer, h, t).map_err(ApiError::unauthorized)?;
+            let (chain, d) = session::verify_delegation(subject, &h.cfg.issuer, h, t).map_err(ApiError::unauthorized)?;
             if d.sub != actor.did {
                 return Err(ApiError::unauthorized("delegation was issued to someone else"));
             }
+            // The org's revocations bind the actor as well as the principal (spec §8.7).
+            h.check_org_revocations(&actor.did, Some(&actor.device.id))?;
             let st = h.resolve(&d.iss)?;
-            // The delegate's assurance, not the delegator's, describes this session.
-            let a = Authn { st, dev: None, aal: actor.aal, amr: vec!["delegated".into()], auth_time: t, alias: None, attrs: Map::new() };
+            // The delegate's assurance, not the delegator's, describes this session. `dev`
+            // is the delegator's device that signed the grant, so a `device` revocation
+            // stops its delegations here and at followers, as it stops its sign-ins.
+            let a = Authn { st, dev: Some(chain.device.id.clone()), aal: actor.aal, amr: vec!["delegated".into()], auth_time: t, alias: None, attrs: Map::new() };
             h.issue(&a, &audience, Some((actor.did.clone(), d.cap.clone())))
         }
         other => Err(ApiError::bad("invalid_request", format!("unsupported subject_token_type {other}"))),

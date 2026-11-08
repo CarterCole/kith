@@ -93,6 +93,7 @@ kith delegate --to ada --action 'Query.*'    # a name works wherever a DID does
 kith resolve https://acme.test               # just look: both directions checked, and exactly one root must pass
 kith name check                              # re-resolve pinned names; report any that moved or became ambiguous
 kith passkey enroll                          # create a passkey in your browser; compare its fingerprint, answer y
+kith passkey enroll --name iphone --qr       # or on your phone: scan the QR code the terminal shows
 kith totp reset [--code 123456]              # forget the authenticator (a current code, or a passkey sign-in)
 kith contact add ada@example.com             # the hub sends a code; private unless you publish it
 kith contact confirm ada@example.com 123456  # apps with scope email (or phone) get it, with a signed attestation
@@ -151,6 +152,7 @@ let ok = engine.authorize(&principal, "Query.invoices", &Resource::new("Operatio
 kith policy publish bundle.json              # as the org: DAG blocks up, root into the org's KEL
 kith policy add-revoker                      # let the hub sign heartbeats (a revoke-only device)
 kith policy slice --org did:kith:… --action Query.invoices   # just that field, checked against the KEL
+kith policy why --org did:kith:… --principal did:kith:ada…   # who signed for her roles, and why she has each
 kith revoke member did:kith:ada… Group::finance              # pushed, signed, hash-chained
 kith revocations --org did:kith:… --max-staleness 86400      # "I sync once a day"
 kith anchor stamp --out root.ots             # OpenTimestamps: existed by Bitcoin block N

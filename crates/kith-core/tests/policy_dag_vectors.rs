@@ -26,7 +26,7 @@ fn bundle() -> Bundle {
     let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
     let mut b: Bundle = serde_json::from_value(v["bundle"].clone()).unwrap();
     b.policies.push_str(
-        "\n@id(\"pay-needs-fresh\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) unless { context has kith && context.kith.sync_age < 60 };",
+        "\n@id(\"pay-needs-fresh\")\nforbid(principal, action == Action::\"Mutation.payInvoice\", resource) unless { context has kith && context.kith.sync_age < 60 };\n@id(\"reports\")\npermit(principal, action == Action::\"Query.reports\", resource);\n@id(\"no-finance-reports\")\nforbid(principal in Group::\"finance\", action == Action::\"Query.reports\", resource);",
     );
     b
 }
@@ -83,6 +83,7 @@ fn generate() -> Value {
             Revocation::Policy { id: "own-invoice".into() },
             Revocation::Policy { id: "no-delegated-pay".into() },
             Revocation::Device { did: "did:kith:bob".into(), device: "dev_stolen".into() },
+            Revocation::Principal { id: "did:kith:mallory".into() },
         ],
     );
 
@@ -96,7 +97,7 @@ fn generate() -> Value {
     hb.sign(&revoker).unwrap();
 
     let policy = FreshnessPolicy { fresh_for: 60, max_staleness: 600, require_beacon: true };
-    let slice = pdag::load(&store, &root, &Query::Actions { actions: vec!["Query.invoices".into(), "Mutation.payInvoice".into(), "Invoice.read".into()], principals: vec!["did:kith:ada".into(), "did:kith:bob".into()] }).unwrap();
+    let slice = pdag::load(&store, &root, &Query::Actions { actions: vec!["Query.invoices".into(), "Mutation.payInvoice".into(), "Invoice.read".into(), "Query.reports".into()], principals: vec!["did:kith:ada".into(), "did:kith:bob".into()] }).unwrap();
     let mut f = Follower::new(&org.did, 0, policy);
     for e in [&e1, &e2, &e3] {
         f.apply_entry(&org, e).unwrap();
@@ -138,6 +139,10 @@ fn generate() -> Value {
             caps: Some(json!([{"action": "Mutation.*"}])),
             ..c("a forbid survives its revocation", "did:kith:bob", 2, "Mutation.payInvoice", t + 10, false)
         },
+        // Ada's membership of finance was revoked, but the forbid on finance still holds:
+        // revocations only remove access (§8.7).
+        c("a member revocation does not lift a forbid on the set", "did:kith:ada", 2, "Query.reports", t + 10, false),
+        Case { actor: Some("did:kith:mallory"), caps: Some(json!([{"action": "*"}])), ..c("a revoked actor acts for no one", "did:kith:bob", 1, "Query.invoices", t + 10, false) },
         Case { context: json!({"amount": 5}), ..c("degraded: payments need a view under 60 s", "did:kith:bob", 2, "Mutation.payInvoice", t + 300, false) },
         c("degraded: reads still work", "did:kith:bob", 1, "Query.invoices", t + 300, true),
         c("stale: everything is denied", "did:kith:bob", 1, "Query.invoices", t + 700, false),
@@ -199,7 +204,7 @@ fn generate() -> Value {
             "heartbeat": hb,
             "heartbeat_received_at": t + 5,
             "freshness": policy,
-            "slice": {"actions": ["Query.invoices", "Mutation.payInvoice", "Invoice.read"], "principals": ["did:kith:ada", "did:kith:bob"]},
+            "slice": {"actions": ["Query.invoices", "Mutation.payInvoice", "Invoice.read", "Query.reports"], "principals": ["did:kith:ada", "did:kith:bob"]},
             "decisions": decisions,
         }
     })

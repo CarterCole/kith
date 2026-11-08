@@ -44,8 +44,30 @@ const expect = { sub: claims.sub, aal: 2, jti: "jti-1", groups: ["finance"] };
 const good = mint();
 const [h0, p0, s0] = good.split(".");
 
+// Provenance (spec section 10.8): `org` names the org whose policy produced `groups` and
+// `roles`, `pol` the root and revocation entry they came from. A resource server configured
+// with `resource_org` keeps `groups_kept` of the token's groups.
+const ORG = "did:kith:acme";
+const POL = { root: "bagu7hcv3wa5jsdzxyvnbt6hqz3km2lqmoawyotv6rzpuqbxupxhna", rev: 4 };
+const provenance = { org: ORG, pol: POL };
+const expectProv = { ...expect, roles: ["billing-reader"], ...provenance };
+const withProv = (c) => mint({ ...claims, ...c });
+
 const cases = [
   { name: "a good token", token: good, valid: true, claims: expect },
+  { name: "org and pol, read by a resource server for that org", token: withProv(provenance), valid: true, claims: expectProv, resource_org: ORG, groups_kept: ["finance"] },
+  { name: "org and pol, read by a resource server for another org", token: withProv(provenance), valid: true, claims: expectProv, resource_org: "did:kith:globex", groups_kept: [] },
+  { name: "no org (a bundle file), read by a resource server for an org", token: good, valid: true, claims: expect, resource_org: ORG, groups_kept: [] },
+  { name: "an org without pol is still an org", token: withProv({ org: ORG }), valid: true, claims: { ...expect, org: ORG }, resource_org: ORG, groups_kept: ["finance"] },
+  { name: "pol without org", token: withProv({ pol: POL }), valid: false },
+  { name: "empty org", token: withProv({ org: "" }), valid: false },
+  { name: "org is not a string", token: withProv({ org: 7 }), valid: false },
+  { name: "pol has no root", token: withProv({ org: ORG, pol: { rev: 4 } }), valid: false },
+  { name: "pol has an empty root", token: withProv({ org: ORG, pol: { root: "", rev: 4 } }), valid: false },
+  { name: "pol has no rev", token: withProv({ org: ORG, pol: { root: POL.root } }), valid: false },
+  { name: "pol.rev is negative", token: withProv({ org: ORG, pol: { ...POL, rev: -1 } }), valid: false },
+  { name: "pol.rev is 1.5", token: withProv({ org: ORG, pol: { ...POL, rev: 1.5 } }), valid: false },
+  { name: "pol is not an object", token: withProv({ org: ORG, pol: "bagu" }), valid: false },
   { name: "typ application/at+jwt is the same type (RFC 7515 4.1.9)", token: mint(claims, withHeader({ typ: "application/at+jwt" })), valid: true, claims: expect },
   { name: "typ AT+JWT, media types are case-insensitive", token: mint(claims, withHeader({ typ: "AT+JWT" })), valid: true, claims: expect },
   { name: "expired 59 s ago, inside the leeway", token: mint({ ...claims, exp: NOW - 59 }), valid: true, claims: expect },

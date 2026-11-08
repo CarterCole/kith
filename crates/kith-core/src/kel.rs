@@ -215,6 +215,11 @@ pub struct PolicyHead {
     pub ts: i64,
     pub root: String,
     pub revocations_through: u64,
+    /// The signers whose signatures on that event verified, which is who the org's
+    /// manage policy relied on to commit this root (spec §10.8). Roles and groups in
+    /// the root are on the org's say-so because these keys signed for it.
+    #[serde(default)]
+    pub signers: BTreeSet<String>,
 }
 
 /// The current state of an identity, derived by replaying its KEL.
@@ -434,7 +439,7 @@ pub fn verify_log(events: &[Event], opts: &VerifyOptions) -> Result<KeyState> {
                 if st.policy.as_ref().is_some_and(|p| *revocations_through < p.revocations_through) {
                     return Err(Error::Kel("revocations_through went backwards".into()));
                 }
-                st.policy = Some(PolicyHead { seq: ev.seq, ts: ev.ts, root: root.clone(), revocations_through: *revocations_through });
+                st.policy = Some(PolicyHead { seq: ev.seq, ts: ev.ts, root: root.clone(), revocations_through: *revocations_through, signers: signed.clone() });
             }
         }
         st.seq = ev.seq;
@@ -634,6 +639,7 @@ pub(crate) mod tests {
         f.log.push(ev);
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         assert_eq!(st.policy.as_ref().unwrap().root, root);
+        assert_eq!(st.policy.as_ref().unwrap().signers, BTreeSet::from([f.root.id.clone()]), "the head names who signed it");
         let mut back = next_event(&st, EventBody::PolicyRoot { root, revocations_through: 2 });
         back.sign(&f.root).unwrap();
         f.log.push(back);

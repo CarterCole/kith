@@ -42,6 +42,7 @@ use kith_core::keys::{KeyType, LocalSigner};
 use kith_core::pdag::{self, Query, Slice};
 use kith_core::revoke::{Entry, Heartbeat, Revocation};
 use kith_core::session::KelResolver;
+use kith_core::token::PolicyRef;
 
 use crate::{read_json, write_json, ApiError, ApiResult, Hub};
 
@@ -208,23 +209,56 @@ impl Hub {
     /// Groups, roles and a revocation verdict for `did`, signing in from `device` (if
     /// any), from the configured policy org, if there is one. `Ok(None)`: no org
     /// configured, use the bundle file.
-    pub(crate) fn org_memberships(&self, did: &str, device: Option<&str>, attrs: &serde_json::Map<String, Value>) -> ApiResult<Option<(kith_core::authz::Memberships, serde_json::Map<String, Value>)>> {
+    pub(crate) fn org_memberships(&self, did: &str, device: Option<&str>, attrs: &serde_json::Map<String, Value>) -> ApiResult<Option<OrgMemberships>> {
         let Some(org) = &self.cfg.policy_org else { return Ok(None) };
-        let (slice, _, through) = self.slice(org, &Query::Principal { id: did.into() })?;
+        let (_, head) = self.policy_head(org)?;
+        let (slice, _) = pdag::prove(&self.orgs.blocks, &head.root, &Query::Principal { id: did.into() })?;
+        let through = head.revocations_through;
         let revoked = self.orgs.active_revocations(org, through);
-        if revoked.iter().any(|r| matches!(r, Revocation::Principal { id } if id == did)) {
-            return Err(ApiError::unauthorized("principal revoked by the organization"));
-        }
-        if device.is_some_and(|dev| revoked.iter().any(|r| matches!(r, Revocation::Device { did: d, device: x } if d == did && x == dev))) {
-            return Err(ApiError::unauthorized("device revoked by the organization"));
-        }
+        refuse_revoked(&revoked, did, device)?;
         let skip: BTreeSet<String> = revoked.iter().filter_map(|r| if let Revocation::Policy { id } = r { Some(id.clone()) } else { None }).collect();
         let excluded: BTreeSet<String> =
             revoked.iter().filter_map(|r| if let Revocation::Member { id, set } = r { (id == did).then(|| set.clone()) } else { None }).collect();
         let engine = slice.engine_without(&skip)?;
         let attrs = engine.attributes(did, attrs);
-        Ok(Some((engine.memberships_excluding(did, &attrs, &excluded)?, attrs)))
+        // The newest entry applied: the ones after `through` are in `revoked`, and the
+        // chain's head is the newest of them (or `through` itself when there are none).
+        let rev = self.orgs.latest(org).map_or(through, |e| e.seq.max(through));
+        Ok(Some(OrgMemberships {
+            memberships: engine.memberships_excluding(did, &attrs, &excluded)?,
+            attrs,
+            org: org.clone(),
+            pol: PolicyRef { root: head.root, rev },
+        }))
     }
+
+    /// Refuse `did`, signing in from `device` (if any), when the configured policy org
+    /// has revoked either (spec §8.7). A delegation's actor goes through this as well as
+    /// its principal: a revoked identity acts for no one. No org configured: nothing to check.
+    pub(crate) fn check_org_revocations(&self, did: &str, device: Option<&str>) -> ApiResult<()> {
+        let Some(org) = &self.cfg.policy_org else { return Ok(()) };
+        let (_, head) = self.policy_head(org)?;
+        refuse_revoked(&self.orgs.active_revocations(org, head.revocations_through), did, device)
+    }
+}
+
+fn refuse_revoked(revoked: &[Revocation], did: &str, device: Option<&str>) -> ApiResult<()> {
+    if revoked.iter().any(|r| matches!(r, Revocation::Principal { id } if id == did)) {
+        return Err(ApiError::unauthorized("principal revoked by the organization"));
+    }
+    if device.is_some_and(|dev| revoked.iter().any(|r| matches!(r, Revocation::Device { did: d, device: x } if d == did && x == dev))) {
+        return Err(ApiError::unauthorized("device revoked by the organization"));
+    }
+    Ok(())
+}
+
+/// Memberships taken from the policy org, and which org and root they came from
+/// (the token's `org` and `pol` claims, spec §10.8).
+pub(crate) struct OrgMemberships {
+    pub memberships: kith_core::authz::Memberships,
+    pub attrs: serde_json::Map<String, Value>,
+    pub org: String,
+    pub pol: PolicyRef,
 }
 
 /// Sign heartbeats for every served org, forever.

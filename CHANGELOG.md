@@ -4,9 +4,34 @@ Kith is a draft. The format will change until v1, so entries record what changed
 behaviour, not a promise about compatibility. Versions follow the workspace version in
 `Cargo.toml`.
 
-## Unreleased
+## 0.2.0 (2026-11-08)
+
+### Security (November 2026 review)
+
+Each fix has a test that failed before it. The findings still open are listed under
+"Known gaps" in [`docs/roadmap.md`](docs/roadmap.md).
+
+- **Challenge login.** The CLI signs only a well-formed sign-in challenge for its own DID
+  (spec §2.3). Before, a hub could send a grant's signing input as the "challenge" and
+  get a device-signed grant for a key it held. Grants now live at most 24 hours (§3.2).
+- **Delegated token exchange honours the org's revocations.** The delegator's revoked
+  device, and a revoked actor or actor device, are refused, and the token's `dev` names
+  the delegator's device (§3.4). Followers deny a revoked actor (`revoked:actor`).
+- **`member` revocations need the manage policy**, and a follower allows only what is
+  also allowed with every membership in place (§8.7, §8.9). Before, a revoke-only key
+  could drop someone from `Group::suspended` and turn off a forbid on it.
 
 ### Added
+
+- **Role provenance** (spec §10.8). In org mode a token's `org` and `pol` claims name the
+  policy its `groups` and `roles` came from, and a resource server configured with an
+  org ignores memberships from any other org or from a bundle file (Rust, JS, Python,
+  `tokens.json` vectors). `kith policy why` shows who signed the `policy_root` event
+  behind a membership, and why.
+- `kith passkey enroll --qr` carries the enrollment link to a phone as a QR code.
+- Delegated administration is specified as a draft (spec §10); grants and delegated
+  roots are not implemented yet.
+- Number text for Cedar strings: a formatter and conversion vectors (spec §4.2).
 
 - **Account attestations.** With the `linked_account` scope, an upstream login returns
   `account_attestation`, a hub-signed JWT naming the account that signed in (spec

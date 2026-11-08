@@ -28,6 +28,47 @@ pub const TYP_DELEGATION: &str = "kith-delegation+jwt";
 pub const LEEWAY: i64 = 60;
 /// Session proofs are single-use and short lived.
 pub const MAX_SESSION_TOKEN_TTL: i64 = 300;
+/// The longest a device grant may live (spec §3.2).
+pub const MAX_GRANT_TTL: i64 = 24 * 3600;
+
+/// The sign-in challenge a hub hands out (spec §2.3).
+pub fn login_challenge(rp: &str, did: &str, iss: &str, nonce: &str, iat: i64, exp: i64) -> String {
+    format!("{rp} wants you to sign in with your Kith identity:\n{did}\n\nURI: {iss}\nVersion: 1\nNonce: {nonce}\nIssued At: {iat}\nExpiration Time: {exp}")
+}
+
+/// The longest a sign-in challenge may claim to be good for.
+const MAX_CHALLENGE_TTL: i64 = 600;
+
+/// Refuse to sign a "challenge" unless it is a sign-in challenge for `did` that is
+/// current. A device key signs grants too, so a hub that sent a grant's signing input
+/// as the challenge would get back a grant for a session key of its choosing. The
+/// sign-in text has spaces and newlines, which a JWS signing input never does.
+pub fn check_login_challenge(message: &str, did: &str, now: i64) -> Result<()> {
+    let bad = |why: &str| Err(Error::Token(format!("not a sign-in challenge: {why}")));
+    let lines: Vec<&str> = message.split('\n').collect();
+    let [head, who, blank, uri, version, nonce, iat, exp] = lines[..] else { return bad("wrong number of lines") };
+    let field = |line: &str, name: &str| line.strip_prefix(name).and_then(|v| v.strip_prefix(": ")).map(str::to_string);
+    let rp = head.strip_suffix(" wants you to sign in with your Kith identity:");
+    if rp.is_none_or(|r| r.is_empty() || r.contains(char::is_whitespace)) || !blank.is_empty() {
+        return bad("unexpected text");
+    }
+    if who != did {
+        return bad("it names another identity");
+    }
+    if field(uri, "URI").is_none_or(|u| u.is_empty()) || version != "Version: 1" {
+        return bad("unexpected URI or version");
+    }
+    if field(nonce, "Nonce").is_none_or(|n| n.is_empty() || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+        return bad("bad nonce");
+    }
+    let (Some(iat), Some(exp)) = (field(iat, "Issued At").and_then(|v| v.parse::<i64>().ok()), field(exp, "Expiration Time").and_then(|v| v.parse::<i64>().ok())) else {
+        return bad("bad times");
+    };
+    if iat > now.saturating_add(LEEWAY) || exp < now.saturating_sub(LEEWAY) || exp < iat || exp.saturating_sub(iat) > MAX_CHALLENGE_TTL {
+        return bad("expired, not yet valid, or too long-lived");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cnf {
@@ -208,6 +249,11 @@ pub fn verify_chain(token: &str, typ: &str, resolver: &dyn KelResolver, now: i64
     // A passkey grant is bound to the relying party the device was enrolled with.
     let asserted = jws::verify_info(&grant, &PublicKey::from_did_key(&device.key)?, device.rp_id.as_deref())?;
     check_times(gc.iat, gc.exp, now)?;
+    // A grant certifies a session key. Bound its life, so a grant obtained by trickery,
+    // or a stolen session key, stops working within a day even before revocation.
+    if gc.exp.saturating_sub(gc.iat) > MAX_GRANT_TTL {
+        return Err(Error::Token("grant lifetime too long".into()));
+    }
 
     let session_key = PublicKey::from_jwk(&gc.cnf.jwk)?;
     jws::verify(&outer, &session_key)?;
@@ -269,6 +315,37 @@ mod tests {
         assert_eq!(v.aal, 2);
         assert!(verify_session_token(&tok, "https://other", &r, now()).is_err());
         assert!(verify_session_token(&tok, "https://hub.example", &r, now() + 7200).is_err());
+    }
+
+    #[test]
+    fn grants_have_a_maximum_lifetime() {
+        let f = fixture();
+        let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
+        let dev = st.device(&f.device_id).unwrap().clone();
+        let mut r = HashMap::new();
+        r.insert(st.did.clone(), st.clone());
+        let ok = SessionKey::create(&st.did, &dev, DeviceSigner::Key(&f.device.secret), MAX_GRANT_TTL).unwrap();
+        assert!(verify_session_token(&ok.session_token("aud", json!({})).unwrap(), "aud", &r, now()).is_ok());
+        let long = SessionKey::create(&st.did, &dev, DeviceSigner::Key(&f.device.secret), 10 * 365 * 86400).unwrap();
+        assert!(verify_session_token(&long.session_token("aud", json!({})).unwrap(), "aud", &r, now()).is_err(), "a ten-year grant");
+        let del = long.delegate("did:kith:someone", "aud", vec![Capability::new("*")], 600).unwrap();
+        assert!(verify_delegation(&del, "aud", &r, now()).is_err(), "delegations rest on the same grant");
+    }
+
+    #[test]
+    fn login_challenges_are_checked_before_signing() {
+        let (did, iss, t) = ("did:kith:abc", "http://127.0.0.1:7777", now());
+        let good = login_challenge("localhost", did, iss, "n0nce", t, t + 300);
+        assert!(check_login_challenge(&good, did, t).is_ok(), "{good}");
+        // What a hub would send to have a device sign a grant for a key it holds.
+        let grant_input = format!("{}.{}", crate::util::b64u(br#"{"typ":"kith-grant+jwt"}"#), crate::util::b64u(br#"{"iss":"did:kith:abc"}"#));
+        assert!(check_login_challenge(&grant_input, did, t).is_err(), "a JWS signing input");
+        assert!(check_login_challenge(&login_challenge("localhost", "did:kith:other", iss, "n", t, t + 300), did, t).is_err(), "someone else's DID");
+        assert!(check_login_challenge(&login_challenge("localhost", did, iss, "n", t - 900, t - 600), did, t).is_err(), "expired");
+        assert!(check_login_challenge(&login_challenge("localhost", did, iss, "n", t, t + 86400), did, t).is_err(), "lives too long");
+        assert!(check_login_challenge(&login_challenge("localhost", did, iss, "", t, t + 300), did, t).is_err(), "no nonce");
+        assert!(check_login_challenge(&format!("{good}\nextra"), did, t).is_err(), "trailing lines");
+        assert!(check_login_challenge(&good.replacen("Version: 1", "Version: 2", 1), did, t).is_err());
     }
 
     #[test]

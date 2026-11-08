@@ -160,11 +160,13 @@ the expected contents of several slices.
   ```
 
   - It MUST satisfy the manage policy, so the org's admin quorum signs every grant.
+    A verifier records which signers' signatures made it so (`PolicyHead.signers`), and
+    §10.8.1 shows how to read them.
   - `revocations_through` MUST NOT decrease. Entries up to it are already reflected
     in the new bundle, and verifiers drop them (compaction).
 - A device with the capability `revoke` may sign revocation entries and heartbeats,
-  and nothing else. A hub that signs heartbeats for an org holds one such key
-  (`kith policy add-revoker`).
+  and nothing else. It may not sign an entry with a `member` revocation (§8.7). A hub
+  that signs heartbeats for an org holds one such key (`kith policy add-revoker`).
   - If a revoke key is stolen, the attacker can revoke access or withhold
     heartbeats, which is denial of service. They can never grant access.
 
@@ -180,7 +182,11 @@ the expected contents of several slices.
   for entry 1.
 - Digest: `base64url(SHA-256(canonical JSON without sigs))`.
 - Signing message: `kith revocation v1\norg: <org>\nseq: <seq>\ndigest: <digest>`.
-- Signers: the manage policy, or one `revoke` device.
+- Signers: the manage policy, or one `revoke` device. An entry with any `member`
+  revocation MUST satisfy the manage policy. Dropping a membership turns off any
+  forbid or `unless` that names the set, so it is not purely a removal, and a
+  revoke-only key must not be able to do it. A verifier rejects such an entry signed
+  only by a revoke device.
 - Two different entries with the same `seq` are **duplicity**. A verifier that sees
   both MUST treat the org as `forked` and deny everything until an operator steps in.
 
@@ -189,7 +195,7 @@ Revocation kinds. Each one only ever removes access:
 | kind | effect |
 |------|--------|
 | `principal {id}` | deny everything for the principal |
-| `member {id, set}` | the principal is never a member of `set`; sets that depended on it are recomputed without it |
+| `member {id, set}` | the principal is never a member of `set`; sets that depended on it are recomputed without it. A request must still be allowed with every membership in place (§8.9), so this never lifts a forbid |
 | `device {did, device}` | treat the device as revoked before its own KEL catches up: the hub issues no token for a sign-in from it, and a follower denies a request whose token names it in `dev` |
 | `policy {id}` | drop that **permit**. A `policy` revocation naming a forbid is ignored |
 | `token {jti}` | deny that token or session |
@@ -275,13 +281,18 @@ condition that errors on a missing `kith` skips the forbid, which fails *open*.
 ## 8.9 Deciding with revocations (normative)
 
 1. If the level is `forked`, `behind` or `stale`, deny with reason `freshness:<level>`.
-2. If the principal is revoked, deny with `revoked:principal`. If the token's `jti` is
-   revoked, deny with `revoked:token`. If the token names a device (`dev`) that is
-   revoked for that principal, deny with `revoked:device`.
+2. If the principal is revoked, deny with `revoked:principal`. If the token has an
+   actor (`act.sub`) that is revoked as a principal, deny with `revoked:actor`. If
+   the token's `jti` is revoked, deny with `revoked:token`. If the token names a device
+   (`dev`) that is revoked for that principal, deny with `revoked:device`.
 3. Remove revoked permit policies from the slice.
 4. Recompute memberships from the slice with the revoked `(principal, set)` pairs
    excluded (§4.3, where an excluded set never joins).
 5. Evaluate with `context.kith` set.
+6. If step 4 excluded anything and the answer is allow, evaluate again with every
+   membership in place. Allow only if that is allowed too. Without this, excluding Ada
+   from `Group::suspended` would turn off `forbid(principal in Group::"suspended", …)`
+   for her.
 
 ## 8.10 Anchoring with OpenTimestamps
 
@@ -325,8 +336,9 @@ offers:
 - **Replay.** Old heartbeats are valid but old: their proven time doesn't move.
 - **Pre-signed heartbeats.** They are impossible, because they would need future
   beacon values.
-- **Compromised revoke key.** It can cause denial of service only. Remove the device
-  from the org KEL, which needs the manage policy.
+- **Compromised revoke key.** It can cause denial of service only, because it cannot
+  sign `member` revocations (§8.7). Remove the device from the org KEL, which needs
+  the manage policy.
 - **Privacy.** A DAG on public IPFS reveals group membership and directory
   attributes. Keep public DAGs to policies and rules. Put the `members` and
   `directory` maps behind the vault (§6), or serve them only to authenticated

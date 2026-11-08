@@ -54,6 +54,22 @@ pub enum PolicyCmd {
         #[arg(long, default_value_t = 1)]
         aal: u8,
     },
+    /// Why a principal holds its groups and roles, and who signed for them: the
+    /// `policy_root` event that committed the org's policy, with the keys that signed it,
+    /// and for each membership the reason (listed, through a nested set, or by rule).
+    Why {
+        #[arg(long)]
+        org: Option<String>,
+        /// Default: this identity.
+        #[arg(long)]
+        principal: Option<String>,
+        /// Only this set, e.g. `Role::billing-admin`.
+        #[arg(long)]
+        set: Option<String>,
+        /// Assurance level to evaluate dynamic groups at.
+        #[arg(long, default_value_t = 1)]
+        aal: u8,
+    },
     /// Let the hub sign this org's heartbeats: add its revoker key as a device
     /// that can only revoke.
     AddRevoker,
@@ -316,6 +332,54 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
                     "revoked": p.effect == "permit" && revoked.contains(&p.id),
                     "text": p.text,
                 })).collect::<Vec<_>>(),
+            }));
+        }
+        PolicyCmd::Why { org, principal, set, aal } => {
+            let org = org_or_self(home, org)?;
+            let id = principal.map(|p| super::names::principal(home, &p)).unwrap_or_else(|| home.did())?;
+            // The KEL is replayed and checked here, so the signers below are not the hub's word.
+            let st = fetch_state(&hub, &org)?;
+            let (root, _) = policy_root(&st)?;
+            let head = st.policy.clone().expect("policy_root found a head");
+            let q = Query::Principal { id: id.clone() };
+            let r = check(http().post(format!("{hub}/v1/policy/{org}/slice")).json(&q).send()?)?;
+            let slice = pdag::load(&MemStore::from_blocks(blocks_from_json(&r["blocks"])?), &root, &q)?;
+            let (f, _) = follow(&hub, &st, FreshnessPolicy { require_beacon: false, ..Default::default() })?;
+            let engine = slice.engine_without(&f.revoked_policies())?;
+            let mut attrs = serde_json::Map::new();
+            attrs.insert("aal".into(), json!(aal));
+            let attrs = engine.attributes(&id, &attrs);
+            let excluded = f.excluded_sets(&id);
+            let (_, why) = engine.explain_memberships(&id, &attrs, &excluded)?;
+            if let Some(set) = &set {
+                if !why.contains_key(set) {
+                    bail!("{id} is not in {set} under {org}'s root {root}");
+                }
+            }
+            let signers: Vec<_> = head
+                .signers
+                .iter()
+                .map(|s| {
+                    let device = st.devices.values().find(|d| &d.key == s);
+                    json!({
+                        "signer": s,
+                        "device": device.map(|d| &d.name),
+                        "in_manage_policy": st.manage.signers().contains(s),
+                        // False: a key that has since rotated out or been revoked.
+                        "current": device.is_some() || st.manage.signers().contains(s),
+                    })
+                })
+                .collect();
+            print(&json!({
+                "principal": id, "org": org, "root": root,
+                "committed_by": {
+                    "kel_seq": head.seq, "ts": head.ts,
+                    "manage_policy_now": st.manage,
+                    "signers": signers,
+                },
+                "sets": why.iter().filter(|(k, _)| set.as_ref().is_none_or(|s| s == *k)).map(|(k, b)| json!({"set": k, "why": b})).collect::<Vec<_>>(),
+                // Sets the org's revocations keep this principal out of, whatever the root says.
+                "revoked_sets": excluded,
             }));
         }
         PolicyCmd::AddRevoker => {

@@ -1,7 +1,9 @@
 # 10. Delegated administration
 
-> Status: draft for discussion. The reference code does not implement this chapter
-> yet, and there are no test vectors.
+> Status: draft for discussion. **§10.8 (provenance in access tokens) is implemented**
+> in Rust, JS and Python, with shared vectors in `test-vectors/tokens.json`, and so is
+> the signer record of §10.8.1. Grants, delegated roots and the rest of this chapter
+> are not implemented yet, and have no vectors.
 
 Two things are missing from §4 and §8:
 - **Provenance.** An access token's `roles` is the hub's word. Nothing in the token
@@ -257,9 +259,14 @@ The revocation chain (§8.7) gains one kind, and one existing kind gains an effe
 - The reference hub's revoker appends a `member {id, set}` revocation when a delegate
   asks for one, if that delegate's valid chain covers `set`. The request is signed like
   a statement, with the signing message
-  `kith revocation request v1\norg: <org>\ndigest: <digest>`. A revoke device can already
-  sign any revocation, so this gives the delegate no new power. The hub keeps the
+  `kith revocation request v1\norg: <org>\ndigest: <digest>`. The hub keeps the
   request for audit.
+  - §8.7 lets only the manage policy sign `member` revocations, because dropping a
+    membership can lift a forbid that names the set. Delegated sets are the exception
+    that makes this safe: §10.4 keeps them out of every forbid, condition and rule.
+    So this chapter relaxes §8.7 for them alone. A revoke device MAY sign a `member`
+    revocation whose `set` is a delegated set of the org's current root, and a
+    verifier checks that against the root before accepting the entry.
 
 ## 10.8 Provenance in access tokens
 
@@ -281,13 +288,36 @@ Two claims join the access token (§3.5):
   memberships from a slice (§8.9, §10.5) and trusts the hub for nothing but
   availability.
 
+### 10.8.1 Who signed for a membership
+
+Without grants, only the org's own signers can put anyone in a set, so "who signed for
+this role" has a short answer: whoever signed the `policy_root` event (§8.6) that
+committed the root. A verifier replays the org's KEL (§1.6) and reads that event:
+
+- `PolicyHead.signers` in the replayed key state holds the signer ids whose signatures
+  on the event verified. The manage policy was satisfied by them at that time.
+- A signer may be a device key or a manage-policy key. A key that has since rotated
+  out or been revoked is still the one that signed. Marking it as no longer current is
+  up to the reader.
+- For each membership, the reason comes from the §4.3 evaluation: the principal is
+  `listed` in the set's `members`, is in a set the `members` name (`nested`, with
+  that set), or satisfies the set's `rule`.
+
+`kith policy why [--org …] [--principal …] [--set Role::x]` prints both: the event's
+sequence number, its time, its signers (with the device name where the key belongs to
+a current device), and a reason for each set. The KEL is checked locally, and the
+slice against the committed root, so the answer rests on nothing the hub says.
+
+Once grants exist, this record grows by a chain: the statements, the grants and the
+signers of each link (§10.12).
+
 ## 10.9 Hub and CLI (planned)
 
 | What | Does |
 |------|------|
 | `kith policy grant <did> --sets 'Role::blog-*' --may members [--require …] [--redelegate N] [--exp …]` | add a grant to the org's bundle and publish a new root (needs the manage policy) |
 | `kith policy publish --grant <cid> <bundle.json>` | as a delegate: build a sub-root, sign a statement, upload both |
-| `kith policy chain <did>` | print every grant chain that gives `did` a membership, and why each link is valid |
+| `kith policy chain <did>` | print every grant chain that gives `did` a membership, and why each link is valid. For org-root memberships, `kith policy why` (§10.8.1) already prints the signers |
 | `GET /v1/policy/{org}/delegated` | the current statement for each grant |
 | `PUT /v1/policy/{org}/delegated` | upload a statement. The hub checks the chain and the sub-root before it stores either |
 | `POST /v1/revocations/{org}/requests` | a delegate's signed `member` revocation request (§10.7) |
@@ -330,13 +360,15 @@ identity in `hub-admin` could edit the bundle and give itself any role.
 
 ## 10.12 Not yet implemented, and open questions
 
-Not implemented: all of it. In particular:
+Implemented: the `org` and `pol` claims (§10.8) in the hub (org mode only), the
+verifiers and `forOrg` / `for_org` / `org` option of the three libraries, their vectors,
+and the signer record and `kith policy why` (§10.8.1). Not implemented: the rest. In particular:
 - the grant block, `delegations` in the org root and in sub-roots;
 - delegated root statements and their storage on the hub;
 - chain validity, sub-root validity and the builder rules, in Rust, JS and Python;
 - the membership extension and the slice step;
 - `delegate` revocations and the hub's revocation requests;
-- the `org` and `pol` claims;
+- `pol.rev` for delegated chains, and a statement list in the signer record;
 - `assign` as a device capability;
 - the CLI commands and hub routes of §10.9;
 - `test-vectors/delegation.json`. Planned cases:

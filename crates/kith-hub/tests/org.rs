@@ -17,6 +17,7 @@ use kith_core::keys::{KeyType, LocalSigner, VerifyOptions};
 use kith_core::pdag::{self, Query};
 use kith_core::policy::SignerPolicy;
 use kith_core::revoke::{self, Entry, FreshnessPolicy, Follower, Heartbeat, Level, Revocation};
+use kith_core::session::{Capability, DeviceSigner, SessionKey};
 use kith_core::util::now;
 use kith_hub::{Authn, Hub, HubConfig};
 
@@ -46,6 +47,35 @@ fn identity(extra: Vec<Device>, signers: &[&LocalSigner]) -> (LocalSigner, Vec<E
     (admin, vec![inc])
 }
 
+/// Someone with one device that may start sessions.
+fn person() -> (LocalSigner, Vec<Event>) {
+    let laptop = LocalSigner::generate(KeyType::Ed25519);
+    let dev = Device { id: "laptop".into(), key: laptop.id.clone(), name: "laptop".into(), kind: DeviceKind::Software, aal: 1, caps: vec!["session".into()], rp_id: None, xkey: None };
+    let (_, log) = identity(vec![dev], &[&laptop]);
+    (laptop, log)
+}
+
+/// `from` delegates everything to `to`, and `to` redeems it at the token endpoint.
+async fn exchange_delegation(app: &Router, issuer: &str, from: (&KeyState, &LocalSigner), to: (&KeyState, &LocalSigner)) -> (StatusCode, Value) {
+    let grant = |(st, key): (&KeyState, &LocalSigner)| SessionKey::create(&st.did, st.device("laptop").unwrap(), DeviceSigner::Key(&key.secret), 3600).unwrap();
+    let delegation = grant(from).delegate(&to.0.did, issuer, vec![Capability::new("*")], 600).unwrap();
+    let actor = grant(to).session_token(issuer, json!({})).unwrap();
+    let enc = |v: &str| v.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
+    let form = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
+        ("subject_token", delegation.as_str()),
+        ("subject_token_type", kith_hub::TT_DELEGATION),
+        ("actor_token", actor.as_str()),
+        ("audience", "api://invoices"),
+    ];
+    let body = form.iter().map(|(k, v)| format!("{k}={}", enc(v))).collect::<Vec<_>>().join("&");
+    let req = Request::post("/oauth/token").header("content-type", "application/x-www-form-urlencoded").body(Body::from(body)).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
 fn state(log: &[Event]) -> KeyState {
     verify_log(log, &VerifyOptions::default()).unwrap()
 }
@@ -70,6 +100,13 @@ async fn publish_slice_issue_revoke() {
     let app = kith_hub::router(hub.clone());
     assert_eq!(call(&app, "PUT", &format!("/v1/kel/{}", ada.did), Some(json!(ada_log))).await.0, StatusCode::OK);
     assert_eq!(call(&app, "PUT", &format!("/v1/kel/{org}"), Some(json!(org_log))).await.0, StatusCode::OK);
+    // Bob and Cy, whom Ada delegates to.
+    let (bob_key, bob_log) = person();
+    let (cy_key, cy_log) = person();
+    let (bob, cy) = (state(&bob_log), state(&cy_log));
+    for log in [&bob_log, &cy_log] {
+        assert_eq!(call(&app, "PUT", &format!("/v1/kel/{}", state(log).did), Some(json!(log))).await.0, StatusCode::OK);
+    }
 
     // The conformance bundle, with Ada's real DID.
     let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
@@ -107,6 +144,10 @@ async fn publish_slice_issue_revoke() {
     let claims = hub.access_claims(&authn, "api://invoices", None).unwrap();
     assert_eq!(claims.groups, vec!["finance", "staff"]);
     assert_eq!(claims.roles, vec!["billing-reader"]);
+    // They say which org's root they came from (spec §10.8), and the KEL says who signed it.
+    assert_eq!(claims.org.as_deref(), Some(org.as_str()));
+    assert_eq!(claims.pol, Some(kith_core::token::PolicyRef { root: root.clone(), rev: 0 }));
+    assert_eq!(state(&org_log).policy.unwrap().signers, std::collections::BTreeSet::from([admin.id.clone()]));
 
     // The org lets the hub sign heartbeats: an add_device for the hub's revoker key,
     // with the hub's proof of possession.
@@ -159,9 +200,25 @@ async fn publish_slice_issue_revoke() {
     let claims = hub.access_claims(&authn, "api://invoices", None).unwrap();
     assert_eq!(claims.groups, vec!["staff"]);
     assert!(claims.roles.is_empty());
+    assert_eq!(claims.pol.map(|p| p.rev), Some(1), "the token names the newest revocation applied");
+
+    // Ada's delegation to Bob works, and the token names the device that granted it.
+    let issuer = "http://localhost:7777";
+    let (s, tok) = exchange_delegation(&app, issuer, (&ada, &laptop), (&bob, &bob_key)).await;
+    assert_eq!(s, StatusCode::OK, "{tok}");
+    let delegated = kith_core::token::verify_access_token(tok["access_token"].as_str().unwrap(), &hub.jwks(), issuer, "api://invoices", now()).unwrap();
+    assert_eq!((delegated.sub.as_str(), delegated.dev.as_deref()), (ada.did.as_str(), Some("laptop")));
+    assert_eq!(delegated.act.map(|a| a.sub), Some(bob.did.clone()));
+
+    // An actor the org revoked can't act for anyone.
+    let mut e_bob = Entry::new(&org, Some(&e1), vec![Revocation::Principal { id: bob.did.clone() }]).unwrap();
+    e_bob.sign(&admin).unwrap();
+    assert_eq!(call(&app, "POST", &format!("/v1/revocations/{org}"), Some(json!(e_bob))).await.0, StatusCode::OK);
+    let (s, tok) = exchange_delegation(&app, issuer, (&ada, &laptop), (&bob, &bob_key)).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "a revoked actor redeemed a delegation: {tok}");
 
     // Revoking a device stops sign-ins from it ahead of her KEL, and only from it.
-    let mut e_dev = Entry::new(&org, Some(&e1), vec![Revocation::Device { did: ada.did.clone(), device: "laptop".into() }]).unwrap();
+    let mut e_dev = Entry::new(&org, Some(&e_bob), vec![Revocation::Device { did: ada.did.clone(), device: "laptop".into() }]).unwrap();
     e_dev.sign(&admin).unwrap();
     assert_eq!(call(&app, "POST", &format!("/v1/revocations/{org}"), Some(json!(e_dev))).await.0, StatusCode::OK);
     assert!(hub.access_claims(&authn, "api://invoices", None).is_err(), "her laptop was revoked by the org");
@@ -169,6 +226,9 @@ async fn publish_slice_issue_revoke() {
     assert!(hub.access_claims(&phone, "api://invoices", None).is_ok(), "another device is unaffected");
     let no_device = Authn { dev: None, ..authn.clone() };
     assert!(hub.access_claims(&no_device, "api://invoices", None).is_ok(), "a sign-in with no device is unaffected");
+    // A delegation the revoked device signs is refused too, though her KEL still lists it.
+    let (s, tok) = exchange_delegation(&app, issuer, (&ada, &laptop), (&cy, &cy_key)).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "a delegation from a revoked device was honoured: {tok}");
 
     // Revoking the principal stops token issuance altogether.
     let mut e2 = Entry::new(&org, Some(&e_dev), vec![Revocation::Principal { id: ada.did.clone() }]).unwrap();

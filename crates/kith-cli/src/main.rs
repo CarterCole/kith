@@ -305,6 +305,10 @@ enum PasskeyCmd {
         /// Don't try to open the browser; just print the link.
         #[arg(long)]
         no_open: bool,
+        /// Show the link as a QR code, to create the passkey on a phone: point its
+        /// camera at the terminal. Implies --no-open.
+        #[arg(long)]
+        qr: bool,
         /// Add the passkey without asking. Otherwise you compare the fingerprint the
         /// browser shows with the one printed here, and answer y.
         #[arg(long)]
@@ -833,6 +837,8 @@ fn login(home: &mut Home, aud: Option<String>, method: &str, totp_code: Option<S
         let did = home.did()?;
         let ch = check(http().post(format!("{hub}/v1/auth/challenge")).json(&json!({"did": did})).send()?)?;
         let msg = ch["message"].as_str().unwrap_or_default();
+        // The device key also signs grants: sign only what is plainly a sign-in challenge.
+        kith_core::session::check_login_challenge(msg, &did, now()).map_err(|e| anyhow!("refusing to sign what the hub sent: {e}"))?;
         let (dev_id, signer) = home.device()?;
         let dev = home.state()?.device(&dev_id).cloned().ok_or_else(|| anyhow!("device not active"))?;
         let mut factors = vec![];
@@ -1237,15 +1243,22 @@ fn main() -> Result<()> {
             };
             print(&out);
         }
-        Cmd::Passkey(PasskeyCmd::Enroll { name, no_open, yes }) => {
+        Cmd::Passkey(PasskeyCmd::Enroll { name, no_open, qr, yes }) => {
             let hub = home.hub()?;
             let auth = bearer(&mut home)?;
             let e = check(http().post(format!("{hub}/v1/enroll")).header("authorization", &auth).json(&json!({"name": name})).send()?)?;
             let id = e["id"].as_str().unwrap_or_default().to_string();
             let url = e["url"].as_str().unwrap_or_default().to_string();
             println!("{url}");
-            eprintln!("open {url} in a browser to create the passkey (link valid for 10 minutes)");
-            if !no_open {
+            if qr {
+                // A photo of the code is the link, so the fingerprint check below still
+                // decides; the code only saves typing the link into the phone.
+                eprintln!("\n{}", qr_text(&url)?);
+                eprintln!("scan this with your phone's camera to create the passkey there (link valid for 10 minutes)");
+            } else {
+                eprintln!("open {url} in a browser to create the passkey (link valid for 10 minutes)");
+            }
+            if !no_open && !qr {
                 let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
                 let _ = std::process::Command::new(opener).arg(&url).status();
             }
@@ -1351,6 +1364,38 @@ fn confirm(question: &str, yes: bool, input: &mut impl std::io::BufRead, out: &m
     Ok(line.trim_start().starts_with(['y', 'Y']))
 }
 
+/// `text` as a QR code drawn with half-block characters, two modules per character, with
+/// the four-module quiet zone. Light modules are drawn and dark ones left blank, so the
+/// code reads correctly as light text on a dark terminal; phone cameras also read it
+/// inverted, on a light one.
+fn qr_text(text: &str) -> Result<String> {
+    use qrcode::{Color, QrCode};
+    const QUIET: usize = 4;
+    let code = QrCode::new(text.as_bytes())?;
+    let n = code.width();
+    let colors = code.to_colors();
+    let size = n + 2 * QUIET;
+    let light = |x: usize, y: usize| {
+        let inside = |v: usize| (QUIET..QUIET + n).contains(&v);
+        !(inside(x) && inside(y) && colors[(y - QUIET) * n + (x - QUIET)] == Color::Dark)
+    };
+    let mut out = String::new();
+    for y in (0..size).step_by(2) {
+        for x in 0..size {
+            // An odd size leaves the last line's lower half outside the code: dark.
+            let lower = y + 1 < size && light(x, y + 1);
+            out.push(match (light(x, y), lower) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,6 +1411,40 @@ mod tests {
         for no in ["", "\n", "n\n", "no\n", "maybe\n", "x y\n"] {
             assert!(!ask(false, no), "{no:?} was taken as a yes");
         }
+    }
+
+    /// Read the terminal QR code back the way a camera would: two modules per character
+    /// (upper and lower half), a drawn half is light, blank is dark.
+    fn scan(text: &str) -> String {
+        let rows: Vec<Vec<char>> = text.lines().map(|l| l.chars().collect()).collect();
+        let w = rows[0].len();
+        assert!(rows.iter().all(|r| r.len() == w), "every line is the same width");
+        let lit = |c: char, upper: bool| match c {
+            '█' => true,
+            '▀' => upper,
+            '▄' => !upper,
+            ' ' => false,
+            other => panic!("unexpected character {other:?}"),
+        };
+        let mut modules = Vec::new();
+        for r in &rows {
+            for upper in [true, false] {
+                modules.push(r.iter().map(|&c| lit(c, upper)).collect::<Vec<_>>());
+            }
+        }
+        const PX: usize = 4;
+        let (iw, ih) = (w * PX, modules.len() * PX);
+        let mut img = rqrr::PreparedImage::prepare_from_greyscale(iw, ih, |x, y| if modules[y / PX][x / PX] { 255 } else { 0 });
+        let grids = img.detect_grids();
+        assert_eq!(grids.len(), 1, "one QR code in the output");
+        grids[0].decode().expect("decodes").1
+    }
+
+    #[test]
+    fn the_enrollment_link_scans_from_the_terminal() {
+        let url = "https://hub.example.com/enroll/3f9a1c0d5e7b2a4c6d8e0f1a2b3c4d5e";
+        let qr = qr_text(url).unwrap();
+        assert_eq!(scan(&qr), url);
     }
 
     #[test]

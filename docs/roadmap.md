@@ -33,6 +33,12 @@
   WebCrypto authenticator in tests.
 - **Vault.** Skip-ratchet group keyrings with join-later, skip-ahead, and re-key, sealed
   to devices' X25519 keys from the KEL.
+- **Role provenance.** In org mode a token's `org` and `pol` ({root, rev}) name the
+  policy its `groups` and `roles` came from, and a resource server configured with an
+  org ignores memberships from any other org or from a bundle file (all three
+  libraries, `tokens.json` vectors). `kith policy why` shows who signed the
+  `policy_root` event behind a membership and the reason for each one
+  ([spec §10.8](../spec/10-delegated-administration.md)).
 - **Keys at rest in the CLI** ([spec §1.3.3](../spec/01-identity.md)). On macOS every
   private key is a login-keychain item keyed by DID and key id, and this device's key
   is a P-256 key in the Secure Enclave that signs inside the chip, enrolled as a
@@ -63,7 +69,8 @@
   - Dynamic client registration behind a registration token.
   - Back- and front-channel logout notices.
   - ID tokens encrypted to the client (`RSA-OAEP-256`, `ECDH-ES`; checked against `jose`).
-  - Browser passkey enrollment brokered by the hub (`kith passkey enroll`).
+  - Browser passkey enrollment brokered by the hub (`kith passkey enroll`), on this
+    computer or, with `--qr`, on a phone that scans the link from the terminal.
   - Upstream OIDC providers as a login factor, starting with Telegram Login
     ([spec §7.8](../spec/07-oidc.md)). Tested against a stand-in provider, not yet
     against Telegram itself.
@@ -131,8 +138,38 @@
   - CI runs on every push and pull request ([`ci.yml`](../.github/workflows/ci.yml)),
     with actions pinned to commits; `LICENSE`, `SECURITY.md`, `NOTICE` and `CLAUDE.md`
     exist.
+- **Security review, November 2026** (each fix has a test that failed first).
+  - Challenge login: the CLI signs only a well-formed sign-in challenge for its own DID
+    ([§2.3](../spec/02-authentication.md)). Before, a hub could send a grant's signing
+    input as the "challenge" and get a device-signed grant for a key it held. Grants
+    now live at most 24 hours ([§3.2](../spec/03-tokens-and-delegation.md)).
+  - Delegated token exchange honours the org's revocations: the delegator's revoked
+    device, and a revoked actor or actor device, are refused. The token's `dev` names
+    the delegator's device ([§3.4](../spec/03-tokens-and-delegation.md)). Followers deny
+    a revoked actor (`revoked:actor`).
+  - A `member` revocation needs the manage policy, and a follower allows only what is
+    also allowed with every membership in place ([§8.7, §8.9](../spec/08-policy-dag.md)).
+    Before, a revoke-only key could drop someone from `Group::suspended` and turn off a
+    forbid on it. `policy-dag.json` has both cases.
 
 ## Known gaps in the reference code (not production ready)
+
+- **Found in the November 2026 review, not yet fixed.**
+  - `kith policy publish` takes `revocations_through` from the hub without checking the
+    entries. A hub that answers with a fake `seq` makes the org sign a value that hides
+    every later revocation, and the value can never go down.
+  - OIDC access tokens carry every `attrs` value, `groups` and `roles` whatever the
+    scope, so a client that asked only for `openid` can read the user's email.
+  - GraphQL row checks treat a non-array iterable (a Django `QuerySet`, a generator, a
+    `Set`) as one object, and Python ignores `@auth` on `extend type`.
+  - A private-use redirect URI with an authority (`app://bank.example/cb`) gets
+    bank.example's pairwise sector and consent host.
+  - KEL `sigs` are outside the event digest, so anyone can add or strip signatures on
+    a stored event through `PUT /v1/kel`. That changes `PolicyHead.signers` and
+    `kith policy why`, but no decision.
+  - Membership rules with negation are not monotone, and the result depends on
+    evaluation order ([§4.3](../spec/04-authorization.md) says rules should be monotone,
+    but nothing checks it).
 
 - **Keys at rest.** The macOS keychain and the Secure Enclave are done
   ([spec §1.3.3](../spec/01-identity.md)). Still to do:
@@ -153,6 +190,10 @@
   no RFC 7592. Login challenges and passkey enrollments in progress are still in
   memory (the page retries after a restart). The bundle is a hot-reloaded file, and
   there is no rate limit on anything but login, registration and TOTP.
+- **Device linking.** The CLI that holds the manage key starts every passkey
+  enrollment; `--qr` only carries its link to a phone. Linking started from the new
+  device (it shows a QR code, an existing device approves) needs a way for something
+  other than the CLI to reach the manage key ([spec §7.11](../spec/07-oidc.md)).
 - **Audiences.** The hub mints tokens for any `audience`. It needs a registry of
   resource servers and per-audience claim release (privacy, and smaller tokens).
 - **Signers still to do:**
@@ -205,9 +246,8 @@
     revocations (§8). The GraphQL middleware doesn't consult a revocation follower yet.
   - Cedar schemas and audience namespaces, for validation and policy analysis.
     Specified as a draft ([spec §9](../spec/09-schemas.md)), not implemented.
-  - Delegated administration and role provenance. Today any change to a group or
-    role needs the org's whole manage policy, and a token's `roles` doesn't say which
-    org defined them. Specified as a draft ([spec §10](../spec/10-delegated-administration.md)),
+  - Delegated administration. Today any change to a group or role needs the org's
+    whole manage policy. Specified as a draft ([spec §10](../spec/10-delegated-administration.md)),
     not implemented.
   - Partial-evaluation pushdown of row-level filters into SQL.
   - The vault uses an HPKE-shaped construction; move to RFC 9180 HPKE.
@@ -377,4 +417,4 @@ repeated here.
 | 5 | Cedar partial evaluation to SQL/Prisma filters; DataLoader-friendly row checks | "Lock down the query" at scale |
 | 6 | rs-wnfs integration, with `did:kith` as the WNFS agent | Encrypted shared data for groups |
 | 7 | Witnesses and optional chain anchoring. OpenTimestamps anchoring of policy roots and revocations is done (§8.10); KEL witnesses and heartbeat co-signing remain | Third-party duplicity detection and public timestamps |
-| 8 | Delegated administration ([spec §10](../spec/10-delegated-administration.md)): grants, delegated roots, the fail-closed builder rules, `org`/`pol` token claims, `test-vectors/delegation.json` in all three implementations; then the admin write API on top | "Who may assign a role", answered by a signed chain instead of by whoever can edit the hub |
+| 8 | Delegated administration ([spec §10](../spec/10-delegated-administration.md)): grants, delegated roots, the fail-closed builder rules, `test-vectors/delegation.json` in all three implementations; then the admin write API on top. The `org`/`pol` token claims and `kith policy why` are done (§10.8) | "Who may assign a role", answered by a signed chain instead of by whoever can edit the hub |
