@@ -666,6 +666,15 @@ async fn the_account_page_signs_in_with_the_passkey_and_shows_who_you_are() {
 }
 
 #[tokio::test]
+async fn login_sends_you_to_the_account_page() {
+    let w = open();
+    let (resp, headers) =
+        send_h(&w.app, Request::get("/login").body(Body::empty()).unwrap()).await;
+    assert!(resp.status.is_redirection(), "{}", resp.status);
+    assert_eq!(headers[header::LOCATION], "/whoami");
+}
+
+#[tokio::test]
 async fn the_account_page_turns_away_a_bad_assertion() {
     let w = open();
     let b = Browser::new();

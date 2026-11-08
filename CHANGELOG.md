@@ -21,6 +21,7 @@ behaviour, not a promise about compatibility. Versions follow the workspace vers
   Verifications go stale after 365 days (email) or 90 days (phone) until checked again,
   and whoever proves an address last holds it. Codes are sent through Amazon SES and AWS
   End User Messaging SMS (`--features aws`), or to an outbox file. New `phone` scope.
+- `GET /login` redirects to the account page, `/whoami`, instead of answering 404.
 
 An audit of all three implementations, and the fixes that came out of it. Each fix has a
 test that failed before it. The audit items that are still open are listed in

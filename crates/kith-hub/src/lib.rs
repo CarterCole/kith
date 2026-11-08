@@ -19,6 +19,7 @@
 //! | `GET  /oauth/userinfo`                    | OIDC userinfo                                   |
 //! | `GET  /oauth/logout`                      | RP-initiated logout                             |
 //! | `GET, POST /whoami`                       | the account page, and its passkey sign-in (see [`account`]) |
+//! | `GET  /login`                             | redirects to `/whoami`                          |
 //! | `GET/PUT /v1/kel/{did}`                   | fetch / append a key event log                  |
 //! | `GET  /v1/did/{did}`                      | DID document                                    |
 //! | `POST /v1/auth/challenge`, `/v1/auth/verify` | API challenge login (signature/passkey/TOTP) |
@@ -1326,6 +1327,10 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/enroll/{id}", get(enroll::page))
         .route("/", get(home))
         .route("/whoami", get(account::page).post(account::login))
+        .route(
+            "/login",
+            get(|| async { axum::response::Redirect::to("/whoami") }),
+        )
         .route("/signup", get(signup::page))
         .route("/v1/signup", post(signup::begin))
         .route("/v1/signup/check", post(signup::check))
