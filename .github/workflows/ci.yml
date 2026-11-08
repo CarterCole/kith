@@ -33,7 +33,7 @@ jobs:
             test_args: ""
           # A hosted macOS runner has no login keychain to write to and no Secure Enclave,
           # which the two keystore tests need. The rest of the CLI is covered.
-          - os: macos-14
+          - os: macos-15
             test_args: "-- --skip keystore::"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
