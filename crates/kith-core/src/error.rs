@@ -8,8 +8,6 @@ pub enum Error {
     Signature(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
-    #[error("invalid input: {0}")]
-    Invalid(String),
     #[error("invalid key event log: {0}")]
     Kel(String),
     #[error("invalid token: {0}")]

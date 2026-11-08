@@ -25,7 +25,6 @@ pub mod authz;
 pub mod beacon;
 pub mod canon;
 pub mod dag;
-pub mod domain;
 pub mod error;
 pub mod jws;
 pub mod kel;
