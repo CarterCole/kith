@@ -101,6 +101,9 @@ repeat at most |groups| + |roles| + 1 times:
 - A resource server that has the bundle and attributes MAY recompute it. The algorithm
   is deterministic, and `test-vectors/authz.json` pins the results.
 
+§10.5 (draft) extends this algorithm with members that delegates add under a grant
+the org signed.
+
 ## 4.4 Delegation
 
 Before evaluating Cedar, if the principal carries `caps`, the action and resource must

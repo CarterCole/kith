@@ -69,7 +69,8 @@ The root block:
 ```
 
 §9.6 (draft) adds two optional members, `attributes` and `schemas`, and an `audience`
-query (§8.5).
+query (§8.5). §10.1 (draft) adds `delegations`: grants that let another identity
+manage some sets.
 
 A **policy block** holds one Cedar policy:
 
@@ -192,6 +193,8 @@ Revocation kinds. Each one only ever removes access:
 | `device {did, device}` | treat the device as revoked before its own KEL catches up: the hub issues no token for a sign-in from it, and a follower denies a request whose token names it in `dev` |
 | `policy {id}` | drop that **permit**. A `policy` revocation naming a forbid is ignored |
 | `token {jti}` | deny that token or session |
+
+§10.7 (draft) adds `delegate {id}`, which voids every grant to `id`.
 
 - Memberships in a token (`groups`, `roles`) are a cache. A verifier applying
   `member` revocations MUST recompute memberships from a slice, not filter the token's
