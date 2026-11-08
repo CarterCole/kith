@@ -135,3 +135,5 @@ It then builds the principal from these fields:
 - DPoP (RFC 9449) binding, with `cnf.jkt` set to the session key thumbprint.
 - Per-audience claim release, so a token only carries the attributes and groups that
   audience's policies reference.
+- `org` and `pol` claims naming the org and policy root that `groups` and `roles` came
+  from (§10.8, draft).

@@ -51,6 +51,7 @@ the only way to read the spec.
 | 7 | [OpenID Connect](07-oidc.md) | "Sign in with Kith": code + PKCE, passkey login page, SSO, step-up, pairwise subjects, browser passkey enrollment, upstream providers (Telegram) |
 | 8 | [Policy DAG, revocations, freshness](08-policy-dag.md) | bundles as content-addressed blocks, provable slices, org policy roots, signed revocation chains, beacon heartbeats (drand, NIST 2.0), degraded mode, OpenTimestamps anchoring |
 | 9 | [Schemas & namespaces](09-schemas.md) | **draft, not implemented:** a Cedar schema per audience, audience namespaces, publish-time validation of policies, schema blocks in the DAG |
+| 10 | [Delegated administration](10-delegated-administration.md) | **draft, not implemented:** grants that let another identity manage some sets, signed delegated roots, chain validity, fail-closed builder rules, provenance claims in access tokens |
 | — | [Test vectors](test-vectors/) | conformance vectors every implementation must pass |
 
 ## Interoperability

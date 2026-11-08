@@ -205,6 +205,10 @@
     revocations (§8). The GraphQL middleware doesn't consult a revocation follower yet.
   - Cedar schemas and audience namespaces, for validation and policy analysis.
     Specified as a draft ([spec §9](../spec/09-schemas.md)), not implemented.
+  - Delegated administration and role provenance. Today any change to a group or
+    role needs the org's whole manage policy, and a token's `roles` doesn't say which
+    org defined them. Specified as a draft ([spec §10](../spec/10-delegated-administration.md)),
+    not implemented.
   - Partial-evaluation pushdown of row-level filters into SQL.
   - The vault uses an HPKE-shaped construction; move to RFC 9180 HPKE.
 
@@ -373,3 +377,4 @@ repeated here.
 | 5 | Cedar partial evaluation to SQL/Prisma filters; DataLoader-friendly row checks | "Lock down the query" at scale |
 | 6 | rs-wnfs integration, with `did:kith` as the WNFS agent | Encrypted shared data for groups |
 | 7 | Witnesses and optional chain anchoring. OpenTimestamps anchoring of policy roots and revocations is done (§8.10); KEL witnesses and heartbeat co-signing remain | Third-party duplicity detection and public timestamps |
+| 8 | Delegated administration ([spec §10](../spec/10-delegated-administration.md)): grants, delegated roots, the fail-closed builder rules, `org`/`pol` token claims, `test-vectors/delegation.json` in all three implementations; then the admin write API on top | "Who may assign a role", answered by a signed chain instead of by whoever can edit the hub |
