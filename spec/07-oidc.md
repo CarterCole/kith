@@ -582,6 +582,22 @@ Not yet implemented:
   on first start and renames them `*.imported`. Login challenges (5 minutes) and
   passkey enrollments in progress (10 minutes) stay in memory: after a restart the
   login page is handed a fresh challenge and retries; an enrollment is started again.
+- **The bundle file** (`--bundle`). The hub reads it again whenever its modification
+  time or length changes, at the next request that needs groups or roles. A file that
+  fails to load (half written, invalid, gone) leaves the last good bundle in force: the
+  hub logs why and reports it in `GET /v1/admin/stats` (§7.10). At startup there is no
+  last good bundle, so a file that fails to load stops the hub from starting.
+  - Keeping the old bundle trades one failure for another. A sign-in still gets the
+    groups and roles it had, so a typo cannot lock everyone out; but a removal in a
+    file that fails to load does not take effect. Check a file before it is deployed
+    (§4.1.1, `kith bundle check`) and confirm with the stats that it loaded. To take
+    access away at once, use a revocation (§8.7) or end the identity's sessions.
+  - Replace the file by renaming a complete copy over it, so the hub never reads half
+    of one.
+  - `kith bundle edit` edits a bundle file in the browser, on the operator's own
+    machine; the hub never takes writes. It lists people from
+    `GET /v1/admin/identities`, shows each person's groups and roles as the file
+    stands, and saves only a file that passes §4.1.1.
 - **Rate limits.** `POST /oauth/login` allows 20 attempts per minute and
   `POST /oauth/register` 20 per hour, per client address. One more answers `429` with
   a `Retry-After` header and `{"error": "rate_limited", "retry_after": <seconds>}`.
@@ -629,7 +645,8 @@ For the hub's operator, under `{issuer}/v1/admin/`. Two credentials open it:
 
 | Method, path | Does |
 |--------------|------|
-| `GET /v1/admin/stats` | Counts of sessions, refresh tokens, codes, pending requests, grants, registered and configured clients, TOTP enrollments, co-signers and KELs; uptime. |
+| `GET /v1/admin/stats` | Counts of sessions, refresh tokens, codes, pending requests, grants, registered and configured clients, TOTP enrollments, co-signers and KELs; uptime; and `bundle`: the file's `path`, when the bundle in force was loaded (`loaded_at`), its numbers of `groups` and `roles`, and `error`, why the file as it is now is not the one in force (null when it is). |
+| `GET /v1/admin/identities` | Every identity the hub holds a KEL for, oldest first: `did`, `created`, `updated`, `devices`, public `aliases`, `linked` provider accounts, verified `contacts` (`address`, `verified_at`, `public`), `totp`, `work`, `last_sign_in` (of its live hub sessions), its `directory` attributes, and its standing `groups` and `roles` (with `memberships_error` when they could not be worked out, as for a principal the org revoked). Standing means worked out from the KEL and the directory alone, so a rule on `aal`, `amr` or an upstream attribute does not match here even where a sign-in would meet it. |
 | `GET /v1/admin/sessions[?did=…]` | Live hub sessions: `sid`, `did`, `device`, `alias`, `aal`, `amr`, `auth_time`, `expires`, `clients`. Never the cookie. |
 | `DELETE /v1/admin/sessions/{sid}` | Ends that session. Its unredeemed codes and its refresh tokens die; clients that registered a logout URI are told (§7.6). |
 | `DELETE /v1/admin/identities/{did}/sessions` | Signs the identity out everywhere: every session, and every refresh token, including those whose session already expired. |

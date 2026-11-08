@@ -103,7 +103,17 @@
     `--behind-proxy` for the address a reverse proxy appends.
   - An admin API (admin token, or any identity in the `hub-admin` role): list and end
     sessions, sign an identity out everywhere, list and delete registered clients,
-    list and withdraw consent.
+    list and withdraw consent, list identities with their standing groups and roles,
+    and see which bundle file is in force.
+  - A bundle file that fails to load leaves the last good one in force, and the stats
+    say why; at startup it still stops the hub ([spec §7.9](../spec/07-oidc.md)).
+- **Bundle files** ([spec §4.1.1](../spec/04-authorization.md)). `kith bundle check`
+  refuses what a loader would quietly misread: keys written twice, unknown members,
+  references to sets that don't exist, policies and rules that don't parse. `kith bundle
+  edit` edits a file in the browser on the operator's machine (organizations, site
+  roles, groups, people, raw JSON), shows each person's groups and roles as the draft
+  stands, and saves only a file that passes the check, by renaming it into place. Rust
+  only: the JS and Python packages load bundles but have no checker.
 
 - **Hardening pass, October 2026** (an audit of all three implementations; each item
   has a test that failed first).
@@ -161,8 +171,12 @@
 - **Hub operations.** The hub speaks plain HTTP (terminate TLS in front of it). There
   is no audit log, and the admin API only lists and deletes: no editing of clients,
   no RFC 7592. Login challenges and passkey enrollments in progress are still in
-  memory (the page retries after a restart). The bundle is a hot-reloaded file, and
-  there is no rate limit on anything but login, registration and TOTP.
+  memory (the page retries after a restart). There is no rate limit on anything but
+  login, registration and TOTP.
+- **Bundle files.** A removal in a file that fails to load does not take effect until a
+  good file replaces it (the stats report it; a revocation acts at once). The editor
+  cannot rename a set, and its `Apply` from raw JSON refuses keys written twice rather
+  than showing them. The §9 schemas are not checked.
 - **Browser accounts.** An identity made at `/signup` has one passkey, which is also
   its manage key, so it can't add another device, and nothing yet uses its recovery
   key. It has no name or email attribute. Sign-up is open to anyone who reaches the

@@ -22,6 +22,24 @@ behaviour, not a promise about compatibility. Versions follow the workspace vers
   and whoever proves an address last holds it. Codes are sent through Amazon SES and AWS
   End User Messaging SMS (`--features aws`), or to an outbox file. New `phone` scope.
 - `GET /login` redirects to the account page, `/whoami`, instead of answering 404.
+- **`kith bundle check`** (spec §4.1.1) refuses a bundle file that a loader would quietly
+  misread: a key written twice, an unknown member such as `"rols"`, a `group:` or `role:`
+  member that names no set, or a policy or rule that does not parse. It warns about
+  likely mistakes. `kith_core::bundle::check` is the library form.
+- **`kith bundle edit`**: a local browser editor for a bundle file kept in git, with
+  organizations (`org:` groups), roles by site, groups, people and raw JSON. It shows
+  each person's groups and roles as the draft stands, saves only a file that passes the
+  check, and renames it into place. Loopback only, behind a per-run token.
+- **`GET /v1/admin/identities`** lists every identity with its contacts, devices, last
+  sign-in and standing groups and roles. `GET /v1/admin/stats` gains `bundle`: which
+  bundle file is in force, and why a newer one is not.
+
+### Changed
+
+- **A bundle file that fails to load leaves the last good one in force** (spec §7.9).
+  Before, a half-written or invalid file made every sign-in fail until it was fixed.
+  The hub logs the error and reports it in the stats; at startup a bad file still stops
+  it. A file is now read again when its length changes as well as its modification time.
 
 An audit of all three implementations, and the fixes that came out of it. Each fix has a
 test that failed before it. The audit items that are still open are listed in

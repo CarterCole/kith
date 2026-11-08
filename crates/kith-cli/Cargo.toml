@@ -24,6 +24,12 @@ reqwest.workspace = true
 clap.workspace = true
 rand.workspace = true
 hickory-resolver.workspace = true
+# `kith bundle edit` serves its page on loopback.
+axum.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 # The macOS keychain and Secure Enclave backends (`keystore.rs`). Other platforms
 # fall back to the plaintext file backend.

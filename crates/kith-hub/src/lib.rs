@@ -30,7 +30,7 @@
 //! | `GET  /v1/contacts/lookup`                | who holds a published contact, signed           |
 //! | `POST /v1/enroll`, `GET /enroll/{id}`     | enroll a browser passkey as a device            |
 //! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
-//! | `/v1/admin/…`                             | sessions, consent, clients and TOTP resets, for the operator (see [`admin`]) |
+//! | `/v1/admin/…`                             | identities, sessions, consent, clients, TOTP resets and the bundle in force, for the operator (see [`admin`]) |
 //!
 //! State that must outlive a restart is in one SQLite file in the data directory
 //! (see [`store`]).
@@ -65,7 +65,7 @@ use axum::{Form, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use kith_core::authz::{Bundle, Engine};
+use kith_core::authz::{Bundle, Engine, Memberships};
 use kith_core::kel::{extends, verify_log, DeviceKind, Event, KeyState};
 use kith_core::keys::{verify_sig, PublicKey, Sig, VerifyOptions};
 use kith_core::session::{self, Capability, KelResolver};
@@ -221,13 +221,24 @@ pub struct Authn {
     pub attrs: Map<String, Value>,
 }
 
+/// The policy engine in force, and what became of the last attempt to load the file.
+struct EngineSlot {
+    /// Modification time and length of the file last read, whether or not it loaded.
+    seen: Option<(std::time::SystemTime, u64)>,
+    engine: Arc<Engine>,
+    /// When `engine` was loaded; 0 for the empty bundle a hub without a file uses.
+    loaded_at: i64,
+    /// Why the file as it is now is not the one in force.
+    error: Option<String>,
+}
+
 pub struct Hub {
     pub cfg: HubConfig,
     pub signer: HubSigner,
     pub(crate) rsa: oidc::RsaSigner,
     pub(crate) pairwise_secret: Vec<u8>,
     kels: RwLock<HashMap<String, Vec<Event>>>,
-    engine: RwLock<(Option<std::time::SystemTime>, Arc<Engine>)>,
+    engine: RwLock<EngineSlot>,
     /// Login challenges live five minutes; a page whose challenge was lost to a
     /// restart is handed a fresh one and retries.
     pub(crate) challenges: Mutex<HashMap<String, Challenge>>,
@@ -432,13 +443,15 @@ impl Hub {
             rsa,
             pairwise_secret,
             kels: RwLock::new(kels),
-            engine: RwLock::new((
-                None,
-                Arc::new(Engine::new(Bundle {
+            engine: RwLock::new(EngineSlot {
+                seen: None,
+                engine: Arc::new(Engine::new(Bundle {
                     version: 1,
                     ..Default::default()
                 })?),
-            )),
+                loaded_at: 0,
+                error: None,
+            }),
             challenges: Mutex::new(HashMap::new()),
             store,
             enrollments: Mutex::new(HashMap::new()),
@@ -452,21 +465,74 @@ impl Hub {
             #[cfg(feature = "aws")]
             aws: Default::default(),
         };
-        hub.engine()?;
+        hub.load_bundle(true)?;
         Ok(Arc::new(hub))
     }
 
-    /// The policy engine, reloaded whenever the bundle file changes.
+    /// The policy engine, reloaded whenever the bundle file changes. A file that
+    /// fails to load (half written, invalid, gone) leaves the last good one in force,
+    /// and [`Hub::bundle_status`] says why.
     pub fn engine(&self) -> anyhow::Result<Arc<Engine>> {
+        self.load_bundle(false)
+    }
+
+    /// Load the bundle file if it changed since it was last read. `strict` is for
+    /// startup, when there is no good bundle to keep.
+    fn load_bundle(&self, strict: bool) -> anyhow::Result<Arc<Engine>> {
         let Some(path) = &self.cfg.bundle_path else {
-            return Ok(self.engine.read().unwrap().1.clone());
+            return Ok(self.engine.read().unwrap().engine.clone());
         };
-        let mtime = std::fs::metadata(path)?.modified()?;
-        if self.engine.read().unwrap().0 != Some(mtime) {
-            let engine = Arc::new(Engine::from_json(&std::fs::read_to_string(path)?)?);
-            *self.engine.write().unwrap() = (Some(mtime), engine);
+        let seen = std::fs::metadata(path).and_then(|m| Ok((m.modified()?, m.len())));
+        let key = seen.as_ref().ok().copied();
+        {
+            let slot = self.engine.read().unwrap();
+            if key.is_some() && slot.seen == key {
+                return Ok(slot.engine.clone());
+            }
         }
-        Ok(self.engine.read().unwrap().1.clone())
+        let loaded = seen
+            .map_err(anyhow::Error::from)
+            .and_then(|_| Ok(Engine::from_json(&std::fs::read_to_string(path)?)?));
+        let mut slot = self.engine.write().unwrap();
+        match loaded {
+            Ok(engine) => {
+                *slot = EngineSlot {
+                    seen: key,
+                    engine: Arc::new(engine),
+                    loaded_at: now(),
+                    error: None,
+                };
+            }
+            Err(e) if strict => {
+                return Err(e.context(format!("policy bundle {}", path.display())))
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if slot.error.as_deref() != Some(msg.as_str()) {
+                    eprintln!(
+                        "policy bundle {}: {msg}; still using the one loaded at {}",
+                        path.display(),
+                        slot.loaded_at
+                    );
+                }
+                slot.seen = key;
+                slot.error = Some(msg);
+            }
+        }
+        Ok(slot.engine.clone())
+    }
+
+    /// Which bundle is in force, for `/v1/admin/stats`.
+    pub fn bundle_status(&self) -> Value {
+        let _ = self.engine();
+        let slot = self.engine.read().unwrap();
+        json!({
+            "path": self.cfg.bundle_path,
+            "loaded_at": slot.loaded_at,
+            "error": slot.error,
+            "groups": slot.engine.bundle.groups.len(),
+            "roles": slot.engine.bundle.roles.len(),
+        })
     }
 
     /// Verification keys: EdDSA (access tokens) and RS256 (ID tokens).
@@ -795,6 +861,24 @@ impl Hub {
         })
     }
 
+    /// Groups, roles and merged attributes for `did`: from the org's policy DAG when
+    /// the hub follows one, otherwise from the bundle file.
+    pub(crate) fn memberships_for(
+        &self,
+        did: &str,
+        dev: Option<&str>,
+        kel_attrs: &Map<String, Value>,
+    ) -> ApiResult<(Memberships, Map<String, Value>)> {
+        Ok(match self.org_memberships(did, dev, kel_attrs)? {
+            Some(found) => found,
+            None => {
+                let engine = self.engine()?;
+                let attrs = engine.attributes(did, kel_attrs);
+                (engine.memberships(did, &attrs)?, attrs)
+            }
+        })
+    }
+
     /// Access token claims for an authenticated principal.
     pub fn access_claims(
         &self,
@@ -810,17 +894,8 @@ impl Hub {
             "work".into(),
             json!(self.store.work_for(&a.st.did)?.map_or(0, |(bits, _)| bits)),
         );
-        let resolve = |kel_attrs: &Map<String, Value>| -> ApiResult<_> {
-            Ok(
-                match self.org_memberships(&a.st.did, a.dev.as_deref(), kel_attrs)? {
-                    Some(found) => found,
-                    None => {
-                        let engine = self.engine()?;
-                        let attrs = engine.attributes(&a.st.did, kel_attrs);
-                        (engine.memberships(&a.st.did, &attrs)?, attrs)
-                    }
-                },
-            )
+        let resolve = |kel_attrs: &Map<String, Value>| {
+            self.memberships_for(&a.st.did, a.dev.as_deref(), kel_attrs)
         };
         let (mut m, mut attrs) = resolve(&kel_attrs)?;
         // Upstream attributes only fill gaps: they never replace what the directory
@@ -1354,6 +1429,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/admin/stats", get(admin::stats))
         .route("/v1/admin/sessions", get(admin::sessions))
         .route("/v1/admin/sessions/{sid}", delete(admin::end_session))
+        .route("/v1/admin/identities", get(admin::identities))
         .route(
             "/v1/admin/identities/{did}/sessions",
             delete(admin::end_sessions_of),

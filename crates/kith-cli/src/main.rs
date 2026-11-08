@@ -6,6 +6,7 @@
 //! Real deployments keep the manage key on hardware or in a wallet and recovery keys
 //! offline.
 
+mod bundle;
 mod keystore;
 mod names;
 mod org;
@@ -166,6 +167,9 @@ enum Cmd {
     Inspect { token: String },
     #[command(subcommand)]
     Hub(HubCmd),
+    /// Policy bundle files: check one before it is deployed, or edit one in the browser.
+    #[command(subcommand)]
+    Bundle(bundle::BundleCmd),
     /// Policy DAGs: publish a bundle, fetch provable slices, list grants.
     #[command(subcommand)]
     Policy(org::PolicyCmd),
@@ -1136,6 +1140,11 @@ fn main() -> Result<()> {
         return tokio::runtime::Runtime::new()?.block_on(kith_hub::serve(cfg, &addr));
     }
 
+    // Bundle files need no identity of their own.
+    if let Cmd::Bundle(cmd) = cli.cmd {
+        return bundle::run(cmd);
+    }
+
     let mut home = Home::load(dir)?;
     match cli.cmd {
         Cmd::Init {
@@ -1809,7 +1818,7 @@ fn main() -> Result<()> {
             }
             print(&json!({"header": header, "claims": t.claims}));
         }
-        Cmd::Hub(_) => unreachable!(),
+        Cmd::Hub(_) | Cmd::Bundle(_) => unreachable!(),
         Cmd::Policy(cmd) => org::policy(&mut home, cmd)?,
         Cmd::Revoke(cmd) => org::revoke(&mut home, cmd)?,
         Cmd::Anchor(cmd) => org::anchor(&home, cmd)?,

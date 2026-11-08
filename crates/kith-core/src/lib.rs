@@ -14,6 +14,7 @@
 //! * [`totp`]      – RFC 6238 one-time codes (a hub-side factor)
 //! * [`vault`]     – crypto-enforced access: skip-ratchet group keys sealed to devices
 //! * [`authz`]     – groups (explicit + dynamic), roles and Cedar policy evaluation
+//! * [`bundle`]    – checks a bundle file before it is deployed (`kith bundle check`)
 //! * [`dag`]       – content-addressed blocks (DAG-JSON CIDs) and a Merkle map
 //! * [`pdag`]      – the policy DAG: bundles as blocks, provable slices
 //! * [`revoke`]    – signed revocation chains, heartbeats and freshness
@@ -22,6 +23,7 @@
 
 pub mod alias;
 pub mod authz;
+pub mod bundle;
 pub mod beacon;
 pub mod canon;
 pub mod dag;

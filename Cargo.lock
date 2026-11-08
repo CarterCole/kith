@@ -2494,9 +2494,11 @@ name = "kith-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "core-foundation 0.10.1",
  "hickory-resolver",
+ "http-body-util",
  "kith-core",
  "kith-hub",
  "p256 0.13.2",
@@ -2507,6 +2509,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

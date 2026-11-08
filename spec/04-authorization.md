@@ -50,6 +50,25 @@ The portable unit that hubs and resource servers load:
   attributes, actions and object types that policies may name, and give each audience
   its own namespace.
 
+### 4.1.1 Checking a bundle file
+
+A loader accepts any bundle that parses, and JSON forgives mistakes that change who has
+access: an unknown member (`"rols"`, `"member"`) is ignored, a key written twice keeps
+only its last value, and `role:gd` names a set whether or not `gd` exists. Tools that
+write or deploy a bundle SHOULD refuse it when any of these hold (`kith bundle check`
+does, and the reference implementation is `kith_core::bundle::check`):
+
+- it is not valid JSON, not an object, or its `version` is not `1`;
+- an object key appears twice in the same object, anywhere in the file;
+- a member is unknown: at the top level (other than the ones above), in a set (other
+  than `description`, `members`, `rule`), or in a directory entry (other than `attrs`);
+- a policy or rule does not parse;
+- a `group:x` or `role:x` member names a set the bundle does not define.
+
+They SHOULD warn about a member that is not a DID, `group:` or `role:`; a set with no
+members and no rule; a member listed twice in one set; a directory entry for something
+that is not a DID; and a `Group::"x"` or `Role::"x"` in a rule or policy that names no set.
+
 ## 4.2 Entity model
 
 | Cedar entity | Kith meaning |

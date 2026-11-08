@@ -8,7 +8,8 @@
 //!
 //! | method, path                                   | what                                                                 |
 //! |------------------------------------------------|----------------------------------------------------------------------|
-//! | `GET /v1/admin/stats`                          | counts of stored state, uptime                                       |
+//! | `GET /v1/admin/stats`                          | counts of stored state, uptime, and which policy bundle is in force  |
+//! | `GET /v1/admin/identities`                     | every stored identity, with its contacts and standing groups/roles   |
 //! | `GET /v1/admin/sessions[?did=…]`               | live hub sessions (never their cookies)                              |
 //! | `DELETE /v1/admin/sessions/{sid}`              | end one session: its codes and refresh tokens die, clients are told |
 //! | `DELETE /v1/admin/identities/{did}/sessions`   | sign an identity out everywhere                                      |
@@ -27,6 +28,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
+use kith_core::kel::verify_log;
+use kith_core::keys::VerifyOptions;
 use kith_core::util::now;
 
 use crate::oidc::{self, ct_eq, Client, SsoSession};
@@ -102,9 +105,58 @@ pub async fn stats(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResult<R
     let mut v = h.store.counts()?;
     v["configured_clients"] = json!(h.cfg.clients.len());
     v["kels"] = json!(h.kel_dids().len());
+    v["bundle"] = h.bundle_status();
     v["started"] = json!(h.started);
     v["uptime"] = json!(now() - h.started);
     Ok(ok(v))
+}
+
+/// Every identity the hub holds a KEL for, oldest first: what an operator needs to
+/// pick people for groups and roles. `groups` and `roles` are standing ones, worked
+/// out from the KEL and the directory alone, so a rule on `aal`, `amr` or an upstream
+/// attribute does not match here even where a sign-in would meet it.
+pub async fn identities(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResult<Response> {
+    authorize(&h, &headers)?;
+    h.store.sweep(now())?;
+    let engine = h.engine()?;
+    let mut out = vec![];
+    for did in h.kel_dids() {
+        let Some(log) = h.get_kel(&did) else { continue };
+        let st = verify_log(&log, &VerifyOptions::default())?;
+        let work = h.store.work_for(&did)?.map_or(0, |(bits, _)| bits);
+        let mut kel_attrs = serde_json::Map::new();
+        kel_attrs.insert("aliases".into(), json!(st.aliases));
+        kel_attrs.insert("work".into(), json!(work));
+        let (memberships, error) = match h.memberships_for(&did, None, &kel_attrs) {
+            Ok((m, _)) => (m, None),
+            Err(ApiError(_, _, msg, _)) => (Default::default(), Some(msg)),
+        };
+        let directory = engine.bundle.directory.get(&did).map(|d| d.attrs.clone());
+        let contacts: Vec<Value> = h
+            .store
+            .contacts_of(&did)?
+            .into_iter()
+            .map(|c| json!({"address": c.address, "verified_at": c.verified_at, "public": c.public}))
+            .collect();
+        out.push(json!({
+            "did": did,
+            "created": st.created,
+            "updated": st.updated,
+            "devices": st.devices.len(),
+            "aliases": st.aliases,
+            "linked": h.store.provider_links_of(&did)?,
+            "contacts": contacts,
+            "totp": h.store.totp(&did)?.is_some_and(|t| t.confirmed),
+            "work": work,
+            "last_sign_in": h.store.sessions(Some(&did))?.iter().map(|s| s.authn.auth_time).max(),
+            "directory": directory,
+            "groups": memberships.groups,
+            "roles": memberships.roles,
+            "memberships_error": error,
+        }));
+    }
+    out.sort_by_key(|p| (p["created"].as_i64(), p["did"].as_str().map(str::to_owned)));
+    Ok(ok(json!(out)))
 }
 
 pub async fn sessions(

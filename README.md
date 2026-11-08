@@ -92,7 +92,9 @@ kith hub serve --registration-token "$TOKEN" # let apps register themselves (RFC
 kith hub serve --signup                      # let anyone create an account at /signup (a passkey)
                                              # /whoami: sign in with that passkey, see your identity
 kith work --bits 24                          # spend compute on your identity; the hub records the best proof
-kith hub serve --admin-token "$TOKEN"        # /v1/admin/…: sessions, consent, clients
+kith hub serve --admin-token "$TOKEN"        # /v1/admin/…: identities, sessions, consent, clients, the bundle in force
+kith bundle check bundle.json                # before deploying: keys written twice, unknown members, missing sets
+kith bundle edit bundle.json --people people.json   # edit it in your browser, on this machine; save, commit, deploy
 kith alias link 'https://oauth.telegram.org#<your id>'   # let that Telegram account sign in as you
                                              # apps asking for scope linked_account get a signed attestation of it
 kith name add ada mailto:ada@acme.test       # follow her WebFinger (or DNS) back-link, check her KEL links it, pin it
@@ -188,9 +190,9 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 | Path | What |
 |------|------|
 | `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
-| `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
+| `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, bundle file checks, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
 | `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email and phone contacts, OpenID Connect provider with passkey login and enrollment pages, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
-| `crates/kith-cli` | `kith` binary |
+| `crates/kith-cli` | `kith` binary, including the local bundle editor (`kith bundle edit`) |
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |
 | `examples/` | Shared policy bundle, GraphQL schema and data used by every example and test |
