@@ -97,6 +97,149 @@ an unregistered redirect URI is shown as an error page, **never redirected**.
   and deletes registrations through the admin API (§7.10).
 - Every call counts against the registration rate limit, token or not (§7.9).
 
+### 7.2.1 Admitting applications
+
+An app can sign people in only once the hub knows its `client_id`. For any other id,
+`/oauth/authorize` shows an error page ("Unknown application") and never redirects.
+
+**Today** the hub learns of an app in one of two ways, and `GET /v1/admin/clients`
+reports which as `source`:
+
+| `source` | How it gets there | `client_id` | Who decides |
+|----------|-------------------|-------------|-------------|
+| `configured` | an entry in the `--clients` file (§7.2), read when the hub starts | chosen in the file | whoever edits the file and restarts the hub |
+| `registered` | `POST /oauth/register` with the `KITH_REGISTRATION_TOKEN` bearer (§7.2) | random, issued by the hub | whoever holds the token: the app is admitted at once |
+
+To remove an app, delete a `configured` one from the file and restart the hub, or call
+`DELETE /v1/admin/clients/{id}` for a `registered` one (§7.10), which also deletes its
+grants and refresh tokens. Nobody can ask to be admitted and wait for an answer, and a
+registration cannot choose its `client_id`. So an app built with a fixed id, such as
+`client_id=questions`, must be a configured client or switch to the id it was issued.
+
+**Requests and approval (draft, not implemented).** An app asks to be admitted. Its
+request waits in a queue until the operator approves or denies it. The operator can
+also add a client directly under an id they choose.
+
+*Asking.* `POST {issuer}/v1/client-requests`:
+
+- It is off unless the hub is started with `--client-requests`. Until then the path
+  answers `404`, as `/oauth/register` does on a hub started without a registration
+  token.
+- The caller presents a hub access token (`aud` = issuer, §2.3) for the identity that
+  is asking, as a bearer. Without one it answers `401`. The queue records who asked.
+- The body is the registration metadata of §7.2. The hub accepts and refuses the same
+  members, and checks them the same way (redirect URIs, auth method, pairwise on one
+  host), so a request that would fail registration fails at once, not in the queue.
+  Two more members:
+  - `client_id` (optional): the id the app wants. It matches
+    `^[a-z0-9][a-z0-9-]{1,62}$` and no configured client, registered client or pending
+    request uses it, or the hub answers `409` `client_id_taken`. A pending request
+    keeps the id reserved. Without it, the hub issues a random id on approval.
+  - `note` (optional, up to 500 characters): what the app is and who runs it, for the
+    operator.
+- It answers `202`, with `Cache-Control: no-store`:
+
+  ```json
+  {
+    "request_id": "…",
+    "status": "pending",
+    "client_id": "questions",                  // as proposed, or null
+    "request_secret": "…",                     // shown once
+    "expires_at": 1796508936
+  }
+  ```
+
+  The hub stores only the SHA-256 of `request_secret`.
+- Every call counts against the registration rate limit (§7.9).
+- A request gives the app nothing. `/oauth/authorize` for an id that a pending request
+  proposed shows "This application is waiting for the hub's operator to approve it."
+  It does not redirect.
+
+*Checking.* `GET {issuer}/v1/client-requests/{request_id}`, with the `request_secret`
+as the bearer, answers the request as it stands:
+
+| `status` | Also returns |
+|----------|--------------|
+| `pending` | `created`, `expires_at` |
+| `approved` | `client_id`, `decided_at`; on the first read after approval, and only then, `client_secret` for a confidential client (`token_endpoint_auth_method` other than `none`) |
+| `denied` | `reason`, `decided_at` |
+| `expired` | `expires_at` |
+
+An unknown id and a wrong secret both answer `404`. A request still pending after
+30 days expires. Approved, denied and expired requests are kept 30 days after that,
+then swept. The client made from an approved request stays.
+
+*Deciding.* Under `/v1/admin/`, with the credentials of §7.10:
+
+| Method, path | Does |
+|--------------|------|
+| `GET /v1/admin/client-requests[?status=pending]` | Requests, newest first: `request_id`, `status`, `requested_by` (the DID), the proposed `client_id` (or null), `client_name`, `redirect_uris` and their hosts, `note`, `created`, `expires_at`, `decided_at`, `reason`. Never the request secret. |
+| `POST /v1/admin/client-requests/{id}/approve` | Creates the client from the request's metadata, under the proposed `client_id` or a random one, with `source: request`. It is then a registered client in every way: `consent: explicit`, `audience` = `client_id`, no `min_aal` (§7.2). Answers the client without its secret, which goes to the requester. A request that is not pending, or whose id has been taken since, answers `409`. |
+| `POST /v1/admin/client-requests/{id}/deny` | Denies it. The optional body `{"reason": "…"}` is shown to the requester. A request that is not pending answers `409`. |
+| `POST /v1/admin/clients` | The operator adds a client directly, with `source: admin`. The body takes the members of the §7.2 file format except `client_secret`, plus `token_endpoint_auth_method` (`none` for a public client). `client_id` is optional, follows the pattern above, and must be free (`409` otherwise); without it the id is random. The hub issues the secret. It answers `201` with the client and, once, its `client_secret`. |
+| `DELETE /v1/admin/clients/{id}` | As today (§7.10). It also deletes `admin` and `request` clients. |
+
+`GET /v1/admin/clients` then reports four `source` values: `configured`, `registered`,
+`admin` and `request`. Clients that come from the admin API or from a request are kept
+in the store (§7.9), as registrations are.
+
+Open questions:
+
+1. May anyone ask, rate limited per address as sign-up is (§7.11), or only a signed-in
+   identity, as drafted above?
+2. May a client the operator adds set `consent: implied`, `min_aal` and `audience`, as
+   a configured one can? If it may, any identity in the `hub-admin` role can make an
+   app that skips the consent page, which today takes access to the clients file.
+
+**Commands.** These work today:
+
+```bash
+# Add: register an app. Its client_id is random; the answer holds client_secret once.
+curl -s -X POST https://id.example.com/oauth/register \
+  -H "authorization: Bearer $KITH_REGISTRATION_TOKEN" -H "content-type: application/json" \
+  -d '{"client_name": "Questions",
+       "redirect_uris": ["https://questions.example.com/callback"],
+       "token_endpoint_auth_method": "none"}'
+
+# List every client, with source and has_secret
+curl -s -H "authorization: Bearer $KITH_ADMIN_TOKEN" https://id.example.com/v1/admin/clients
+
+# Remove a registered client, with its grants and refresh tokens
+curl -s -X DELETE -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
+  "https://id.example.com/v1/admin/clients/$CLIENT_ID"
+```
+
+These are drafted (not implemented):
+
+```bash
+# The app asks, proposing its id
+curl -s -X POST https://id.example.com/v1/client-requests \
+  -H "authorization: Bearer $HUB_ACCESS_TOKEN" -H "content-type: application/json" \
+  -d '{"client_id": "questions", "client_name": "Questions",
+       "redirect_uris": ["https://questions.example.com/callback"],
+       "token_endpoint_auth_method": "none", "note": "Q&A site, run by Carter"}'
+
+# The app checks on its request
+curl -s -H "authorization: Bearer $REQUEST_SECRET" \
+  "https://id.example.com/v1/client-requests/$REQUEST_ID"
+
+# The operator reviews the queue, then approves or denies
+curl -s -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
+  "https://id.example.com/v1/admin/client-requests?status=pending"
+curl -s -X POST -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
+  "https://id.example.com/v1/admin/client-requests/$REQUEST_ID/approve"
+curl -s -X POST -H "authorization: Bearer $KITH_ADMIN_TOKEN" -H "content-type: application/json" \
+  -d '{"reason": "No such site"}' \
+  "https://id.example.com/v1/admin/client-requests/$REQUEST_ID/deny"
+
+# The operator adds a client directly, under an id they choose
+curl -s -X POST https://id.example.com/v1/admin/clients \
+  -H "authorization: Bearer $KITH_ADMIN_TOKEN" -H "content-type: application/json" \
+  -d '{"client_id": "questions", "name": "Questions",
+       "redirect_uris": ["https://questions.example.com/callback"],
+       "token_endpoint_auth_method": "none"}'
+```
+
 ## 7.3 Authorization request
 
 `GET /oauth/authorize` takes:
@@ -656,6 +799,9 @@ For the hub's operator, under `{issuer}/v1/admin/`. Two credentials open it:
 | `GET /v1/admin/grants/{did}` | What the identity agreed to share, per client: scopes and when. |
 | `DELETE /v1/admin/grants/{did}/{client_id}` | Withdraws that consent. The client's refresh tokens for the identity die, and it is asked again next time. |
 
+Adding a client through this API, and a queue of requests to approve or deny, are
+drafted in §7.2.1 and not implemented.
+
 Responses are JSON with `Cache-Control: no-store`. Errors have the API's usual
 `error` and `error_description`: no credential is `401`, an identity outside the
 role `403`.
@@ -826,6 +972,9 @@ Limits:
 
 - A page for the user to review and withdraw remembered consent (the admin API can).
 - Open client registration, and the registration management endpoint (RFC 7592).
+- Admitting applications (§7.2.1, draft): requests at `/v1/client-requests`, the
+  operator's queue to approve or deny them, and adding a client under a chosen
+  `client_id` through `POST /v1/admin/clients`.
 - `jwks_uri` and `sector_identifier_uri` for clients; encrypted userinfo.
 - Logout notices when a session expires or its device is revoked; retries.
 - Session management through `check_session_iframe`.

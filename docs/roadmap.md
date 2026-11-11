@@ -170,7 +170,10 @@
     a keychain access group would avoid that.
 - **Hub operations.** The hub speaks plain HTTP (terminate TLS in front of it). There
   is no audit log, and the admin API only lists and deletes: no editing of clients,
-  no RFC 7592. Login challenges and passkey enrollments in progress are still in
+  no RFC 7592. It cannot add a client, and an app cannot ask to be admitted and wait
+  for the operator's answer; a registration always gets a random `client_id`
+  ([spec §7.2.1](../spec/07-oidc.md), draft: a request queue to approve or deny, and
+  `POST /v1/admin/clients` under a chosen id). Login challenges and passkey enrollments in progress are still in
   memory (the page retries after a restart). There is no rate limit on anything but
   login, registration and TOTP.
 - **Bundle files.** A removal in a file that fails to load does not take effect until a
