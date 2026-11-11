@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Add a device · {{BRAND}}</title>
+<style nonce="{{NONCE}}">{{STYLE}}
+.qr { display: block; width: 240px; height: 240px; margin: 0 auto 6px; border-radius: 8px; background: #fff; }
+#qr-box code.block { text-align: center; margin-bottom: 16px; }
+ul.items:empty { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <div class="brand">{{BRAND}}</div>
+  <h1 id="title">Add a device</h1>
+  <p id="lead"></p>
+  <ul id="items" class="items"></ul>
+  <div id="qr-box" class="hidden">
+    <img id="qr" class="qr" alt="QR code of this page's link">
+    <code id="link" class="block"></code>
+  </div>
+  <div id="name-box" class="hidden">
+    <label for="name">Name this device</label>
+    <input id="name" maxlength="40" value="phone" autocomplete="off">
+    <p class="meta mt">The name is public, in your identity's log. Keep it plain, like "phone".</p>
+  </div>
+  <div class="stack">
+    <button id="signin" class="primary hidden" type="button">Sign in with a passkey</button>
+    <button id="claim" class="primary hidden" type="button">Add it to my identity</button>
+    <button id="create" class="primary hidden" type="button">Create a passkey on this device</button>
+    <button id="confirm" class="primary hidden" type="button">Confirm with the new passkey</button>
+    <button id="approve" class="primary hidden" type="button">Approve with your passkey</button>
+    <button id="here" class="secondary hidden" type="button">Make the passkey on this device instead</button>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The first six bytes of SHA-256(did:key), as xxxx-xxxx-xxxx. `kith` prints the same.
+async function fingerprint(k) {
+  const hex = Array.from((await sha256(k)).slice(0, 6), (b) => b.toString(16).padStart(2, "0")).join("");
+  return hex.match(/.{4}/g).join("-");
+}
+const KIND = { software: "software key", hardware: "hardware key", passkey: "passkey", wallet: "wallet" };
+const LEVEL = { 1: "level 1", 2: "level 2", 3: "level 3" };
+const BUTTONS = ["signin", "claim", "create", "confirm", "approve", "here", "qr-box", "name-box"];
+
+let J = D.join;
+const me = D.session_did; // the identity this browser is signed in as, if any
+let challenge = D.challenge_id ? { id: D.challenge_id, message: D.message } : null;
+let joining = false; // this browser made the new passkey
+let makeHere = false; // signed in, but making the passkey here rather than on a phone
+let approvedHere = false;
+let rawId = null;
+
+function show(ids) {
+  for (const id of BUTTONS) $(id).classList.toggle("hidden", !ids.includes(id));
+}
+function items(list) {
+  $("items").replaceChildren();
+  for (const [label, value] of list) {
+    if (value == null) continue;
+    const li = document.createElement("li");
+    li.append(label);
+    const v = document.createElement("span");
+    v.className = "value";
+    v.textContent = value;
+    li.append(v);
+    $("items").append(li);
+  }
+}
+function text(title, lead) {
+  $("title").textContent = title;
+  $("lead").textContent = lead;
+}
+function qr() {
+  $("qr").src = `/join/${J.id}/qr.svg`;
+  $("link").textContent = J.url;
+}
+
+async function render() {
+  const d = J.device;
+  const code = d ? await fingerprint(d.key) : null;
+  const what = d ? `${d.name} (${KIND[d.kind] || d.kind}, ${LEVEL[d.aal] || "level " + d.aal})` : null;
+  if (!webauthnSupported()) for (const id of ["signin", "create", "confirm", "approve"]) $(id).disabled = true;
+  switch (J.state) {
+    case "waiting_for_identity":
+      if (!me) {
+        text("Add a device to your identity", "A terminal asked to join your identity. Sign in with your passkey to add it.");
+        items([["Device", what], ["Code", code]]);
+        show(["signin"]);
+      } else {
+        text("Add a device to your identity", "Your terminal shows a code. Add the device only if it matches this one.");
+        items([["Device", what], ["Code", code], ["Your identity", me]]);
+        show(["claim"]);
+      }
+      break;
+    case "waiting_for_device":
+      if (me === J.did && !makeHere) {
+        text("Add a phone or another device", "Scan this with the phone's camera. The phone makes its own passkey, then you approve it here.");
+        items([]);
+        qr();
+        show(["qr-box", "here"]);
+      } else {
+        text("Add this device", "This makes a passkey on this device for the identity below. Continue only if you started this from your own account.");
+        items([["Identity", J.did]]);
+        show(["name-box", "create"]);
+      }
+      break;
+    case "waiting_for_approval":
+      if (joining && !J.pop) {
+        text("Confirm the new passkey", "Passkey made. Confirm with it once more, to prove this device holds it.");
+        items([["Code", code]]);
+        show(["confirm"]);
+      } else if (joining) {
+        text("Waiting for approval", "Approve this device where you showed the QR code. Check that it shows this code.");
+        items([["Code", code], ["Identity", J.did]]);
+        show([]);
+      } else {
+        const pending = d && d.kind !== "passkey" ? " Your terminal will ask you to confirm too." : "";
+        items([["Device", what], ["Code", code], ["Identity", J.did],
+          ["Approvals", J.approvals.length + (J.approved ? ", enough" : " so far")]]);
+        if (J.approved) {
+          text("Approved", J.pop ? "Adding the device…" : "Waiting for the new device to confirm." + pending);
+          show([]);
+        } else if (approvedHere) {
+          text("One more approval needed", `Approve on another device that manages this identity: scan this, or run \`kith device approve ${J.id}\` there.`);
+          qr();
+          show(["qr-box"]);
+        } else {
+          text("Approve the new device", "Check that the new device shows the same code, then approve with a passkey that manages this identity." + pending);
+          show(["approve"]);
+        }
+      }
+      break;
+    case "done":
+      text("Device added", (d ? d.name : "The device") + " is now a device of your identity. You can close this page.");
+      items([["Device", what], ["Identity", J.did]]);
+      show([]);
+      status("Done.", "ok");
+      break;
+    case "failed":
+      text("Couldn't add the device", J.error || "The request failed. Start again.");
+      items([]);
+      show([]);
+      break;
+  }
+}
+
+async function refresh() {
+  const r = await fetch(`/v1/join/${J.id}`);
+  if (r.status === 404) {
+    status("This request expired. Start again.", "error");
+    return false;
+  }
+  const next = await r.json();
+  if (JSON.stringify(next) !== JSON.stringify(J)) {
+    J = next;
+    await render();
+  }
+  return true;
+}
+
+async function poll() {
+  while (!["done", "failed"].includes(J.state)) {
+    await sleep(1000);
+    if (!(await refresh())) return;
+  }
+}
+
+function failed(e, what) {
+  status(e.name === "NotAllowedError" ? `${what} was cancelled.` : "Error: " + e.message, "error");
+}
+
+function assertion(a) {
+  return { authenticator_data: b64u(a.response.authenticatorData), client_data_json: b64u(a.response.clientDataJSON), signature: b64u(a.response.signature) };
+}
+
+$("signin").onclick = async () => {
+  $("signin").disabled = true;
+  try {
+    const cred = await navigator.credentials.get({
+      publicKey: { challenge: await sha256(challenge.message), rpId: D.rp_id, userVerification: "preferred", allowCredentials: [] },
+    });
+    const r = cred.response;
+    if (!r.userHandle || r.userHandle.byteLength === 0) throw new Error("that passkey isn't linked to a {{BRAND}} identity");
+    status("Checking…");
+    const res = await postJSON("/whoami", {
+      challenge_id: challenge.id,
+      did: new TextDecoder().decode(r.userHandle),
+      factors: [{ type: "webauthn", authenticator_data: b64u(r.authenticatorData), client_data_json: b64u(r.clientDataJSON), signature: b64u(r.signature) }],
+    });
+    if (res.ok) return location.reload();
+    if (res.body.challenge_id) challenge = { id: res.body.challenge_id, message: res.body.message };
+    throw new Error(res.body.error_description || "sign-in failed");
+  } catch (e) {
+    failed(e, "Sign-in");
+  } finally {
+    $("signin").disabled = false;
+  }
+};
+
+$("claim").onclick = async () => {
+  $("claim").disabled = true;
+  const r = await postJSON(`/v1/join/${J.id}/claim`, {});
+  $("claim").disabled = false;
+  if (!r.ok) return status(r.body.error_description || "Couldn't claim the device.", "error");
+  J = r.body;
+  status("");
+  await render();
+};
+
+$("here").onclick = () => { makeHere = true; render(); };
+
+$("create").onclick = async () => {
+  $("create").disabled = true;
+  try {
+    const name = $("name").value.trim() || "phone";
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        rp: { id: D.rp_id, name: "{{BRAND}}" },
+        user: { id: new TextEncoder().encode(J.did), name, displayName: name },
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "preferred" },
+        attestation: "none",
+      },
+    });
+    const spki = cred.response.getPublicKey();
+    if (!spki) throw new Error("the authenticator did not return a public key");
+    rawId = cred.rawId;
+    const r = await postJSON(`/v1/join/${J.id}/device`, { key: p256DidKey(spki), name });
+    if (!r.ok) throw new Error(r.body.error_description || "couldn't submit the passkey");
+    joining = true;
+    J = r.body;
+    status("");
+    await render();
+  } catch (e) {
+    failed(e, "Passkey creation");
+  } finally {
+    $("create").disabled = false;
+  }
+};
+
+$("confirm").onclick = async () => {
+  $("confirm").disabled = true;
+  try {
+    const a = await navigator.credentials.get({
+      publicKey: { challenge: await sha256(J.message), rpId: D.rp_id, allowCredentials: [{ type: "public-key", id: rawId }], userVerification: "preferred" },
+    });
+    const r = await postJSON(`/v1/join/${J.id}/pop`, { webauthn: assertion(a) });
+    if (!r.ok) throw new Error(r.body.error_description || "the signature was refused");
+    J = r.body;
+    status("");
+    await render();
+  } catch (e) {
+    failed(e, "Confirming");
+  } finally {
+    $("confirm").disabled = false;
+  }
+};
+
+$("approve").onclick = async () => {
+  $("approve").disabled = true;
+  try {
+    const a = await navigator.credentials.get({
+      publicKey: { challenge: await sha256(J.message), rpId: D.rp_id, allowCredentials: [], userVerification: "preferred" },
+    });
+    const r = await postJSON(`/v1/join/${J.id}/approve`, { webauthn: assertion(a) });
+    if (!r.ok) throw new Error(r.body.error_description || "the approval was refused");
+    approvedHere = true;
+    J = r.body;
+    status("");
+    await render();
+  } catch (e) {
+    failed(e, "Approving");
+  } finally {
+    $("approve").disabled = false;
+  }
+};
+
+if (!webauthnSupported()) status("This browser doesn't support passkeys.", "error");
+render().then(poll);
+</script>
+</body>
+</html>

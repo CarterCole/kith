@@ -871,10 +871,11 @@ without `--signup`.
   most 1000 sign-ups are in progress at once. Each lasts 10 minutes.
 - Both the log (`kels/`) and the handle (`hub.sqlite`) are needed to sign in; back up
   both.
-- The identity has one device. There is no browser page to add another passkey or to
-  use the recovery key: adding a device needs the manage key's signature, and that is
-  the passkey, which the CLI can't produce. Until those exist, losing the passkey
-  loses the account.
+- The identity starts with one device, and the passkey alone approves new ones. More
+  devices join through §7.13, approved by that passkey in a browser. The recovery key
+  can then make other devices manage signers (`kith manage set`, §7.13). Until it has,
+  losing the passkey loses the account; nothing yet uses the recovery key from a
+  browser, or from a machine that is not a device of the identity.
 - The identity has no name or email attribute, so tokens carry no `name` or `email`
   claim. Attributes come from the directory (§4.3) or an upstream provider (§7.8).
 
@@ -968,7 +969,111 @@ Limits:
 - Bits are not comparable between hubs unless the hubs agree to trust each other's
   records; the proof itself is portable, since anyone can recheck it.
 
-## 7.13 Not yet implemented
+## 7.13 Joining a device
+
+A device joins an identity through a **join request** that the hub holds for one
+`add_device` event (§1.6). The identity's manage signers approve it, each with a
+signature over the event's message, and the new device proves it holds its key with a
+signature over the same message. Once the approvals satisfy the manage policy (§1.4)
+and the proof is in, the hub appends the event to the log. This is how an identity
+made in the browser (§7.11), whose manage key is a passkey that only a browser can use,
+gains devices. It works for any identity whose manage signers can sign in a browser or
+a terminal.
+
+There are two ways in:
+
+- **From a terminal.** `kith device join --hub https://hub.example` makes this
+  machine's key (in the Secure Enclave when there is one, §1.3.3) and opens a request
+  for it. It prints a link and a QR code. A browser signed in to the hub opens the link
+  and claims the request for its identity, and a manage signer approves it.
+- **By QR code, from the account page.** Signed in at `/whoami`, "Add a device" opens a
+  request for the identity, with no device yet, and shows a QR code of its link. A
+  phone that scans it makes a passkey on the hub's origin and proves it holds it; the
+  account page then approves it.
+
+```
+Terminal  POST /v1/join {device}                   → {id, url}; prints url, QR, fingerprint
+Browser   GET  /join/{id}, signed in; POST /v1/join/{id}/claim → {event, message}
+Terminal  polls; checks the event; asks "Join did:kith:…?"; POST /v1/join/{id}/pop {sig}
+Browser   credentials.get(challenge = SHA-256(message)); POST /v1/join/{id}/approve
+Hub       manage policy met and proof in → appends the event; state "done"
+
+Account   POST /v1/join/invite (session)           → {id, url}; the page shows a QR code
+Phone     GET  /join/{id}; credentials.create(user.id = DID)
+          POST /v1/join/{id}/device {key}          → {event, message}
+          credentials.get(challenge = SHA-256(message)); POST /v1/join/{id}/pop
+Account   polls; shows the fingerprint; credentials.get(…); POST /v1/join/{id}/approve
+```
+
+| Method, path | Who may call | Does |
+|--------------|--------------|------|
+| `POST /v1/join` `{device: {key, xkey?, name, kind, aal}}` | anyone; rate limited per address | Opens a request for a device that already holds its key. `kind` is `software` (`aal` 1) or `hardware` (`aal` 1 to 3); the device gets the caps `session` and `alias`. |
+| `POST /v1/join/invite` `{name?}` | a hub session (§7.6) | Opens a request for the session's identity, for a passkey not made yet. |
+| `GET /v1/join/{id}` | anyone with the id | The request as it stands: `state`, `did`, `device` (with its `fingerprint`), the unsigned `event` and its `message`, the signer ids in `approvals`, whether the manage policy is `approved`, whether the proof (`pop`) is in, `expires_at`, and `error` if it failed. |
+| `POST /v1/join/{id}/claim` | a hub session | Binds a terminal's request to the session's identity and builds the event. Once per request. |
+| `POST /v1/join/{id}/device` `{key, name?}` | anyone with the id | Supplies the new passkey (`ES256`) for an invite and builds the event. Once per request. The device is a `passkey` at `aal` 2 with the cap `session`, scoped to the hub's RP id. |
+| `POST /v1/join/{id}/approve` `{sig}` or `{webauthn}` | a manage signer | Adds one approval (below). |
+| `POST /v1/join/{id}/pop` `{sig}` or `{webauthn}` | the new device | Adds the proof of possession. |
+| `GET /join/{id}` | a browser | The page for every step and role. |
+| `GET /join/{id}/qr.svg` | a browser | A QR code of the request's link. |
+
+`state` is one of `waiting_for_identity` (a terminal's request nobody has claimed),
+`waiting_for_device` (an invite with no passkey yet), `waiting_for_approval`, `done`
+and `failed`.
+
+Rules:
+- The hub builds the event: `add_device` at the next `seq`, on the log as it holds it
+  then. The terminal checks it before it signs: the DID that claimed it, the next `seq`
+  and `prev` of that log, and exactly the device it asked for.
+- An approval is a signature over the message by a signer of the manage policy that
+  has not approved yet. It is `{sig}`, checked as §1.3 says, or `{webauthn}`: the
+  assertion's `authenticator_data`, `client_data_json` and `signature`, which the
+  browser sends without knowing its passkey's `did:key`. The hub tries each P-256
+  signer of the manage policy and keeps the one it verifies against. Any WebAuthn
+  signature, approval or proof, is checked as a login is: this hub's RP id and origins.
+- The proof is a signature by the new device's key over the same message. A passkey
+  proves with a WebAuthn assertion.
+- When the approvals satisfy the manage policy and the proof is in, the hub appends the
+  event, and `PUT /v1/kel` checks it again (§1.6). If the log moved in the meantime the
+  request fails and must be started again.
+- A request lasts 15 minutes and is held in memory. `POST /v1/join` counts against a
+  per-address limit (default 20 an hour), and at most 1000 requests are open at once.
+
+What a person checks:
+- **The terminal**: the link is a bearer value, and whoever signs in and opens it first
+  can claim the request. The terminal names the identity that claimed it and asks
+  before it signs; `--did` makes it refuse any other.
+- **The phone**: its page names the identity before it makes a passkey.
+- **Fingerprints**: the approving page shows the new key's fingerprint (§7.7), and the
+  terminal or the phone shows the same code for its own key. The person compares them
+  before approving.
+
+A terminal whose device key is a manage signer approves with
+`kith device approve <link or id>`, after the same check.
+
+**Changing who approves.** Only a `rotate` replaces the manage policy (§1.5), and only
+the keys committed in `next` sign one. For an identity made in the browser that is its
+recovery key. On a device that has joined:
+
+```bash
+kith manage set 2 passkey mac phone --recovery-key kith-recovery-key.json   # or --recovery-words
+```
+
+This signs a `rotate` whose manage policy is 2 of those devices' keys (named by device
+name, device id or `did:key`). It commits a new recovery key, saved as a file in the
+format the sign-up page downloads, unless `--next did:key:…` names one held elsewhere.
+The rotation reveals the old recovery key in the log, and it can't rotate again: the
+new one replaces it. Sign-in is unchanged; each device still signs in alone.
+
+The recovery key file:
+
+```json
+{ "kith": "recovery-key", "version": 1, "created": "2026-11-04T01:01:43.906Z",
+  "hub": "https://hub.example", "signer": "did:key:zDn…",
+  "private_key_jwk": { "kty": "EC", "crv": "P-256", "x": "…", "y": "…", "d": "…" } }
+```
+
+## 7.14 Not yet implemented
 
 - A page for the user to review and withdraw remembered consent (the admin API can).
 - Open client registration, and the registration management endpoint (RFC 7592).
@@ -981,6 +1086,8 @@ Limits:
 - Pushed authorization requests (PAR), DPoP-bound tokens.
 - `claims` request parameter; request objects (JAR).
 - TOTP enrollment from the browser (CLI only today).
-- Adding a passkey, and recovery with the recovery key, for an identity created in the
-  browser (§7.11); profile attributes and email verification for it.
+- Recovery with the recovery key from a browser, or from a machine that is not a device
+  of the identity (§7.11, §7.13); profile attributes and email verification for an
+  identity created in the browser.
+- Removing a device from the account page; joins that survive a hub restart.
 - Editing clients, and an audit log, through the admin API.

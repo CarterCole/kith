@@ -13,6 +13,7 @@ const MESSAGE: &str = include_str!("pages/message.html");
 const CONSENT: &str = include_str!("pages/consent.html");
 const LOGOUT: &str = include_str!("pages/logout.html");
 const WHOAMI: &str = include_str!("pages/whoami.html");
+const JOIN: &str = include_str!("pages/join.html");
 static BRAND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The name pages show to people. Letters, digits and spaces only, so it can sit in HTML
@@ -97,6 +98,10 @@ pub fn consent(data: Value) -> Response {
 
 pub fn whoami(data: Value) -> Response {
     render(StatusCode::OK, WHOAMI, &data)
+}
+
+pub fn join(data: Value) -> Response {
+    render(StatusCode::OK, JOIN, &data)
 }
 
 /// `scheme://host[:port]` of a URL, when it is plain enough to put in a CSP header.

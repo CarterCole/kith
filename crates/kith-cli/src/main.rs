@@ -7,6 +7,7 @@
 //! offline.
 
 mod bundle;
+mod join;
 mod keystore;
 mod names;
 mod org;
@@ -84,6 +85,10 @@ enum Cmd {
     /// keychain, or forget them.
     #[command(subcommand)]
     Keys(KeysCmd),
+    /// Who approves new devices and other changes (the manage policy), and changing it
+    /// with the recovery key (spec §7.13).
+    #[command(subcommand)]
+    Manage(ManageCmd),
     /// Rotate the manage key using the pre-committed recovery keys.
     Rotate {
         /// Also revoke every device (use after a compromise).
@@ -226,6 +231,45 @@ enum DeviceCmd {
         #[arg(long)]
         sig: String,
     },
+    /// Join an identity from this machine (spec §7.13). Makes this machine's key (in the
+    /// Secure Enclave when there is one) and prints a link and QR code; a browser signed
+    /// in to the hub adds it, and a manage signer approves it.
+    Join {
+        /// The hub that holds the identity, e.g. https://accounts.example.com.
+        #[arg(long, env = "KITH_HUB")]
+        hub: String,
+        /// Refuse to join any identity but this one.
+        #[arg(long)]
+        did: Option<String>,
+        /// This device's name in the identity's log, which is public (default: mac, or
+        /// computer).
+        #[arg(long)]
+        name: Option<String>,
+        /// `keychain` or `file` (default: keychain on macOS, file elsewhere).
+        #[arg(long)]
+        keystore: Option<String>,
+        /// Keep this device's key in software even when a Secure Enclave is available.
+        #[arg(long)]
+        no_secure_enclave: bool,
+        /// Ask for Touch ID on every signature by this device's Secure Enclave key, and
+        /// join at AAL3.
+        #[arg(long)]
+        touch_id: bool,
+        /// Don't try to open the browser; just print the link and QR code.
+        #[arg(long)]
+        no_open: bool,
+        /// Join without asking once an identity claims this device.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Approve a device that is joining this identity, with this device's key. The key
+    /// must be one of the identity's manage signers (`kith manage show`).
+    Approve {
+        /// The join link, or its id.
+        request: String,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Use an exported device on this machine.
     Import {
         file: PathBuf,
@@ -235,6 +279,37 @@ enum DeviceCmd {
     },
     Revoke {
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManageCmd {
+    /// Show who approves changes to this identity, by device name where they are devices.
+    Show,
+    /// Replace the manage policy with a rotation signed by the recovery key, e.g.
+    /// `kith manage set 2 passkey mac phone --recovery-key kith-recovery-key.json`.
+    /// Commits a new recovery key, saved as a file unless `--next` names one.
+    Set {
+        /// How many of the signers must approve.
+        threshold: usize,
+        /// Device names, device ids or did:keys.
+        #[arg(required = true)]
+        signers: Vec<String>,
+        /// The recovery key file the sign-up page downloaded, or an earlier
+        /// `kith manage set` saved.
+        #[arg(long, conflicts_with = "recovery_words")]
+        recovery_key: Option<PathBuf>,
+        /// Read the recovery phrase from standard input instead.
+        #[arg(long)]
+        recovery_words: bool,
+        /// Commit to this did:key as the next recovery key instead of making one.
+        #[arg(long, conflicts_with = "next_out")]
+        next: Option<String>,
+        /// Where to save the new recovery key (default: kith-recovery-key-<seq>.json here).
+        #[arg(long)]
+        next_out: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1255,6 +1330,52 @@ fn main() -> Result<()> {
             eprintln!("published");
         }
         Cmd::Device(DeviceCmd::List) => print(&json!(home.state()?.devices)),
+        Cmd::Device(DeviceCmd::Join {
+            hub,
+            did,
+            name,
+            keystore,
+            no_secure_enclave,
+            touch_id,
+            no_open,
+            yes,
+        }) => join::join(
+            &mut home,
+            join::JoinOpts {
+                hub,
+                did,
+                name,
+                keystore,
+                no_secure_enclave,
+                touch_id,
+                no_open,
+                yes,
+            },
+        )?,
+        Cmd::Device(DeviceCmd::Approve { request, yes }) => {
+            join::approve(&mut home, &request, yes)?
+        }
+        Cmd::Manage(ManageCmd::Show) => join::manage_show(&mut home)?,
+        Cmd::Manage(ManageCmd::Set {
+            threshold,
+            signers,
+            recovery_key,
+            recovery_words,
+            next,
+            next_out,
+            yes,
+        }) => join::manage_set(
+            &mut home,
+            join::ManageSet {
+                threshold,
+                signers,
+                recovery_key,
+                recovery_words,
+                next,
+                next_out,
+                yes,
+            },
+        )?,
         Cmd::Device(DeviceCmd::Add {
             name,
             key: Some(key),

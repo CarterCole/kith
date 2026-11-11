@@ -20,6 +20,8 @@ p256.workspace = true
 k256.workspace = true
 cedar-policy.workspace = true
 hmac = "0.12"
+# Recovery phrases are NFKD-normalized before they are stretched (spec §7.11).
+unicode-normalization = "0.1"
 sha1 = "0.10"
 skip_ratchet = { version = "0.3", features = ["serde"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }

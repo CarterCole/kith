@@ -30,7 +30,7 @@ pub(crate) fn current(h: &Hub, headers: &HeaderMap) -> Option<(SsoSession, KeySt
     Some((s, st))
 }
 
-fn challenge(h: &Hub) -> (String, String) {
+pub(crate) fn challenge(h: &Hub) -> (String, String) {
     let name = pages::brand();
     let (id, message, _) = h.new_challenge(None, |id, iat, exp| h.oidc_message(name, id, iat, exp));
     (id, message)

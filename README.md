@@ -81,6 +81,10 @@ kith init --hub https://hub.example          # root identity + this device + 2-o
 kith init --keystore file                    # or a plaintext identity.json (the default on Linux)
 kith keys list && kith keys migrate          # where each key lives; move a file-backed home into the keychain
 kith device add --name phone --kind passkey --out phone.json
+kith device join --hub https://hub.example   # join an identity made in the browser: approve this machine there
+                                             # (phones join by the QR code on the hub's account page)
+kith manage set 2 passkey mac phone --recovery-key kith-recovery-key.json   # who approves new devices
+kith device approve <link>                   # add this device's approval, when it is a manage signer
 kith login --aud api://invoices --totp 123456
 curl -H "authorization: Bearer $(kith token --aud api://invoices)" https://api.example/graphql …
 kith alias new gaming && kith alias prove gaming --aud https://shop.example

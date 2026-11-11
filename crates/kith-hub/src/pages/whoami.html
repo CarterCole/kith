@@ -24,8 +24,10 @@
     </div>
     <ul id="items" class="items mt"></ul>
     <div class="stack">
+      <button id="add" class="primary" type="button">Add a device</button>
       <button id="logout" class="secondary" type="button">Sign out</button>
     </div>
+    <p class="note">To add a computer from its terminal, run <code>kith device join --hub <span id="hub"></span></code> there and open the link it prints.</p>
   </div>
   <div id="status" class="status" role="status" aria-live="polite"></div>
 </main>
@@ -67,6 +69,15 @@ if (D.signed_in) {
     catch { status("Couldn't copy. Select the identity above instead.", "error"); }
   };
   $("logout").onclick = () => location.assign("/oauth/logout");
+  $("hub").textContent = location.origin;
+  // A phone (or any other browser) joins by scanning the QR code on the next page.
+  $("add").onclick = async () => {
+    $("add").disabled = true;
+    const r = await postJSON("/v1/join/invite", {});
+    $("add").disabled = false;
+    if (r.ok) return location.assign(`/join/${r.body.id}`);
+    status(r.body.error_description || "Couldn't start adding a device.", "error");
+  };
 } else {
   $("signed-out").classList.remove("hidden");
   if (D.signup) $("signup").classList.remove("hidden");

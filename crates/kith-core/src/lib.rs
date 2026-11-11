@@ -34,6 +34,7 @@ pub mod keys;
 pub mod ots;
 pub mod pdag;
 pub mod policy;
+pub mod recovery;
 pub mod resolve;
 pub mod revoke;
 pub mod session;

@@ -72,6 +72,11 @@
     makes a passkey and a recovery key, and is linked to the new identity and signed in
     ([spec §7.11](../spec/07-oidc.md)). Verified in headless Chrome against a mock
     OpenID Connect provider, not yet against Google or any real one.
+  - Joining devices ([spec §7.13](../spec/07-oidc.md)): `kith device join` from a
+    terminal, or a phone by the QR code on the account page; manage signers approve
+    in the browser or with `kith device approve` until the manage policy is met, and
+    `kith manage set` uses the recovery key (file or words) to change that policy.
+    Verified in headless Chrome with the real CLI (`scripts/join-demo.sh`).
   - Proof of work as an account score: `POST /v1/work`, the `work` token attribute,
     mining in the sign-up page and `kith work` ([spec §7.12](../spec/07-oidc.md)).
   - Upstream OIDC providers as a login factor, starting with Telegram Login
@@ -180,9 +185,12 @@
   good file replaces it (the stats report it; a revocation acts at once). The editor
   cannot rename a set, and its `Apply` from raw JSON refuses keys written twice rather
   than showing them. The §9 schemas are not checked.
-- **Browser accounts.** An identity made at `/signup` has one passkey, which is also
-  its manage key, so it can't add another device, and nothing yet uses its recovery
-  key. It has no name or email attribute. Sign-up is open to anyone who reaches the
+- **Browser accounts.** An identity made at `/signup` starts with one passkey as its
+  manage key. Devices join through §7.13, and the recovery key can change the manage
+  policy only from a device that has joined: there is no recovery from a browser, or
+  from a machine that isn't yet a device. Join requests live in memory and end with a
+  hub restart, and the account page can't remove a device. It has no name or email
+  attribute. Sign-up is open to anyone who reaches the
   hub and is only rate limited per address ([spec §7.11](../spec/07-oidc.md)).
 - **Provider sign-up.** Links made at sign-up live in the hub's store, not the identity's
   log, and can't be removed or added to from a session. Attributes (name, email) are

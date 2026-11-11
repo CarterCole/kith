@@ -29,6 +29,7 @@
 //! | `POST, GET, DELETE /v1/contacts`, `POST /v1/contacts/confirm`, `PUT /v1/contacts/public` | verified email and phone contacts (bearer; see [`contacts`]) |
 //! | `GET  /v1/contacts/lookup`                | who holds a published contact, signed           |
 //! | `POST /v1/enroll`, `GET /enroll/{id}`     | enroll a browser passkey as a device            |
+//! | `POST /v1/join`, `/v1/join/invite`, `GET /join/{id}` | join a device, from a terminal or by QR code, approved by manage signers (see [`join`]) |
 //! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
 //! | `/v1/admin/…`                             | identities, sessions, consent, clients, TOTP resets and the bundle in force, for the operator (see [`admin`]) |
 //!
@@ -42,10 +43,12 @@ pub mod account;
 pub mod admin;
 pub mod contacts;
 pub mod enroll;
+pub mod join;
 pub mod jwe;
 pub mod oidc;
 pub mod org;
 pub mod pages;
+pub mod qr;
 pub mod signup;
 pub mod store;
 pub mod upstream;
@@ -128,6 +131,8 @@ pub struct HubConfig {
     pub signup: bool,
     /// Sign-up attempts allowed per client address.
     pub signup_limit: RateLimit,
+    /// Join requests a terminal may open per client address (spec §7.13).
+    pub join_limit: RateLimit,
     /// Proofs of work submitted per client address (spec §7.12).
     pub work_limit: RateLimit,
     /// Verified email addresses and phone numbers (spec 7.8.2): how codes are sent,
@@ -171,6 +176,10 @@ impl HubConfig {
             signup: false,
             signup_limit: RateLimit {
                 max: 5,
+                window_secs: 3600,
+            },
+            join_limit: RateLimit {
+                max: 20,
                 window_secs: 3600,
             },
             work_limit: RateLimit {
@@ -246,6 +255,7 @@ pub struct Hub {
     pub store: store::Store,
     pub(crate) enrollments: Mutex<HashMap<String, enroll::Enrollment>>,
     pub(crate) signups: Mutex<HashMap<String, signup::Attempt>>,
+    pub(crate) joins: Mutex<HashMap<String, join::Join>>,
     pub(crate) upstream: Mutex<upstream::UpstreamState>,
     pub(crate) http: reqwest::Client,
     pub orgs: org::Orgs,
@@ -456,6 +466,7 @@ impl Hub {
             store,
             enrollments: Mutex::new(HashMap::new()),
             signups: Mutex::new(HashMap::new()),
+            joins: Mutex::new(HashMap::new()),
             upstream: Mutex::new(upstream::UpstreamState::default()),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
@@ -1400,6 +1411,15 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/enroll/{id}/event", post(enroll::submit_event))
         .route("/v1/enroll/{id}/sig", post(enroll::submit_sig))
         .route("/enroll/{id}", get(enroll::page))
+        .route("/v1/join", post(join::start))
+        .route("/v1/join/invite", post(join::invite))
+        .route("/v1/join/{id}", get(join::status))
+        .route("/v1/join/{id}/claim", post(join::claim))
+        .route("/v1/join/{id}/device", post(join::submit_device))
+        .route("/v1/join/{id}/approve", post(join::approve))
+        .route("/v1/join/{id}/pop", post(join::pop))
+        .route("/join/{id}", get(join::page))
+        .route("/join/{id}/qr.svg", get(join::qr_svg))
         .route("/", get(home))
         .route("/whoami", get(account::page).post(account::login))
         .route(
