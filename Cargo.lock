@@ -2519,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "kith-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "kith-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "bls12_381",
@@ -2573,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "kith-hub"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

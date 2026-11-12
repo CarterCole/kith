@@ -4,7 +4,7 @@ Kith is a draft. The format will change until v1, so entries record what changed
 behaviour, not a promise about compatibility. Versions follow the workspace version in
 `Cargo.toml`.
 
-## Unreleased
+## 0.3.0 (2026-11-11)
 
 ### Added
 
