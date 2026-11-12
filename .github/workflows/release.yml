@@ -1,15 +1,19 @@
 # Push a tag like v0.2.0 to publish a release: an archive for every platform
-# on the GitHub release, and the Homebrew formula in the tap, so that
+# and a .deb for each Linux one on the GitHub release, the Homebrew formula in
+# the tap, and a rebuild of the apt repository, so that
 #
 #   brew install cartercole/tap/kith
+#   sudo apt install kith        # after adding apt.cartercole.net
 #
-# installs it. Homebrew downloads the archives without credentials, so the
-# release has to be on a public repository. The tag has to match the workspace
-# version in Cargo.toml, which is what `kith --version` prints.
+# install it. Homebrew and the apt repository's build download the release
+# without credentials, so the release has to be on a public repository. The tag
+# has to match the workspace version in Cargo.toml, which is what
+# `kith --version` prints.
 #
-# Needs a repository secret HOMEBREW_TAP_DEPLOY_KEY: the private half of an
-# SSH deploy key with write access to CarterCole/homebrew-tap, and nothing
-# else.
+# Needs two repository secrets, each the private half of an SSH deploy key with
+# write access to one repository and nothing else:
+#   HOMEBREW_TAP_DEPLOY_KEY  CarterCole/homebrew-tap
+#   APT_REPO_DEPLOY_KEY      CarterCole/apt
 name: release
 
 on:
@@ -74,10 +78,21 @@ jobs:
       - name: Build
         run: packaging/archive.sh ${{ matrix.target }}
 
+      # The same binary as the archive, packaged by crates/kith-cli's
+      # [package.metadata.deb]. Each Linux runner builds for its own
+      # architecture, which lets cargo-deb work out Depends from the binary.
+      - name: Debian package
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb --version 3.8.0 --locked
+          cargo deb -p kith-cli --target ${{ matrix.target }} --no-build --output dist/release/
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.target }}
-          path: dist/release/*.tar.gz
+          path: |
+            dist/release/*.tar.gz
+            dist/release/*.deb
 
   release:
     needs: build
@@ -94,7 +109,7 @@ jobs:
 
       - name: Checksums and the Homebrew formula
         run: |
-          (cd dist/release && shasum -a 256 *.tar.gz > checksums.txt)
+          (cd dist/release && shasum -a 256 *.tar.gz *.deb > checksums.txt)
           KITH_REPO="$GITHUB_REPOSITORY" packaging/homebrew/formula.sh "${GITHUB_REF_NAME#v}" \
             "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" dist/release \
             > dist/release/kith.rb
@@ -104,7 +119,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
-            dist/release/*.tar.gz dist/release/checksums.txt
+            dist/release/*.tar.gz dist/release/*.deb dist/release/checksums.txt
 
       - name: Update the Homebrew tap
         env:
@@ -126,3 +141,30 @@ jobs:
           git add Formula/kith.rb
           git commit -m "kith ${GITHUB_REF_NAME#v}"
           git push
+
+      # CarterCole/apt rebuilds apt.cartercole.net from the .debs on the
+      # releases of every project it lists; a push to it starts that build.
+      - name: Update the apt repository
+        env:
+          DEPLOY_KEY: ${{ secrets.APT_REPO_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          APT_REPO: CarterCole/apt
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/apt_key
+          chmod 600 ~/.ssh/apt_key
+          gh api meta --jq '.ssh_keys[]' | sed 's/^/github.com /' >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/apt_key -o IdentitiesOnly=yes"
+          git clone --depth 1 "git@github.com:$APT_REPO.git" apt
+          echo "$GITHUB_REPOSITORY $GITHUB_REF_NAME" > apt/projects/kith
+          cd apt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add projects/kith
+          git commit -m "kith ${GITHUB_REF_NAME#v}"
+          # Another project's release may have pushed in the meantime.
+          for try in 1 2 3; do
+            git push && exit 0
+            git pull --rebase
+          done
+          exit 1

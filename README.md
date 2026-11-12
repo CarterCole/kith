@@ -54,8 +54,18 @@ On a Mac, or on Linux with Homebrew:
 brew install cartercole/tap/kith
 ```
 
-Each release also carries archives for macOS and Linux on ARM64 and x86-64. To build
-it yourself you need a recent stable Rust: `cargo install --path crates/kith-cli`.
+On Debian 12+ or Ubuntu 22.04+ (x86-64 or ARM64), from the apt repository at
+[apt.cartercole.net](https://apt.cartercole.net). The first line adds the repository
+and its signing key; after that `apt upgrade` keeps kith current:
+
+```bash
+sudo curl -fsSLo /etc/apt/sources.list.d/cartercole.sources https://apt.cartercole.net/cartercole.sources
+sudo apt update && sudo apt install kith
+```
+
+Each release also carries the .deb files, and archives for macOS and Linux on ARM64 and
+x86-64. To build it yourself you need a recent stable Rust:
+`cargo install --path crates/kith-cli`.
 
 ## Try it
 

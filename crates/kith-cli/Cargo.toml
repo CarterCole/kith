@@ -1,6 +1,7 @@
 [package]
 name = "kith-cli"
-description = "The kith command line"
+description = "The kith command line and hub: universal identity and authorization"
+homepage = "https://github.com/CarterCole/kith"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +9,31 @@ license.workspace = true
 [[bin]]
 name = "kith"
 path = "src/main.rs"
+
+# The Debian package, for the apt repository at apt.cartercole.net. The release
+# workflow builds it on each Linux runner with
+# `cargo deb -p kith-cli --target <target> --no-build` after packaging/archive.sh,
+# so the .deb holds the same binary as the archive. Depends is worked out from the
+# binary's shared libraries (glibc 2.35 or newer for a binary built on Ubuntu 22.04).
+[package.metadata.deb]
+name = "kith"
+maintainer = "Carter Cole <carter@cartercole.com>"
+copyright = "2026 Carter Cole"
+section = "utils"
+priority = "optional"
+extended-description = """\
+Kith gives a person one self-certifying root identity (did:kith), controlled by a \
+policy over passkeys, hardware keys, wallets, SSH and software keys, with devices, \
+sessions, aliases and delegation under it. This package has the kith command line \
+and the reference hub (kith hub serve).
+
+On Linux the keys sit in plaintext in ~/.kith/identity.json (mode 0600), the only \
+keystore backend there. Kith is a draft spec with a reference implementation, not \
+production ready."""
+assets = [
+    ["target/release/kith", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/kith/README.md", "644"],
+]
 
 [features]
 # Send verification codes through Amazon SES and AWS End User Messaging SMS.
