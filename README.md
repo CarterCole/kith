@@ -121,6 +121,14 @@ kith totp reset [--code 123456]              # forget the authenticator (a curre
 kith contact add ada@example.com             # the hub sends a code; private unless you publish it
 kith contact confirm ada@example.com 123456  # apps with scope email (or phone) get it, with a signed attestation
 kith contact publish ada@example.com         # anyone can `kith contact lookup` it; `unpublish` withdraws
+kith domain records example.com              # what to publish: a TXT record, a CNAME or an HTML file that names your DID
+kith domain verify example.com [--method txt|cname|html]   # the hub looks; you now hold dns:example.com (scope `domain`)
+kith domain attest example.com --did acme    # ask any hub to look for a DID's proof (an org's too) and sign what it saw
+kith namespace add ada@example.com --to ada  # a domain you hold gives out a name; the hub answers WebFinger for it
+kith alias link mailto:ada@example.com       # she links it too, and then it resolves (both sides must agree)
+kith finger ada@example.com                  # find it through the hub's WebFinger, then check her log links it back
+kith whoami --full                           # your log, devices, sessions and recovery state; the paper keys this machine holds
+curl https://hub.example/v1/profile/did:kith:…   # the public view: what the log makes public, no token
 kith hub serve --email-from no-reply@example.com --sms-from +15555550199   # send codes with SES and End User Messaging (build with --features aws)
 ```
 
@@ -206,8 +214,8 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 | Path | What |
 |------|------|
 | `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
-| `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, bundle file checks, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
-| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email and phone contacts, OpenID Connect provider with passkey login and enrollment pages, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
+| `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, bundle file checks, verified-domain proofs, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
+| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email, phone and domain contacts (TXT, CNAME or HTML-file proof, witnessed by any hub), OpenID Connect provider with passkey login and enrollment pages, public profile and `whoami` views, names in a verified domain with WebFinger, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
 | `crates/kith-cli` | `kith` binary, including the local bundle editor (`kith bundle edit`) |
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |

@@ -48,7 +48,7 @@ the only way to read the spec.
 | 4 | [Authorization](04-authorization.md) | policy bundles, explicit/nested/dynamic groups, roles, Cedar mapping, GraphQL mapping |
 | 5 | [Aliases](05-aliases.md) | public and private aliases, proving the link on demand, resolving a public alias through WebFinger, DNS or did:web back-links, local names for roots |
 | 6 | [Vault](06-vault.md) | crypto-enforced access: skip ratchets, WNFS relationship |
-| 7 | [OpenID Connect](07-oidc.md) | "Sign in with Kith": code + PKCE, passkey login page, SSO, step-up, pairwise subjects, browser passkey enrollment, upstream providers (Telegram) |
+| 7 | [OpenID Connect](07-oidc.md) | "Sign in with Kith": code + PKCE, passkey login page, SSO, step-up, pairwise subjects, browser passkey enrollment, browser sign-up and joining devices, verified contacts and domains, names in a domain, profile and whoami, upstream providers (Telegram) |
 | 8 | [Policy DAG, revocations, freshness](08-policy-dag.md) | bundles as content-addressed blocks, provable slices, org policy roots, signed revocation chains, beacon heartbeats (drand, NIST 2.0), degraded mode, OpenTimestamps anchoring |
 | 9 | [Schemas & namespaces](09-schemas.md) | **draft, not implemented:** a Cedar schema per audience, audience namespaces, publish-time validation of policies, schema blocks in the DAG |
 | 10 | [Delegated administration](10-delegated-administration.md) | **draft.** Provenance claims (`org`, `pol`) and `kith policy why` are implemented. Not yet: grants that let another identity manage some sets, signed delegated roots, chain validity, fail-closed builder rules |
@@ -112,7 +112,7 @@ An implementation claims one or more profiles:
 | **Verifier** | The above, plus KEL replay (§1.6), session-chain verification (§3.3), and alias proofs (§5). |
 | **Hub** | The above, plus the endpoints of §2, §3.4 and §7. |
 | **Wallet / agent** | Create and sign KEL events, grants, session tokens and delegations. |
-| **Attestation consumer** | Verify account and contact attestations (§7.8.1, §7.8.2). Pass `test-vectors/attestations.json`. |
+| **Attestation consumer** | Verify account, contact and domain attestations (§7.8.1, §7.8.2, §7.8.3). Pass `test-vectors/attestations.json`. |
 
 Current implementations:
 

@@ -77,7 +77,7 @@ fn ok(v: Value) -> Response {
     r
 }
 
-fn session_json(s: &SsoSession) -> Value {
+pub(crate) fn session_json(s: &SsoSession) -> Value {
     json!({
         "sid": s.id,
         "did": s.authn.st.did,

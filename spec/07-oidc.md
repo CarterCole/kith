@@ -339,6 +339,7 @@ Scoped claims (ID token and userinfo):
 | `profile` | `name`, `preferred_username` |
 | `email` | `email`, `email_verified` (from a verified contact if nothing else gives one, §7.8.2) |
 | `phone` | `phone_number`, `phone_number_verified` (from a verified contact, §7.8.2) |
+| `domain` | no claim: one `domain` attestation per fresh verified domain, in `contact_attestations` (§7.8.3) |
 | `groups` | `groups`, `roles` (computed from the policy bundle, §4.3) |
 
 `sid` identifies the hub session to the client, for logout (§7.6). It is a separate
@@ -711,6 +712,173 @@ Not yet implemented:
   the browser (CLI only today).
 - Voice calls, and delivery receipts.
 
+### 7.8.3 Verified domains (TXT, CNAME or HTML file)
+
+An identity, a person's or an org's, can prove it controls a domain the way a site proves
+it to Google or Bing: by publishing something only the domain's owner can publish. The
+hub looks, and attests what it saw, as it does for a contact (§7.8.2). Because the proof
+**names the identity**, nobody has to take the hub's word for it: any party can look at
+the same records, and any hub can sign what it saw.
+
+**The proof.** For identity `did` and domain `example.com` (lower case ASCII; an
+internationalised name is written `xn--…`; IP addresses, single labels and reserved names
+such as `localhost`, `.local` and `.internal` are refused), one of:
+
+| Method | Publish | Accepted when |
+|--------|---------|---------------|
+| `txt`   | a TXT record at `_kith-challenge.example.com` with the value `kith-domain-verification=<did>` | a record is exactly that value (a longer DID that begins with it does not count) |
+| `cname` | a CNAME at `_kith-<h16>.example.com` pointing at `<h32>.dv.kith.invalid` | the CNAME has that target (case and the trailing dot are ignored) |
+| `html`  | a file at `https://example.com/kith-<h16>.html` containing `kith-domain-verification=<did>` | the response is `200` and some whitespace- or markup-delimited word of the first 16 KiB is that value |
+
+`h16` and `h32` are the first 16 and 32 hex digits of SHA-256 of the DID's UTF-8 bytes
+(a DNS label cannot hold a DID, and a CNAME has only its name and target to carry one).
+`.invalid` is never delegated, so the CNAME target belongs to no hub and every verifier
+reads the same record. The file name carries only `h16`, so a site that echoes the request
+path into a "not found" page cannot be made to print the whole proof. A CNAME is for hosts
+whose DNS panel does not allow a TXT record at the name; any one method is enough.
+
+`kith_core::domain` implements the names and the checks with no network, and
+`GET`-ing the same URLs yourself is a complete verifier. A domain proves only itself:
+`example.com` says nothing about `www.example.com`, or the reverse.
+
+**Proving it to the hub.** Both take a hub bearer token (`aud` = issuer):
+
+| Request | Effect |
+|---------|--------|
+| `POST /v1/domains` `{"domain"}` | What to publish for the caller's DID: `{domain, did, methods: {txt: {type, name, value}, cname: {type, name, value}, html: {url, body}}}`. Nothing is stored and nothing is looked up. |
+| `POST /v1/domains/verify` `{"domain", "method"?}` | Looks for the proof (all allowed methods in the order txt, cname, html, or the one named). Found: the caller holds `dns:example.com` as a contact and the answer is the contact (§7.8.2) plus `method`. Not found: `422 verification_failed` with `checked`, one `{method, ok, why}` per method tried. Rate limited per identity and per client address (`verify_limit`, default 10 an hour each); a limited call looks nothing up |
+
+A verified domain is a contact whose address is `dns:example.com` and whose `kind` is
+`domain`, so `GET /v1/contacts`, `PUT /v1/contacts/public`, `DELETE /v1/contacts` and the
+public `GET /v1/contacts/lookup?address=dns:example.com` work as in §7.8.2, with these
+differences:
+
+- **Proved by a record, not a code.** `POST /v1/contacts` refuses a `dns:` address.
+- **Freshness.** `max_age` defaults to 90 days (domains change hands). A stale domain
+  stays listed and is attested again after another `verify`, which keeps its
+  publication if the same identity proves it.
+- **Takeover.** Whoever proves a domain last holds it, and the earlier holder's
+  publication ends. If DNS names two identities, whichever verified last holds it here.
+- **Release.** Only with the `domain` scope, and only as attestations in
+  `contact_attestations` (`provider: "domain"`, `account: "dns:example.com"`); never as
+  an ID-token claim, and never in an access token. The `email` and `phone` scopes do not
+  release domains.
+
+**Witnesses.** `GET /v1/domains/attest?domain=…&did=…` needs no token and no account.
+The hub looks for `did`'s proof exactly as above and, if it finds one, answers
+
+```json
+{ "domain": "dns:example.com", "did": "did:kith:…", "method": "txt",
+  "verified_at": 1799999970,
+  "attestation": "<kith-account+jwt, provider \"domain\", aud urn:kith:public, sub the DID>" }
+```
+
+The attestation verifies as in §7.8.1 (the audience is `urn:kith:public`). It lasts 10
+minutes: it says what this hub saw just now, so a relying party that wants a later answer
+asks again, and nothing is stored. The DID is only a string here (an org's usually has
+no account on the hub), so a witness says "this domain publishes a proof naming this
+DID", not that the DID's KEL is valid; check that separately (§1). **Several hubs can
+witness one claim**, each signing with its own key. A relying party lists the hubs it
+trusts and decides how many must agree. A claim signed by a hub it does not trust, or by
+one hub only, is as strong as that hub.
+
+A hub MAY accept only some methods (`methods`): a file on a shared host is a weaker proof
+than a DNS record, and an operator who thinks so leaves `html` out.
+
+**What the hub's lookups guard against.** The domain is the caller's input, so the hub is
+making requests a stranger steers. The reference hub fetches the HTML file only over
+HTTPS on port 443, from an address it resolved itself and checked is public (not
+loopback, private, link-local, carrier-grade NAT, unique-local, multicast, or IPv4 inside
+IPv6), connecting to exactly that address; follows no redirect; gives up after 10 seconds;
+and reads at most 16 KiB. Names that are IP addresses or reserved are refused before any
+lookup. DNS answers are not DNSSEC-validated.
+
+Not yet implemented:
+- Methods without a hub. `kith domain attest` asks a hub to look; a verifier that wants
+  no hub reads the records itself with `kith_core::domain` (Rust only today; no JS or
+  Python helper, and no shared vectors).
+- Subdomain and wildcard rules, and a public-suffix list: `co.uk` cannot be proved only
+  because no one can publish there.
+- Organisation-level proofs by a signed statement from an existing domain proof's holder
+  (an org proving a domain through a member's proof).
+- An app asking the hub to check a domain again during sign-in; verification is CLI only.
+- Continuity: the hub knows when it last saw the proof, not that it was there all along.
+
+### 7.8.4 Names in a verified domain
+
+Whoever holds `dns:example.com` (§7.8.3) can give out names under it, `ada@example.com`,
+and the hub answers WebFinger for them. This is the back-link of §5.1.1 for a domain that
+runs no WebFinger server of its own: the domain says "`ada@example.com` is this root", and
+the root's log has to say "I link `ada@example.com`". Neither alone resolves, so a domain
+cannot claim a person, and a person cannot claim a domain's name.
+
+The holder uses a hub bearer token (`aud` = issuer); a call from an identity that does not
+hold the domain, fresh, is `403`. The holder is the identity that ran `kith domain verify`,
+so an org whose proof is made by a member (§7.8.3, not yet implemented) cannot do this yet.
+
+| Request | Effect |
+|---------|--------|
+| `PUT /v1/namespaces/{domain}/{local}` `{"did"}` | Gives the name to that root, replacing whoever had it. The DID must have a log on this hub (the answer says this hub serves it). Answers `{alias, domain, local, did, held_by, linked, created}`; `linked` says whether the root's log already links the alias. `409` past 1000 names from one holder under one domain. |
+| `DELETE /v1/namespaces/{domain}/{local}` | Takes the name back. The holder may remove any name under the domain, including one a former holder gave. `404` if there is none. |
+| `GET /v1/namespaces/{domain}` | The names the caller gave out, with `linked`. A list of people is not public, so it is the holder's alone. |
+| `GET /.well-known/webfinger?resource=acct:ada@example.com[&rel=…]` | The JRD below. No token. |
+
+**The name.** `acct:{local}@{domain}`; `mailto:` and the bare address name the same alias
+(§5.1.1). `local` is 1 to 64 of `a-z`, `0-9`, `.`, `_`, `+` and `-`, starting with a letter
+or digit, lower case only: one spelling, so the string the hub returns is the string the
+log links. The domain is lower-cased as in §7.8.3. A name has one root.
+
+**The answer.**
+
+```json
+{ "subject": "acct:ada@example.com",
+  "links": [
+    { "rel": "urn:kith:root", "href": "did:kith:…",
+      "properties": { "urn:kith:hub": "https://hub.example" } },
+    { "rel": "http://webfinger.net/rel/profile-page", "type": "application/json",
+      "href": "https://hub.example/v1/profile/did:kith:…" } ] }
+```
+
+It is served as `application/jrd+json` with `Access-Control-Allow-Origin: *` (RFC 7033 §5)
+and `Cache-Control: public, max-age=60`. `rel` (repeatable) keeps only the links of those
+relations; the subject stays. A `resource` that is absent, not a URI, or an `acct:` or
+`mailto:` without a user is `400` (RFC 7033 §4.2); one the hub holds nothing for, or whose
+host it cannot hold, is `404`, whether the name never existed, was removed, or lost its holder.
+
+**A name is live only while its giver holds the domain.** The hub serves a name, and shows
+it anywhere, only if the identity that gave it holds the domain now and its verification is
+fresh (§7.8.3). When the domain changes hands, or goes unchecked past `max_age`, its names
+stop answering at once; nothing is deleted, so they return if that identity proves the
+domain again. The new holder starts with an empty list, and a name a former holder gave
+stays stored (and unserved) until the holder replaces or removes it.
+
+**Both sides on the profile.** `GET /v1/whoami` (§7.14) lists, as `namespaces`, every live
+name that points at the caller: `{alias, domain, held_by, linked}`, including names the
+caller has not linked yet, so an offer is visible. `GET /v1/profile/{did}` lists only the
+names whose root links them, which is the proof anyone can check: the domain's holder and
+the root's own log agree. The profile path also takes such a name, in any of its spellings
+(`/v1/profile/ada@example.com`), and answers `404` unless the name is live and linked.
+
+**Being found.** A resolver (§5.1.1) asks the alias's own host, so the domain sends
+`/.well-known/webfinger` to the hub, as sites that host their WebFinger elsewhere do:
+
+```
+location = /.well-known/webfinger { return 307 https://id.example.com$request_uri; }
+```
+
+Resolvers follow the redirect (RFC 7033 §4.1). Without one, `kith finger ada@example.com
+--hub https://id.example.com` asks the hub directly, then checks the root's log as
+`kith resolve` does. The root links the name as any alias: `kith alias link
+mailto:ada@example.com`.
+
+Not yet implemented:
+- Names for an org, or given by an identity without a hub account (see §7.8.3).
+- Subdomain and wildcard names, and handles outside a verified domain (`/u/ada` on the hub
+  itself, with no domain behind it).
+- A name that points at a root whose log another hub serves.
+- Deleting names whose giver lost the domain; they are only unserved.
+- `aliases`, `titles` and `properties` beyond the two links above in the JRD.
+
 ## 7.9 Deployment notes
 
 - **State.** The data directory (`--data`, default `.kith-hub`) holds:
@@ -1078,7 +1246,41 @@ The recovery key file:
   "private_key_jwk": { "kty": "EC", "crv": "P-256", "x": "…", "y": "…", "d": "…" } }
 ```
 
-## 7.14 Not yet implemented
+## 7.14 Profile and whoami
+
+One identity's key event log, devices, sessions and recovery state in one place. The hub
+builds both views from the KEL it stores, so a mirror can check them against
+`GET /v1/kel/{did}`.
+
+These are the API's views, as JSON. The browser's account page is `GET /whoami` (§7.11).
+
+| Method, path | Who | Does |
+|--------------|-----|------|
+| `GET /v1/profile/{did}` | anyone, no token | What the log already makes public: `did`, `state` (the folded key state: `manage`, `next`, active `devices`, `revoked`, `aliases`), `events`, `recovery` and `namespaces` (names in verified domains that the domain and the root both vouch for, §7.8.4). `404` for a DID the hub has no log for. |
+| `GET /v1/whoami` | the owner, with a hub access token (`aud` = issuer, no actor, §2.3) | The same, plus what only the hub holds: `token` (the claims that asked), `sessions` and, in `recovery`, `totp` and `cosigner`. `Cache-Control: no-store`. |
+
+* `events` are oldest first. Each has `seq`, `ts`, `kind`, `digest`, `signers` (the signer
+  ids that signed it) and `detail` (the rest of the event, such as the device added or the
+  reason for a revocation).
+* `sessions` are the caller's own live hub sessions, in the shape of the admin API's (§7.10):
+  `sid`, `device`, `alias`, `aal`, `amr`, `auth_time`, `expires`, `clients`. Never the cookie.
+* `recovery.next` is the hash of the rotation policy the log has committed to (§1.5), and
+  `recovery.rotations` lists each rotation so far with the policy it revealed, the signers
+  that signed it and whether it revoked every device. `recovery.totp` is `{enrolled,
+  locked_until}` and `recovery.cosigner` is the co-signer's signer id, or `null` when
+  none was ever asked for. Looking creates neither.
+* The rule for what is public: anything derived from the KEL is public already, and
+  nothing else is. No TOTP seed, cookie, code or refresh token is in either view.
+
+**The hub cannot list recovery ("paper") keys.** `next` is a hash until a rotation uses
+it, so the log and the hub know only the policies that were already spent. The machine
+that holds the keys can say more: `kith whoami --full` fetches `/v1/whoami` and adds
+`this_machine` (this device and every private key held here, from `kith keys list`) and
+`recovery.this_machine`: whether the rotation policy stored here hashes to `next`
+(`matches_next`), its `policy_signers`, and which of them are `held_here`. A `false` means
+the keys here are not the ones the log commits to.
+
+## 7.15 Not yet implemented
 
 - A page for the user to review and withdraw remembered consent (the admin API can).
 - Open client registration, and the registration management endpoint (RFC 7592).
@@ -1096,3 +1298,9 @@ The recovery key file:
   identity created in the browser.
 - Removing a device from the account page; joins that survive a hub restart.
 - Editing clients, and an audit log, through the admin API.
+- A profile page for people (HTML), and hub-local handles such as `/u/ada`. The public view
+  lists no other proofs yet: public aliases whose back-links the hub checked (§5.1),
+  verified domains (§7.8.3), published contacts (§7.8.2). Names in a verified domain
+  (§7.8.4) are the one proof it lists. It lists no orgs or groups the identity
+  belongs to (§8, §10) either.
+- Ending your own sessions; today only the operator can (§7.10).

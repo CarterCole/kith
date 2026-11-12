@@ -4,6 +4,27 @@ Kith is a draft. The format will change until v1, so entries record what changed
 behaviour, not a promise about compatibility. Versions follow the workspace version in
 `Cargo.toml`.
 
+## Unreleased
+
+### Added
+
+- **Verified domains** (spec §7.8.3). An identity or an org proves it controls a domain
+  with a TXT record, a CNAME or an HTML file that names its DID (`kith domain
+  records|verify|attest`). Any hub can witness the proof for any DID and sign what it saw
+  (`GET /v1/domains/attest`). A verified domain is a `dns:` contact, released to apps with
+  the `domain` scope as an attestation.
+- **Names in a verified domain** (spec §7.8.4). Whoever holds `dns:example.com` gives out
+  `ada@example.com` (`kith namespace add|remove|list`) and the hub answers WebFinger for
+  it. It resolves only when the root's own log links the alias too; `kith finger` does
+  both lookups.
+- **Profile and whoami** (spec §7.14). `GET /v1/profile/{did}` (public) and
+  `GET /v1/whoami` (a hub token) show an identity's log with who signed each event, its
+  devices and its recovery history; `whoami` adds the caller's sessions, TOTP and
+  co-signer. `kith whoami --full` adds the keys this machine holds and whether its
+  recovery policy hashes to `next`.
+- **Linux packages.** Each release attaches a .deb per Linux archive (x86-64 and ARM64),
+  and apt.cartercole.net serves them: `sudo apt install kith` after the README's setup.
+
 ## 0.3.0 (2026-11-11)
 
 ### Added

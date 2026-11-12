@@ -56,6 +56,9 @@ The back-link is one of:
   resolver asks its own hub. Several such links MAY be present, and each is checked.
   Only a root that links the alias back counts, and at most one may (step 3 below), so
   a handover lists only the new root, or the old root unlinks the alias first.
+  A domain that runs no WebFinger server can have a hub answer for it: the hub gives out
+  names to whoever holds a verified domain (§7.8.4), and the domain redirects
+  `/.well-known/webfinger` there.
 - **DNS**: a TXT record at `_kith.{host}` reading `did=did:kith:…`, optionally
   followed by `;hub=https://hub.example`. It vouches for the host's own aliases,
   `https://{host}` and `did:web:{host}`, and not for accounts at the host.

@@ -20,6 +20,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 aes-gcm = "0.10"
 p256 = { workspace = true, features = ["ecdh"] }
 reqwest.workspace = true
+hickory-resolver.workspace = true
 tokio-stream = { version = "0.1", features = ["sync"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 # QR codes for join links, as SVG on the pages and as text in the terminal.

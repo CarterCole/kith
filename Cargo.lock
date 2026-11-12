@@ -2582,6 +2582,7 @@ dependencies = [
  "aws-sdk-sesv2",
  "axum",
  "base64 0.22.1",
+ "hickory-resolver",
  "hmac 0.12.1",
  "http-body-util",
  "kith-core",

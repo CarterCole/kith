@@ -43,13 +43,14 @@ const KNOWN = {
   profile: () => item("Your name", C.name || C.preferred_username || "not set"),
   email: () => item("Your email address", C.email || "not set"),
   phone: () => item("Your phone number", C.phone_number || "not set"),
+  domain: () => item("Domains you have proved you control", list((C.contact_attestations || []).filter((a) => a.startsWith("dns:")).map((a) => a.slice(4)))),
   groups: () => { item("Your groups", list(C.groups)); item("Your roles", list(C.roles)); },
   linked_account: () => item("The account you signed in with", C.linked_account || "none"),
   offline_access: () => item("Access while you are away", "Ends when the device or account you signed in with is revoked"),
 };
 for (const s of D.scopes) (KNOWN[s] || (() => item("Scope", s)))();
 if (Array.isArray(C.contact_attestations) && C.contact_attestations.length) {
-  item("A signed statement that this hub checked", list(C.contact_attestations.map((a) => a.replace(/^(mailto|tel):/, ""))));
+  item("A signed statement that this hub checked", list(C.contact_attestations.map((a) => a.replace(/^(mailto|tel|dns):/, ""))));
 }
 
 async function decide(allow) {

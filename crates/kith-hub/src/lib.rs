@@ -22,12 +22,18 @@
 //! | `GET  /login`                             | redirects to `/whoami`                          |
 //! | `GET/PUT /v1/kel/{did}`                   | fetch / append a key event log                  |
 //! | `GET  /v1/did/{did}`                      | DID document                                    |
+//! | `GET  /.well-known/webfinger`             | WebFinger for names in a verified domain, `ada@example.com` (see [`namespace`]) |
+//! | `PUT, DELETE /v1/namespaces/{domain}/{local}`, `GET /v1/namespaces/{domain}` | the domain's holder gives out, takes back and lists names (bearer) |
+//! | `GET  /v1/profile/{did}`                  | what the KEL makes public: events, devices, recovery commitment (no token; see [`profile`]) |
+//! | `GET  /v1/whoami`                         | the same, plus your sessions, authenticator and co-signer (bearer) |
 //! | `POST /v1/auth/challenge`, `/v1/auth/verify` | API challenge login (signature/passkey/TOTP) |
 //! | `POST /v1/totp/enroll`, `/v1/totp/confirm`| TOTP factor (bearer)                            |
 //! | `DELETE /v1/totp`                         | forget the authenticator: a current code, or an AAL 2 sign-in |
 //! | `POST /v1/cosigner`, `/v1/cosign`         | TOTP-gated co-signer                            |
 //! | `POST, GET, DELETE /v1/contacts`, `POST /v1/contacts/confirm`, `PUT /v1/contacts/public` | verified email and phone contacts (bearer; see [`contacts`]) |
 //! | `GET  /v1/contacts/lookup`                | who holds a published contact, signed           |
+//! | `POST /v1/domains`, `POST /v1/domains/verify` | what to publish, and proving a domain by TXT, CNAME or HTML file (bearer; see [`domains`]) |
+//! | `GET  /v1/domains/attest`                 | witness any DID's proof of a domain, signed (no token) |
 //! | `POST /v1/enroll`, `GET /enroll/{id}`     | enroll a browser passkey as a device            |
 //! | `POST /v1/join`, `/v1/join/invite`, `GET /join/{id}` | join a device, from a terminal or by QR code, approved by manage signers (see [`join`]) |
 //! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
@@ -42,12 +48,15 @@
 pub mod account;
 pub mod admin;
 pub mod contacts;
+pub mod domains;
 pub mod enroll;
 pub mod join;
 pub mod jwe;
+pub mod namespace;
 pub mod oidc;
 pub mod org;
 pub mod pages;
+pub mod profile;
 pub mod qr;
 pub mod signup;
 pub mod store;
@@ -138,6 +147,9 @@ pub struct HubConfig {
     /// Verified email addresses and phone numbers (spec 7.8.2): how codes are sent,
     /// how long a verification lasts, and limits.
     pub contacts: contacts::ContactConfig,
+    /// Verified domains (spec 7.8.3): which proofs are accepted, how long they last, and
+    /// how DNS and HTTP are asked.
+    pub domains: domains::DomainConfig,
 }
 
 impl HubConfig {
@@ -187,6 +199,7 @@ impl HubConfig {
                 window_secs: 60,
             },
             contacts: contacts::ContactConfig::default(),
+            domains: domains::DomainConfig::default(),
         }
     }
 }
@@ -446,6 +459,7 @@ impl Hub {
             }
         }
         cfg.contacts.validate()?;
+        cfg.domains.validate()?;
         let cfg_dir = cfg.data_dir.clone();
         let hub = Hub {
             cfg,
@@ -1386,6 +1400,11 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/oauth/token", post(token))
         .route("/v1/kel/{did}", get(get_kel).put(put_kel))
         .route("/v1/did/{did}", get(did_doc))
+        .route("/.well-known/webfinger", get(namespace::webfinger))
+        .route("/v1/namespaces/{domain}", get(namespace::list))
+        .route("/v1/namespaces/{domain}/{local}", axum::routing::put(namespace::give).delete(namespace::remove))
+        .route("/v1/profile/{did}", get(profile::profile))
+        .route("/v1/whoami", get(profile::whoami))
         .route("/v1/auth/challenge", post(challenge))
         .route("/v1/auth/verify", post(verify))
         .route("/v1/totp/enroll", post(totp_enroll))
@@ -1405,6 +1424,9 @@ pub fn router(hub: Arc<Hub>) -> Router {
             axum::routing::put(contacts::set_public),
         )
         .route("/v1/contacts/lookup", get(contacts::lookup))
+        .route("/v1/domains", post(domains::records))
+        .route("/v1/domains/verify", post(domains::verify))
+        .route("/v1/domains/attest", get(domains::attest))
         .route("/v1/enroll", post(enroll::start))
         .route("/v1/enroll/{id}", get(enroll::status))
         .route("/v1/enroll/{id}/key", post(enroll::submit_key))

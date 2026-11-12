@@ -144,6 +144,26 @@ PY
 if $K --home "$D/phone" login --aud api://invoices 2>/dev/null; then echo "FAIL: revoked device logged in"; exit 1; fi
 echo "revoked device refused (good)"
 
+step "whoami --full: the log, devices and recovery in one view; this machine's recovery keys are the ones next commits to"
+$K --home "$D/ada" whoami --full | PHONE="$PHONE" python3 -c "
+import os,sys,json
+v=json.load(sys.stdin)
+kinds=[e['kind'] for e in v['events']]
+assert kinds[0]=='inception' and 'add_device' in kinds and kinds[-1]=='revoke_device',kinds
+assert v['state']['revoked']==[os.environ['PHONE']],v['state']['revoked']
+assert len(v['state']['devices'])==1,list(v['state']['devices'])
+r=v['recovery']
+assert r['totp']['enrolled'] is True and r['cosigner'] is None and r['rotations']==[],r
+m=r['this_machine']
+assert m['matches_next'] is True and len(m['held_here'])==3,m
+assert [k['role'] for k in v['this_machine']['keys']].count('recovery')==3
+print('events',kinds,'| devices',list(v['state']['devices']),'| revoked',v['state']['revoked'],'| paper keys held here:',len(m['held_here']),'(match next)')"
+curl -sf "$KITH_HUB/v1/profile/$(cat "$D/ada.did")" | python3 -c "
+import sys,json
+v=json.load(sys.stdin)
+assert 'sessions' not in v and 'token' not in v and 'totp' not in v['recovery'] and 'cosigner' not in v['recovery'],list(v)
+print('public profile: no token needed,',len(v['events']),'events, nothing the hub alone holds')"
+
 step "recovery: make the hub's TOTP-gated co-signer a recovery signer, then recover with 1 paper key + TOTP"
 $K --home "$D/ada" rotate --add-cosigner
 # Lose all but one recovery key: drop them from identity.json and, on macOS, from the keychain.
@@ -157,5 +177,21 @@ echo "one key alone cannot rotate (good)"
 sleep $((31 - $(date +%s) % 30))
 $K --home "$D/ada" rotate --revoke-devices --totp "$($K totp code "$SECRET")"
 $K --home "$D/ada" status | python3 -c "import sys,json;s=json.load(sys.stdin);print('seq',s['seq'],'devices',s['devices'],'revoked',s['revoked'])"
+
+step "after recovery the public profile shows both rotations; the last took two signers of the policy it revealed"
+# revoke-devices ended this machine's own device, so there is no token for whoami; the public view needs none.
+curl -sf "$KITH_HUB/v1/profile/$(cat "$D/ada.did")" | python3 -c "
+import sys,json
+def strings(x):
+    if isinstance(x,str): yield x
+    elif isinstance(x,dict): yield from (s for v in x.values() for s in strings(v))
+    elif isinstance(x,list): yield from (s for v in x for s in strings(v))
+v=json.load(sys.stdin)
+rs=v['recovery']['rotations']
+assert v['events'][-1]['kind']=='rotate' and len(rs)==2,(v['events'][-1]['kind'],len(rs))
+last=rs[1]
+assert last['revoked_devices'] is True and len(last['signers'])==2,last
+assert set(last['signers'])<=set(strings(last['rotation'])),last
+print('rotations at seq',[x['seq'] for x in rs],'| the last revoked every device and was signed by',len(last['signers']),'of its policy')"
 
 step "all CLI flows passed"

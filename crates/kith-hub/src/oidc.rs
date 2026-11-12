@@ -512,7 +512,7 @@ pub async fn discovery(State(h): State<Arc<Hub>>) -> Json<Value> {
         "id_token_encryption_enc_values_supported": jwe::ENCS,
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
         "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": ["openid", "profile", "email", "phone", "groups", "work", "offline_access", "linked_account"],
+        "scopes_supported": ["openid", "profile", "email", "phone", "groups", "work", "offline_access", "linked_account", "domain"],
         "claims_supported": ["sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "acr", "amr", "azp", "sid", "name", "preferred_username", "email", "email_verified", "phone_number", "phone_number_verified", "groups", "roles", "work"],
         "acr_values_supported": [format!("{ACR_PREFIX}1"), format!("{ACR_PREFIX}2"), format!("{ACR_PREFIX}3")],
         "prompt_values_supported": ["none", "login", "consent"],

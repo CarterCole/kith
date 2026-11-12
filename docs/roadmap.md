@@ -106,6 +106,31 @@
     Messaging SMS (the `aws` feature) or to an outbox file. Tested in process and with
     the CLI through the outbox; not yet sent through AWS.
   - Verified in headless Chrome with a virtual authenticator against `openid-client`.
+  - Verified domains ([spec §7.8.3](../spec/07-oidc.md)): an identity or an org proves it
+    controls a domain with a TXT record, a CNAME or an HTML file that names its DID
+    (`kith domain records|verify|attest`). The proof is public, so any hub can witness it
+    for any DID and sign what it saw (`GET /v1/domains/attest`); a relying party collects
+    witnesses from the hubs it trusts. A verified domain is a `dns:` contact (publish,
+    staleness, takeover, the `domain` scope). The hub's page fetch refuses non-public
+    addresses and redirects. Tested with a fake DNS and web; the real DNS and HTTP probe has
+    one `--ignored` test against live DNS (CNAME, TXT) and `example.com`.
+- **Profile and whoami** ([spec §7.14](../spec/07-oidc.md)). `GET /v1/profile/{did}`
+  (public) and `GET /v1/whoami` (a hub token) show one identity's key event log with who
+  signed each event, its devices and revoked devices, and its recovery commitment with the
+  rotations so far. `whoami` adds the caller's hub sessions, whether an authenticator is
+  enrolled and the co-signer's id, and looking creates neither. `kith whoami --full` adds
+  the keys this machine holds and whether its recovery policy hashes to `next`: the hub
+  cannot list paper keys, this machine can vouch for the ones it has. Tested in process
+  (`tests/whoami.rs`) and through the CLI against a real hub (`scripts/cli-flows.sh`,
+  before and after a recovery with one paper key and the co-signer).
+- **Names in a verified domain** ([spec §7.8.4](../spec/07-oidc.md)). Whoever holds
+  `dns:example.com` gives out `ada@example.com` (`kith namespace add|remove|list`), and the
+  hub answers WebFinger for it (`GET /.well-known/webfinger`, with `urn:kith:root`, the hub
+  and a profile link). It resolves only when the root's own log also links the alias, as in
+  [spec §5.1.1](../spec/05-aliases.md); `kith finger` does both lookups. A name is served only
+  while its giver holds the domain, fresh. Both-sided names show on the public profile, and
+  `/v1/profile/ada@example.com` finds it. Tested in process (`tests/namespace.rs`) and with
+  the real `kith` binary against a real hub on a port (`kith-cli/tests/namespace.rs`).
 - **Hub state and operations** ([spec §7.9–7.10](../spec/07-oidc.md)).
   - One SQLite file holds sessions, codes, refresh tokens, pending sign-in requests,
     consent, registered clients, TOTP enrollments and lockouts, co-signer keys, the
@@ -279,6 +304,35 @@
   - `kith resolve` does not follow public contacts, an app cannot ask for a check
     during sign-in, and verification is CLI only.
   - Userinfo finds a pairwise client's identity by scanning every KEL.
+- **Verified domains.**
+  - Verification is by a hub. `kith_core::domain` has the names and checks, but there is
+    no JS or Python helper and no shared vectors, so a verifier without a hub is
+    Rust-only.
+  - An org proving a domain through a member's proof, wildcard and subdomain rules, and a
+    public-suffix list are not done. DNS answers are not DNSSEC-validated.
+  - The HTML method trusts whatever the web root serves: on a shared host anyone with
+    a file there proves the domain. Operators can leave `html` out (`methods`).
+  - A witness checks the proof, not the DID's KEL. Nothing yet says how many witnesses a
+    relying party should ask or how to find hubs willing to witness.
+  - `kith domain verify` is CLI only; an app cannot ask for a check during sign-in.
+- **Profile and whoami.**
+  - There is no profile page for people and no handle (`/u/ada`): a DID or a proven alias
+    is the only name. The public view has the log, devices and recovery history, and none
+    of the other proofs that make a Keybase-style page: public aliases the hub verified, verified
+    domains, published contacts, or the orgs and groups the identity belongs to (names in a
+    verified domain are listed).
+  - The hub shows only the recovery policies a rotation already revealed. Seeing the
+    current paper keys needs the machine that holds them (`kith whoami --full`).
+  - You cannot end your own sessions, only the operator can; `sessions` is read-only.
+- **Names in a verified domain.**
+  - Only the identity that ran `kith domain verify` can give names, so an org (which
+    usually has no hub account) cannot yet; wildcard and subdomain names, and hub-local
+    handles with no domain behind them (`/u/ada`), are not done.
+  - `kith resolve` reaches the hub only if the domain redirects `/.well-known/webfinger`
+    to it; `scripts/cli-flows.sh` has no domain to prove, so the CLI flow is covered by the
+    Rust integration test instead.
+  - A name must point at a root whose log this hub serves. Names whose giver lost the
+    domain stay stored, unserved.
 - **Co-signer safety.** A time delay plus device notification before co-signing
   `rotate`, as did:plc does with its 72-hour window.
 - **Other.**
@@ -460,3 +514,4 @@ repeated here.
 | 6 | rs-wnfs integration, with `did:kith` as the WNFS agent | Encrypted shared data for groups |
 | 7 | Witnesses and optional chain anchoring. OpenTimestamps anchoring of policy roots and revocations is done (§8.10); KEL witnesses and heartbeat co-signing remain | Third-party duplicity detection and public timestamps |
 | 8 | Delegated administration ([spec §10](../spec/10-delegated-administration.md)): grants, delegated roots, the fail-closed builder rules, `test-vectors/delegation.json` in all three implementations; then the admin write API on top. The `org`/`pol` token claims and `kith policy why` are done (§10.8) | "Who may assign a role", answered by a signed chain instead of by whoever can edit the hub |
+| 9 | Public profiles, as Keybase has: a page per identity (`/u/…`) with its log, devices, proofs (aliases, domains, published contacts) and orgs. The data view (`/v1/profile`, `/v1/whoami`) is done (§7.14), and so are names in a verified domain with WebFinger (§7.8.4); the page, hub-local handles and the other proofs and teams in the view remain | One link that shows who a key is and what vouches for it |

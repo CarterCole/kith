@@ -121,6 +121,18 @@ enum Cmd {
     /// Resolve a public alias to its root: the alias side's back-link (WebFinger,
     /// DNS TXT or did:web) must name the root, and the root's KEL must link the alias.
     Resolve { alias: String },
+    /// Look a name in a domain up through a hub's WebFinger and check the root's log links
+    /// it back: `kith finger ada@example.com`. Needs no sign-in.
+    Finger {
+        name: String,
+        /// The hub to ask. Default: your own.
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// Names in a domain you hold (`kith domain verify` first): give out `ada@example.com`
+    /// and the hub answers WebFinger for it.
+    #[command(subcommand)]
+    Namespace(NamespaceCmd),
     /// Authenticate to the hub and get an access token for an audience.
     Login {
         #[arg(long)]
@@ -143,10 +155,14 @@ enum Cmd {
         #[arg(long)]
         aud: Option<String>,
     },
-    /// Show the claims of the stored access token.
+    /// Show the claims of the stored access token. With `--full`, ask the hub for your
+    /// key event log, devices, sessions and recovery state, and add what this machine
+    /// holds: the recovery keys it has, and whether they are the ones `next` commits to.
     Whoami {
         #[arg(long)]
         aud: Option<String>,
+        #[arg(long, conflicts_with = "aud")]
+        full: bool,
     },
     /// Delegate capabilities to another identity.
     Delegate {
@@ -166,6 +182,10 @@ enum Cmd {
     /// you publish them; apps get them only with your agreement.
     #[command(subcommand)]
     Contact(ContactCmd),
+    /// Prove that you (or an org) control a domain, by a TXT record, a CNAME or an HTML
+    /// file that names your DID, and let anyone check it.
+    #[command(subcommand)]
+    Domain(DomainCmd),
     /// Get the hub's TOTP-gated co-signer id for your identity.
     Cosigner,
     /// Decode a JWT (no verification).
@@ -399,6 +419,48 @@ enum ContactCmd {
     Remove { address: String },
     /// Who holds a published contact (no sign-in needed).
     Lookup { address: String },
+}
+
+#[derive(Subcommand)]
+enum DomainCmd {
+    /// What to publish to prove your DID controls the domain (a TXT record, a CNAME or an
+    /// HTML file; any one is enough). Nothing is looked up.
+    Records { domain: String },
+    /// Have the hub look for the proof. If it is there you hold the domain: see it with
+    /// `kith contact list`, and publish it with `kith contact publish dns:<domain>`.
+    Verify {
+        domain: String,
+        /// Look by one method only: txt, cname or html.
+        #[arg(long)]
+        method: Option<String>,
+    },
+    /// Ask a hub to look for a DID's proof and sign what it saw (no sign-in needed, and the
+    /// DID need not have an account there). Ask several hubs to collect several witnesses.
+    Attest {
+        domain: String,
+        /// Whose proof to look for: a DID or a name. Default: you.
+        #[arg(long)]
+        did: Option<String>,
+        /// The hub to ask. Default: your own.
+        #[arg(long)]
+        hub: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NamespaceCmd {
+    /// Give `local@domain` to a root. The root must also link it (`kith alias link
+    /// mailto:local@domain`) before it resolves: your word alone proves nothing.
+    Add {
+        name: String,
+        /// Who gets it: a DID, a local name, or a resolvable alias.
+        #[arg(long)]
+        to: String,
+    },
+    /// Take a name back.
+    Remove { name: String },
+    /// The names you gave out under a domain, and whether each root has linked its.
+    List { domain: String },
 }
 
 #[derive(Subcommand)]
@@ -1718,6 +1780,37 @@ fn main() -> Result<()> {
         Cmd::Name(cmd) => names::run(&home, cmd)?,
         Cmd::Work { bits, seconds } => mine_work(&home, bits, seconds)?,
         Cmd::Resolve { alias } => print(&names::resolve(&home, &alias)?.json()),
+        Cmd::Finger { name, hub } => {
+            let hub = match hub {
+                Some(h) => h.trim_end_matches('/').to_string(),
+                None => home.hub()?,
+            };
+            print(&names::finger(&home, &name, &hub)?.json());
+        }
+        Cmd::Namespace(cmd) => {
+            let hub = home.hub()?;
+            let auth = bearer(&mut home)?;
+            let split = |name: &str| -> Result<(String, String)> {
+                let (local, domain) = name.trim_start_matches("acct:").trim_start_matches("mailto:").rsplit_once('@').ok_or_else(|| anyhow!("a name is local@domain, such as ada@example.com"))?;
+                Ok((local.to_ascii_lowercase(), domain.to_ascii_lowercase()))
+            };
+            match cmd {
+                NamespaceCmd::Add { name, to } => {
+                    let (local, domain) = split(&name)?;
+                    let did = names::principal(&home, &to)?;
+                    let out = check(http().put(format!("{hub}/v1/namespaces/{domain}/{local}")).header("authorization", auth).json(&json!({"did": did})).send()?)?;
+                    if out["linked"] == false {
+                        eprintln!("{} has not linked it yet; they run `kith alias link mailto:{local}@{domain}`, and then it resolves", out["did"].as_str().unwrap_or("the root"));
+                    }
+                    print(&out);
+                }
+                NamespaceCmd::Remove { name } => {
+                    let (local, domain) = split(&name)?;
+                    print(&check(http().delete(format!("{hub}/v1/namespaces/{domain}/{local}")).header("authorization", auth).send()?)?);
+                }
+                NamespaceCmd::List { domain } => print(&check(http().get(format!("{hub}/v1/namespaces/{}", domain.to_ascii_lowercase())).header("authorization", auth).send()?)?),
+            }
+        }
         Cmd::Login {
             aud,
             method,
@@ -1740,7 +1833,25 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Token { aud } => println!("{}", cached_token(&mut home, aud)?),
-        Cmd::Whoami { aud } => {
+        Cmd::Whoami { aud: _, full: true } => {
+            let hub = home.hub()?;
+            let auth = bearer(&mut home)?;
+            let mut v = check(http().get(format!("{hub}/v1/whoami")).header("authorization", auth).send()?)?;
+            // The hub sees only a hash of the recovery policy. This machine can say whether
+            // the keys it holds are the ones that hash commits to.
+            let keys = home.key_inventory()?;
+            let policy: Option<SignerPolicy> = serde_json::from_value(home.v["rotation_policy"].clone()).ok();
+            let mine: Vec<String> = home.v["recovery"].as_array().into_iter().flatten().filter_map(|s| s["id"].as_str().map(String::from)).collect();
+            let named = policy.as_ref().map(SignerPolicy::signers);
+            v["recovery"]["this_machine"] = json!({
+                "matches_next": policy.as_ref().map(|p| Some(p.digest().as_str()) == v["recovery"]["next"].as_str()),
+                "policy_signers": named,
+                "held_here": mine.iter().filter(|id| named.as_ref().is_some_and(|n| n.contains(*id))).collect::<Vec<_>>(),
+            });
+            v["this_machine"] = json!({"device": home.device_id()?, "keystore": home.backend().name(), "keys": keys});
+            print(&v);
+        }
+        Cmd::Whoami { aud, full: false } => {
             let tok = cached_token(&mut home, aud)?;
             print(&jws::decode(&tok)?.claims);
         }
@@ -1822,6 +1933,32 @@ fn main() -> Result<()> {
                         req = req.json(&body);
                     }
                     check(req.send()?)?
+                }
+            };
+            print(&out);
+        }
+        Cmd::Domain(cmd) => {
+            let out = match cmd {
+                DomainCmd::Attest { domain, did, hub } => {
+                    let did = match did {
+                        Some(d) => names::principal(&home, &d)?,
+                        None => home.did()?,
+                    };
+                    let hub = match hub {
+                        Some(h) => h.trim_end_matches('/').to_string(),
+                        None => home.hub()?,
+                    };
+                    check(http().get(format!("{hub}/v1/domains/attest")).query(&[("domain", domain), ("did", did)]).send()?)?
+                }
+                cmd => {
+                    let hub = home.hub()?;
+                    let auth = bearer(&mut home)?;
+                    let (path, body) = match cmd {
+                        DomainCmd::Records { domain } => ("", json!({"domain": domain})),
+                        DomainCmd::Verify { domain, method } => ("/verify", json!({"domain": domain, "method": method})),
+                        DomainCmd::Attest { .. } => unreachable!(),
+                    };
+                    check(http().post(format!("{hub}/v1/domains{path}")).header("authorization", auth).json(&body).send()?)?
                 }
             };
             print(&out);

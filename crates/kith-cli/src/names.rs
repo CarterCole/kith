@@ -126,6 +126,33 @@ pub fn resolve(home: &Home, alias: &str) -> Result<Resolved> {
             Err(e) => notes.push(format!("{}: {e}", l.describe())),
         }
     }
+    conclude(home, alias, found, notes)
+}
+
+/// `kith finger`: ask one hub's WebFinger for a name in a domain it holds (spec §7.8.4),
+/// then check the root's log links the name back, as `resolve` does. This is the lookup
+/// a domain's own `/.well-known/webfinger` would answer if it sent it to the hub.
+pub fn finger(home: &Home, name: &str, hub: &str) -> Result<Resolved> {
+    let alias = if name.contains(':') { name.to_string() } else { format!("acct:{name}") };
+    let url = format!("{hub}/.well-known/webfinger");
+    let mut notes = Vec::new();
+    let found = match http().get(&url).query(&[("resource", alias.as_str())]).header("accept", "application/jrd+json, application/json").send() {
+        Ok(r) if r.status().is_success() => resolve::from_jrd(&r.json::<Value>()?).into_iter().map(|c| Candidate { hub: c.hub.or_else(|| Some(hub.to_string())), ..c }).collect(),
+        Ok(r) => {
+            notes.push(format!("WebFinger {url}: HTTP {}", r.status()));
+            vec![]
+        }
+        Err(e) => {
+            notes.push(format!("WebFinger {url}: {e}"));
+            vec![]
+        }
+    };
+    conclude(home, &alias, found, notes)
+}
+
+/// Check every root the alias side named against its own log: exactly one must link the
+/// alias back (spec §5.1.1).
+fn conclude(home: &Home, alias: &str, found: Vec<Candidate>, mut notes: Vec<String>) -> Result<Resolved> {
     let candidates = resolve::merge(found);
     if candidates.is_empty() {
         bail!("no back-link found for {alias} ({})", notes.join("; "));

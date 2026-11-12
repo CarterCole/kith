@@ -31,7 +31,7 @@ scripts/policy-dag-demo.sh               # needs the network (a drand beacon)
 ```
 
 The CI workflow runs the first two, plus `cli-flows.sh`, on every push and pull request.
-The scripts use fixed ports (7788, 7790, 7799, 4001, 4002, 3000), so run them one at a
+The scripts use fixed ports (7788, 7790, 7791, 7799, 4001, 4002, 3000), so run them one at a
 time. On macOS `cli-flows.sh` puts keys in the login keychain and cleans up after itself.
 
 ## Shared conformance vectors

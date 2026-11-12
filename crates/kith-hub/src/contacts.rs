@@ -94,12 +94,16 @@ impl Default for ContactConfig {
 pub enum Kind {
     Email,
     Phone,
+    /// A domain the identity proved it controls (spec 7.8.3); the address is `dns:<domain>`.
+    Domain,
 }
 
 impl Kind {
     pub fn of(address: &str) -> Kind {
         if address.starts_with("tel:") {
             Kind::Phone
+        } else if address.starts_with(kith_core::domain::SCHEME) {
+            Kind::Domain
         } else {
             Kind::Email
         }
@@ -109,6 +113,7 @@ impl Kind {
         match self {
             Kind::Email => "email",
             Kind::Phone => "phone",
+            Kind::Domain => "domain",
         }
     }
 }
@@ -117,6 +122,9 @@ impl Kind {
 pub fn normalize(input: &str) -> Result<String, String> {
     let s = input.trim();
     let bad = |why: &str| Err(format!("{why}: {input:?}"));
+    if let Some(d) = s.strip_prefix(kith_core::domain::SCHEME) {
+        return kith_core::domain::normalize(d).map(|d| format!("{}{d}", kith_core::domain::SCHEME)).map_err(|e| e.to_string());
+    }
     if let Some(rest) = s.strip_prefix("tel:").or_else(|| s.strip_prefix('+').map(|_| s)) {
         let Some(number) = rest.strip_prefix('+') else {
             return bad("a phone number needs its + country code");
@@ -166,6 +174,7 @@ impl Hub {
         match kind {
             Kind::Email => self.cfg.contacts.email_max_age,
             Kind::Phone => self.cfg.contacts.phone_max_age,
+            Kind::Domain => self.cfg.domains.max_age,
         }
     }
 
@@ -184,7 +193,7 @@ impl Hub {
     /// The kinds of contact the `email` and `phone` scopes release.
     fn granted(scope: &str) -> Vec<Kind> {
         let has = |s: &str| scope.split_whitespace().any(|x| x == s);
-        [(has("email"), Kind::Email), (has("phone"), Kind::Phone)].into_iter().filter(|(on, _)| *on).map(|(_, k)| k).collect()
+        [(has("email"), Kind::Email), (has("phone"), Kind::Phone), (has("domain"), Kind::Domain)].into_iter().filter(|(on, _)| *on).map(|(_, k)| k).collect()
     }
 
     /// Claims from verified contacts, for the scopes granted: `email` and
@@ -199,6 +208,8 @@ impl Hub {
             let (claim, verified) = match kind {
                 Kind::Email => ("email", "email_verified"),
                 Kind::Phone => ("phone_number", "phone_number_verified"),
+                // Domains are released as attestations only, never as a claim.
+                Kind::Domain => continue,
             };
             if claims.contains_key(claim) {
                 continue;
@@ -253,6 +264,7 @@ impl Hub {
             // The last line is an origin-bound one-time code, so a phone offers it only
             // on the hub's own site.
             Kind::Phone => (String::new(), format!("{code} is your {rp} verification code. It expires in {mins} minutes.\n\n@{rp} #{code}")),
+            Kind::Domain => anyhow::bail!("domains are proved with a published record, not a code"),
         };
         match &self.cfg.contacts.delivery {
             Delivery::None => anyhow::bail!("no delivery method"),
@@ -313,6 +325,7 @@ impl ContactConfig {
             Delivery::Aws(a) => match kind {
                 Kind::Email => a.email_from.is_some(),
                 Kind::Phone => a.sms_from.is_some(),
+                Kind::Domain => false,
             },
         }
     }
@@ -328,7 +341,7 @@ fn too_many(retry: i64) -> ApiError {
     ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited".into(), format!("too many codes requested; try again in {retry}s"), Some(json!({"retry_after": retry})))
 }
 
-fn view(h: &Hub, c: &ContactRecord) -> Value {
+pub(crate) fn view(h: &Hub, c: &ContactRecord) -> Value {
     let until = h.fresh_until(c);
     json!({"address": c.address, "kind": Kind::of(&c.address), "verified_at": c.verified_at, "fresh_until": until, "fresh": now() < until, "public": c.public})
 }
@@ -343,6 +356,9 @@ pub async fn request_code(State(h): State<Arc<Hub>>, ip: ClientIp, headers: Head
     let c = h.bearer(&headers)?;
     let address = normalize(&req.address).map_err(|e| ApiError::bad("invalid_request", e))?;
     let kind = Kind::of(&address);
+    if kind == Kind::Domain {
+        return Err(ApiError::bad("invalid_request", "a domain is proved with a published record: POST /v1/domains, then POST /v1/domains/verify"));
+    }
     if !h.cfg.contacts.sends(kind) {
         return Err(off(if kind == Kind::Email { "email" } else { "text messages" }));
     }

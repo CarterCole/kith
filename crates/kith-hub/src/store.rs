@@ -26,6 +26,7 @@ use kith_core::keys::{KeyType, LocalSigner};
 use kith_core::util::{b64u, b64u_decode, now, sha256};
 
 use crate::contacts::{ContactRecord, CODE_TRIES};
+use crate::namespace::NameRecord;
 use crate::oidc::{AuthRequest, Client, CodeGrant, RefreshGrant, SsoSession};
 use crate::{read_json, RateLimit};
 
@@ -49,6 +50,8 @@ CREATE TABLE IF NOT EXISTS seen_jti (jti TEXT PRIMARY KEY, expires INTEGER NOT N
 CREATE TABLE IF NOT EXISTS contacts (address TEXT PRIMARY KEY, did TEXT NOT NULL, verified_at INTEGER NOT NULL, public INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS contacts_did ON contacts (did);
 CREATE TABLE IF NOT EXISTS contact_codes (did TEXT NOT NULL, address TEXT NOT NULL, code TEXT NOT NULL, expires INTEGER NOT NULL, failures INTEGER NOT NULL, PRIMARY KEY (did, address));
+CREATE TABLE IF NOT EXISTS namespace_names (domain TEXT NOT NULL, local TEXT NOT NULL, did TEXT NOT NULL, set_by TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY (domain, local));
+CREATE INDEX IF NOT EXISTS namespace_names_did ON namespace_names (did);
 CREATE TABLE IF NOT EXISTS rate_limits (bucket TEXT PRIMARY KEY, window_start INTEGER NOT NULL, window_secs INTEGER NOT NULL, count INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS handles (handle TEXT PRIMARY KEY, did TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS provider_links (alias TEXT PRIMARY KEY, did TEXT NOT NULL);
@@ -762,6 +765,24 @@ impl Store {
         })
     }
 
+    /// Make `did` the holder of `address` as of `t` without a code: the caller has shown
+    /// proof some other way (a published record, spec 7.8.3). Same rule as a confirmed
+    /// code: whoever proves it last holds it, and the old holder's publication ends.
+    pub(crate) fn hold_contact(&self, did: &str, address: &str, t: i64) -> anyhow::Result<ContactRecord> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO contacts (address, did, verified_at, public) VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(address) DO UPDATE SET verified_at = excluded.verified_at,
+                   public = CASE WHEN contacts.did = excluded.did THEN contacts.public ELSE 0 END, did = excluded.did",
+                params![address, did, t],
+            )?;
+            let rec = read_contact(&tx, address)?.ok_or_else(|| anyhow::anyhow!("contact vanished"))?;
+            tx.commit()?;
+            Ok(rec)
+        })
+    }
+
     pub(crate) fn contacts_of(&self, did: &str) -> anyhow::Result<Vec<ContactRecord>> {
         self.with(|c| {
             let mut stmt = c.prepare("SELECT address, did, verified_at, public FROM contacts WHERE did = ?1 ORDER BY address")?;
@@ -797,6 +818,49 @@ impl Store {
         })
     }
 
+    // ------------------------------------------------------------ names in a domain
+
+    pub(crate) fn put_name(&self, n: &NameRecord) -> anyhow::Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO namespace_names (domain, local, did, set_by, created) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(domain, local) DO UPDATE SET did = excluded.did, set_by = excluded.set_by, created = excluded.created",
+                params![n.domain, n.local, n.did, n.set_by, n.created],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn name(&self, domain: &str, local: &str) -> anyhow::Result<Option<NameRecord>> {
+        self.with(|c| Ok(c.query_row("SELECT domain, local, did, set_by, created FROM namespace_names WHERE domain = ?1 AND local = ?2", params![domain, local], read_name).optional()?))
+    }
+
+    pub(crate) fn delete_name(&self, domain: &str, local: &str) -> anyhow::Result<bool> {
+        self.with(|c| Ok(c.execute("DELETE FROM namespace_names WHERE domain = ?1 AND local = ?2", params![domain, local])? > 0))
+    }
+
+    /// The names `set_by` gave out under `domain`.
+    pub(crate) fn names_in(&self, domain: &str, set_by: &str) -> anyhow::Result<Vec<NameRecord>> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT domain, local, did, set_by, created FROM namespace_names WHERE domain = ?1 AND set_by = ?2 ORDER BY local")?;
+            let rows = stmt.query_map(params![domain, set_by], read_name)?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub(crate) fn count_names_by(&self, domain: &str, set_by: &str) -> anyhow::Result<i64> {
+        self.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM namespace_names WHERE domain = ?1 AND set_by = ?2", params![domain, set_by], |r| r.get(0))?))
+    }
+
+    /// Every name that points at `did`, whoever gave it.
+    pub(crate) fn names_for(&self, did: &str) -> anyhow::Result<Vec<NameRecord>> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT domain, local, did, set_by, created FROM namespace_names WHERE did = ?1 ORDER BY domain, local")?;
+            let rows = stmt.query_map(params![did], read_name)?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
     /// Count one attempt in `bucket`. `Some(seconds)` when `limit` is exceeded: how
     /// long until the window resets. A limit with `max == 0` never trips.
     pub(crate) fn hit(
@@ -826,6 +890,10 @@ impl Store {
 /// off directly; the ten-minute life and five tries are what protect it.
 fn contact_code_hash(did: &str, address: &str, code: &str) -> String {
     hash(&format!("kith-contact-code|{did}|{address}|{code}"))
+}
+
+fn read_name(r: &rusqlite::Row) -> rusqlite::Result<NameRecord> {
+    Ok(NameRecord { domain: r.get(0)?, local: r.get(1)?, did: r.get(2)?, set_by: r.get(3)?, created: r.get(4)? })
 }
 
 fn read_contact(c: &Connection, address: &str) -> anyhow::Result<Option<ContactRecord>> {
