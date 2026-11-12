@@ -97,6 +97,149 @@ an unregistered redirect URI is shown as an error page, **never redirected**.
   and deletes registrations through the admin API (§7.10).
 - Every call counts against the registration rate limit, token or not (§7.9).
 
+### 7.2.1 Admitting applications
+
+An app can sign people in only once the hub knows its `client_id`. For any other id,
+`/oauth/authorize` shows an error page ("Unknown application") and never redirects.
+
+**Today** the hub learns of an app in one of two ways, and `GET /v1/admin/clients`
+reports which as `source`:
+
+| `source` | How it gets there | `client_id` | Who decides |
+|----------|-------------------|-------------|-------------|
+| `configured` | an entry in the `--clients` file (§7.2), read when the hub starts | chosen in the file | whoever edits the file and restarts the hub |
+| `registered` | `POST /oauth/register` with the `KITH_REGISTRATION_TOKEN` bearer (§7.2) | random, issued by the hub | whoever holds the token: the app is admitted at once |
+
+To remove an app, delete a `configured` one from the file and restart the hub, or call
+`DELETE /v1/admin/clients/{id}` for a `registered` one (§7.10), which also deletes its
+grants and refresh tokens. Nobody can ask to be admitted and wait for an answer, and a
+registration cannot choose its `client_id`. So an app built with a fixed id, such as
+`client_id=questions`, must be a configured client or switch to the id it was issued.
+
+**Requests and approval (draft, not implemented).** An app asks to be admitted. Its
+request waits in a queue until the operator approves or denies it. The operator can
+also add a client directly under an id they choose.
+
+*Asking.* `POST {issuer}/v1/client-requests`:
+
+- It is off unless the hub is started with `--client-requests`. Until then the path
+  answers `404`, as `/oauth/register` does on a hub started without a registration
+  token.
+- The caller presents a hub access token (`aud` = issuer, §2.3) for the identity that
+  is asking, as a bearer. Without one it answers `401`. The queue records who asked.
+- The body is the registration metadata of §7.2. The hub accepts and refuses the same
+  members, and checks them the same way (redirect URIs, auth method, pairwise on one
+  host), so a request that would fail registration fails at once, not in the queue.
+  Two more members:
+  - `client_id` (optional): the id the app wants. It matches
+    `^[a-z0-9][a-z0-9-]{1,62}$` and no configured client, registered client or pending
+    request uses it, or the hub answers `409` `client_id_taken`. A pending request
+    keeps the id reserved. Without it, the hub issues a random id on approval.
+  - `note` (optional, up to 500 characters): what the app is and who runs it, for the
+    operator.
+- It answers `202`, with `Cache-Control: no-store`:
+
+  ```json
+  {
+    "request_id": "…",
+    "status": "pending",
+    "client_id": "questions",                  // as proposed, or null
+    "request_secret": "…",                     // shown once
+    "expires_at": 1796508936
+  }
+  ```
+
+  The hub stores only the SHA-256 of `request_secret`.
+- Every call counts against the registration rate limit (§7.9).
+- A request gives the app nothing. `/oauth/authorize` for an id that a pending request
+  proposed shows "This application is waiting for the hub's operator to approve it."
+  It does not redirect.
+
+*Checking.* `GET {issuer}/v1/client-requests/{request_id}`, with the `request_secret`
+as the bearer, answers the request as it stands:
+
+| `status` | Also returns |
+|----------|--------------|
+| `pending` | `created`, `expires_at` |
+| `approved` | `client_id`, `decided_at`; on the first read after approval, and only then, `client_secret` for a confidential client (`token_endpoint_auth_method` other than `none`) |
+| `denied` | `reason`, `decided_at` |
+| `expired` | `expires_at` |
+
+An unknown id and a wrong secret both answer `404`. A request still pending after
+30 days expires. Approved, denied and expired requests are kept 30 days after that,
+then swept. The client made from an approved request stays.
+
+*Deciding.* Under `/v1/admin/`, with the credentials of §7.10:
+
+| Method, path | Does |
+|--------------|------|
+| `GET /v1/admin/client-requests[?status=pending]` | Requests, newest first: `request_id`, `status`, `requested_by` (the DID), the proposed `client_id` (or null), `client_name`, `redirect_uris` and their hosts, `note`, `created`, `expires_at`, `decided_at`, `reason`. Never the request secret. |
+| `POST /v1/admin/client-requests/{id}/approve` | Creates the client from the request's metadata, under the proposed `client_id` or a random one, with `source: request`. It is then a registered client in every way: `consent: explicit`, `audience` = `client_id`, no `min_aal` (§7.2). Answers the client without its secret, which goes to the requester. A request that is not pending, or whose id has been taken since, answers `409`. |
+| `POST /v1/admin/client-requests/{id}/deny` | Denies it. The optional body `{"reason": "…"}` is shown to the requester. A request that is not pending answers `409`. |
+| `POST /v1/admin/clients` | The operator adds a client directly, with `source: admin`. The body takes the members of the §7.2 file format except `client_secret`, plus `token_endpoint_auth_method` (`none` for a public client). `client_id` is optional, follows the pattern above, and must be free (`409` otherwise); without it the id is random. The hub issues the secret. It answers `201` with the client and, once, its `client_secret`. |
+| `DELETE /v1/admin/clients/{id}` | As today (§7.10). It also deletes `admin` and `request` clients. |
+
+`GET /v1/admin/clients` then reports four `source` values: `configured`, `registered`,
+`admin` and `request`. Clients that come from the admin API or from a request are kept
+in the store (§7.9), as registrations are.
+
+Open questions:
+
+1. May anyone ask, rate limited per address as sign-up is (§7.11), or only a signed-in
+   identity, as drafted above?
+2. May a client the operator adds set `consent: implied`, `min_aal` and `audience`, as
+   a configured one can? If it may, any identity in the `hub-admin` role can make an
+   app that skips the consent page, which today takes access to the clients file.
+
+**Commands.** These work today:
+
+```bash
+# Add: register an app. Its client_id is random; the answer holds client_secret once.
+curl -s -X POST https://id.example.com/oauth/register \
+  -H "authorization: Bearer $KITH_REGISTRATION_TOKEN" -H "content-type: application/json" \
+  -d '{"client_name": "Questions",
+       "redirect_uris": ["https://questions.example.com/callback"],
+       "token_endpoint_auth_method": "none"}'
+
+# List every client, with source and has_secret
+curl -s -H "authorization: Bearer $KITH_ADMIN_TOKEN" https://id.example.com/v1/admin/clients
+
+# Remove a registered client, with its grants and refresh tokens
+curl -s -X DELETE -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
+  "https://id.example.com/v1/admin/clients/$CLIENT_ID"
+```
+
+These are drafted (not implemented):
+
+```bash
+# The app asks, proposing its id
+curl -s -X POST https://id.example.com/v1/client-requests \
+  -H "authorization: Bearer $HUB_ACCESS_TOKEN" -H "content-type: application/json" \
+  -d '{"client_id": "questions", "client_name": "Questions",
+       "redirect_uris": ["https://questions.example.com/callback"],
+       "token_endpoint_auth_method": "none", "note": "Q&A site, run by Carter"}'
+
+# The app checks on its request
+curl -s -H "authorization: Bearer $REQUEST_SECRET" \
+  "https://id.example.com/v1/client-requests/$REQUEST_ID"
+
+# The operator reviews the queue, then approves or denies
+curl -s -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
+  "https://id.example.com/v1/admin/client-requests?status=pending"
+curl -s -X POST -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
+  "https://id.example.com/v1/admin/client-requests/$REQUEST_ID/approve"
+curl -s -X POST -H "authorization: Bearer $KITH_ADMIN_TOKEN" -H "content-type: application/json" \
+  -d '{"reason": "No such site"}' \
+  "https://id.example.com/v1/admin/client-requests/$REQUEST_ID/deny"
+
+# The operator adds a client directly, under an id they choose
+curl -s -X POST https://id.example.com/v1/admin/clients \
+  -H "authorization: Bearer $KITH_ADMIN_TOKEN" -H "content-type: application/json" \
+  -d '{"client_id": "questions", "name": "Questions",
+       "redirect_uris": ["https://questions.example.com/callback"],
+       "token_endpoint_auth_method": "none"}'
+```
+
 ## 7.3 Authorization request
 
 `GET /oauth/authorize` takes:
@@ -587,6 +730,22 @@ Not yet implemented:
   on first start and renames them `*.imported`. Login challenges (5 minutes) and
   passkey enrollments in progress (10 minutes) stay in memory: after a restart the
   login page is handed a fresh challenge and retries; an enrollment is started again.
+- **The bundle file** (`--bundle`). The hub reads it again whenever its modification
+  time or length changes, at the next request that needs groups or roles. A file that
+  fails to load (half written, invalid, gone) leaves the last good bundle in force: the
+  hub logs why and reports it in `GET /v1/admin/stats` (§7.10). At startup there is no
+  last good bundle, so a file that fails to load stops the hub from starting.
+  - Keeping the old bundle trades one failure for another. A sign-in still gets the
+    groups and roles it had, so a typo cannot lock everyone out; but a removal in a
+    file that fails to load does not take effect. Check a file before it is deployed
+    (§4.1.1, `kith bundle check`) and confirm with the stats that it loaded. To take
+    access away at once, use a revocation (§8.7) or end the identity's sessions.
+  - Replace the file by renaming a complete copy over it, so the hub never reads half
+    of one.
+  - `kith bundle edit` edits a bundle file in the browser, on the operator's own
+    machine; the hub never takes writes. It lists people from
+    `GET /v1/admin/identities`, shows each person's groups and roles as the file
+    stands, and saves only a file that passes §4.1.1.
 - **Rate limits.** `POST /oauth/login` allows 20 attempts per minute and
   `POST /oauth/register` 20 per hour, per client address. One more answers `429` with
   a `Retry-After` header and `{"error": "rate_limited", "retry_after": <seconds>}`.
@@ -634,7 +793,8 @@ For the hub's operator, under `{issuer}/v1/admin/`. Two credentials open it:
 
 | Method, path | Does |
 |--------------|------|
-| `GET /v1/admin/stats` | Counts of sessions, refresh tokens, codes, pending requests, grants, registered and configured clients, TOTP enrollments, co-signers and KELs; uptime. |
+| `GET /v1/admin/stats` | Counts of sessions, refresh tokens, codes, pending requests, grants, registered and configured clients, TOTP enrollments, co-signers and KELs; uptime; and `bundle`: the file's `path`, when the bundle in force was loaded (`loaded_at`), its numbers of `groups` and `roles`, and `error`, why the file as it is now is not the one in force (null when it is). |
+| `GET /v1/admin/identities` | Every identity the hub holds a KEL for, oldest first: `did`, `created`, `updated`, `devices`, public `aliases`, `linked` provider accounts, verified `contacts` (`address`, `verified_at`, `public`), `totp`, `work`, `last_sign_in` (of its live hub sessions), its `directory` attributes, and its standing `groups` and `roles` (with `memberships_error` when they could not be worked out, as for a principal the org revoked). Standing means worked out from the KEL and the directory alone, so a rule on `aal`, `amr` or an upstream attribute does not match here even where a sign-in would meet it. |
 | `GET /v1/admin/sessions[?did=…]` | Live hub sessions: `sid`, `did`, `device`, `alias`, `aal`, `amr`, `auth_time`, `expires`, `clients`. Never the cookie. |
 | `DELETE /v1/admin/sessions/{sid}` | Ends that session. Its unredeemed codes and its refresh tokens die; clients that registered a logout URI are told (§7.6). |
 | `DELETE /v1/admin/identities/{did}/sessions` | Signs the identity out everywhere: every session, and every refresh token, including those whose session already expired. |
@@ -643,6 +803,9 @@ For the hub's operator, under `{issuer}/v1/admin/`. Two credentials open it:
 | `DELETE /v1/admin/clients/{id}` | Deletes a registered client with its grants and refresh tokens. A configured client answers `409`: edit the clients file. |
 | `GET /v1/admin/grants/{did}` | What the identity agreed to share, per client: scopes and when. |
 | `DELETE /v1/admin/grants/{did}/{client_id}` | Withdraws that consent. The client's refresh tokens for the identity die, and it is asked again next time. |
+
+Adding a client through this API, and a queue of requests to approve or deny, are
+drafted in §7.2.1 and not implemented.
 
 Responses are JSON with `Cache-Control: no-store`. Errors have the API's usual
 `error` and `error_description`: no credential is `401`, an identity outside the
@@ -654,17 +817,282 @@ curl -s -X DELETE -H "authorization: Bearer $KITH_ADMIN_TOKEN" \
   "https://id.example.com/v1/admin/identities/did:kith:…/sessions"
 ```
 
-## 7.11 Not yet implemented
+## 7.11 Browser sign-up
+
+A hub started with `--signup` lets anyone create an identity at `GET /signup`, with a
+passkey and nothing else. It is off by default: it turns a hub into an open registry.
+
+```
+Browser  POST /v1/signup                        → {id, handle, rp_id}
+         navigator.credentials.create({ user.id = handle, ES256, resident key })
+         POST /v1/signup/{id}/key {key, recovery_key}
+                                                → {message}   the inception to sign
+         navigator.credentials.get({ challenge = SHA-256(message) })
+         POST /v1/signup/{id}/sig {sig}         → {did}
+```
+
+The identity the hub records:
+- `manage`: the new passkey, alone.
+- `next`: the digest of a policy naming one **recovery key**. The browser generates it
+  (ECDSA P-256) and offers it as a file to download before the passkey exists; the hub
+  only ever receives its public `did:key`.
+- one device, the passkey, `kind: passkey`, `aal: 2`, `caps: [session, alias]`,
+  `rp_id` the hub's, named `passkey`.
+
+The passkey signs the inception itself with a WebAuthn assertion, which satisfies both
+the manage policy and the device's proof of possession (§1.6). The hub checks the
+assertion as it checks a login (its RP id, its origins), then the log as it checks any
+`PUT /v1/kel/{did}`. It holds no key for the identity.
+
+Nothing personal goes into the log, which is public and mirrored: not a name, not an
+email address. The name the visitor types is the passkey's label on their own device
+and is never sent.
+
+**User handle.** A passkey's user handle is fixed when it is created, but the DID is a
+hash of the inception, which contains the passkey's public key. So the handle is not the
+DID, as it is for `kith passkey enroll` (§7.7). It is `h_` and 128 random bits, kept in
+the hub's store next to the DID once the identity exists. `POST /oauth/login` accepts
+either as `did` and resolves a handle before anything else. An app never sees a handle:
+`sub` is the DID (or its pairwise form).
+
+**Account page.** `GET /whoami` shows who this browser is signed in as. It works with or
+without `--signup`.
+- Signed out, it asks for a passkey (username-less, as the login page does) and posts
+  `{challenge_id, did, factors}` to `POST /whoami`. `did` may be a handle. The hub checks
+  the factors as `/oauth/login` does, but one of the identity's devices must have signed:
+  the page is open to anyone, so a one-time code alone is refused. On success it starts
+  the ordinary hub session (§7.6), so apps the person then visits get SSO. A failed
+  attempt returns a fresh challenge. The endpoint shares `/oauth/login`'s rate limit.
+- Signed in, it shows the DID, the devices in the log (and which one signed in), the
+  session's assurance level and expiry, and what the hub keeps about the identity: a
+  verified email, provider accounts linked to it, and its work (§7.12). It never shows
+  the handle. "Sign out" is `GET /oauth/logout`.
+- The session holds only while the device it signed in with is still in the log, as for
+  SSO. `GET /` sends a signed-in browser here, and anyone else to `/signup` (with
+  `--signup`). The sign-up page ends here unless an app sent the visitor.
+
+**Limits.**
+- `POST /v1/signup` is rate limited per client address (default 5 an hour), and at
+  most 1000 sign-ups are in progress at once. Each lasts 10 minutes.
+- Both the log (`kels/`) and the handle (`hub.sqlite`) are needed to sign in; back up
+  both.
+- The identity starts with one device, and the passkey alone approves new ones. More
+  devices join through §7.13, approved by that passkey in a browser. The recovery key
+  can then make other devices manage signers (`kith manage set`, §7.13). Until it has,
+  losing the passkey loses the account; nothing yet uses the recovery key from a
+  browser, or from a machine that is not a device of the identity.
+- The identity has no name or email attribute, so tokens carry no `name` or `email`
+  claim. Attributes come from the directory (§4.3) or an upstream provider (§7.8).
+
+The page loses nothing if the visitor skips the download, but the recovery key can't be
+made again.
+
+**Choosing the recovery key.** The hub only needs a public `did:key`, so the page offers
+three sources and the hub cannot tell them apart:
+1. **A generated key.** The browser makes a P-256 key and offers its private half as a
+   file.
+2. **Secret words.** The key is derived from words the visitor chooses, so nothing needs
+   saving but the words. The derivation is fixed so it can be redone anywhere:
+   ```
+   phrase = NFKD(words), lower-cased, split on whitespace, joined with one space
+   seed   = PBKDF2-HMAC-SHA-256(phrase, salt = "kith/recovery/p256/v1", 600000 rounds, 64 bytes)
+   d      = (seed as a big-endian integer) mod (n − 1) + 1      n = the P-256 group order
+   key    = did:key of the point d·G
+   ```
+   The page requires at least 5 words. The salt is fixed, so an attacker can try
+   guesses against any account: the digest of the recovery key is public in the log.
+   Six random words is a sensible floor; a short or familiar phrase will be found.
+3. **A public key brought from elsewhere** (P-256, Ed25519 or secp256k1 as a `did:key`),
+   derived or stored however the visitor likes. `POST /v1/signup/check` and an optional
+   `recovery_key` on `POST /v1/signup` let the page vet it before a passkey exists.
+
+In every case the hub receives the public key only, and the log holds only the digest of
+the policy naming it until a rotation reveals the key.
+
+**Sign-up through a provider.** With `--signup` and an upstream provider configured
+(§7.8), a login from a provider account that no identity links is not refused. The
+hub makes a **ticket**: the verified `{iss}#{sub}`, the login request that started it,
+and the attributes the provider is trusted for. It redirects to
+`/signup?ticket=…` and sets the ticket in an `HttpOnly` cookie. The sign-up above then
+runs unchanged, so the account still gets a passkey as its manage key and a recovery
+key, and the hub still holds no key for it.
+- `POST /v1/signup` takes `{ticket}` and accepts it only when the cookie holds the same
+  value, once, within 15 minutes. The ticket is a bearer value in a URL; without the
+  cookie, anyone who saw the URL could link someone else's provider account to their
+  own passkey.
+- When the passkey's signature is accepted, the hub records `{iss}#{sub}` → the new DID
+  in its own store, then writes the log. If writing the log fails the link is removed.
+  An account already linked is refused (`409`).
+- The link is **not** written into the identity's log, which is public and mirrored: it
+  would publish a provider account number next to the DID. The hub is the only party
+  that can check provider evidence, and it already issues the tokens, so this widens no
+  trust. `kith alias link` still links an account in the log (§5.1); either kind signs
+  the identity in, and a session ends when no link of either kind remains.
+- The reply carries `redirect` and a session cookie when the hub could finish the sign-in
+  the app started: the provider account signs in at AAL1 (`amr: fed`), the same as an
+  existing identity would. Otherwise (the request expired, or it asks for more than
+  AAL1) the person signs in with the passkey.
+- The next login from that provider account signs in to that identity.
+- Someone who typed an identity before choosing the provider is signing in, not signing
+  up, and still gets the "not linked" page.
+
+Not done: unlinking a provider account made this way, or linking another from a signed-in
+session. Provider attributes (name, email) apply to the session that provided them and
+are not stored.
+
+## 7.12 Work
+
+An identity can show it cost someone compute. This is a score, not a credential: it says
+nothing about who the holder is, only that effort was spent on this identity.
+
+A **proof** for `did` is a 64-bit `nonce` such that
+
+```
+SHA-256( "kith/work/v1" ‖ 0x00 ‖ did ‖ 0x00 ‖ nonce as 8 bytes, big-endian )
+```
+
+starts with many zero bits. The count of leading zero bits is the **work** of the proof.
+Each extra bit doubles the expected effort, so work grows with the logarithm of the time
+spent, and one hash checks a proof. The DID is in the preimage: a proof is for one
+identity and can't be moved to another.
+
+- `POST /v1/work {did, nonce}` records the proof if it has at least 12 bits and beats
+  the one on record. Anyone may submit; it can only raise that identity's work. The
+  identity must exist on the hub. It is rate limited per client address (default 120 a
+  minute). The reply is `{bits, work}`.
+- `GET /v1/work/{did}` returns `{did, work, nonce}`, so anyone can check the record.
+- Access tokens carry the attribute `work` (0 when none), next to `aal`. Group rules
+  and policies can use it: `principal.work >= 24`. The name is reserved, so an upstream
+  provider can't set it (§7.8). An ID token includes `work` when the `work` scope is
+  requested.
+- The browser sign-up page offers to mine for the new account, and `kith work` does the
+  same on all cores of a machine.
+
+Limits:
+- It prices bulk account creation; it doesn't prove a person. Someone with GPUs buys more
+  work per second than a phone does, and a policy that gates on `work` should expect it.
+- Bits are not comparable between hubs unless the hubs agree to trust each other's
+  records; the proof itself is portable, since anyone can recheck it.
+
+## 7.13 Joining a device
+
+A device joins an identity through a **join request** that the hub holds for one
+`add_device` event (§1.6). The identity's manage signers approve it, each with a
+signature over the event's message, and the new device proves it holds its key with a
+signature over the same message. Once the approvals satisfy the manage policy (§1.4)
+and the proof is in, the hub appends the event to the log. This is how an identity
+made in the browser (§7.11), whose manage key is a passkey that only a browser can use,
+gains devices. It works for any identity whose manage signers can sign in a browser or
+a terminal.
+
+There are two ways in:
+
+- **From a terminal.** `kith device join --hub https://hub.example` makes this
+  machine's key (in the Secure Enclave when there is one, §1.3.3) and opens a request
+  for it. It prints a link and a QR code. A browser signed in to the hub opens the link
+  and claims the request for its identity, and a manage signer approves it.
+- **By QR code, from the account page.** Signed in at `/whoami`, "Add a device" opens a
+  request for the identity, with no device yet, and shows a QR code of its link. A
+  phone that scans it makes a passkey on the hub's origin and proves it holds it; the
+  account page then approves it.
+
+```
+Terminal  POST /v1/join {device}                   → {id, url}; prints url, QR, fingerprint
+Browser   GET  /join/{id}, signed in; POST /v1/join/{id}/claim → {event, message}
+Terminal  polls; checks the event; asks "Join did:kith:…?"; POST /v1/join/{id}/pop {sig}
+Browser   credentials.get(challenge = SHA-256(message)); POST /v1/join/{id}/approve
+Hub       manage policy met and proof in → appends the event; state "done"
+
+Account   POST /v1/join/invite (session)           → {id, url}; the page shows a QR code
+Phone     GET  /join/{id}; credentials.create(user.id = DID)
+          POST /v1/join/{id}/device {key}          → {event, message}
+          credentials.get(challenge = SHA-256(message)); POST /v1/join/{id}/pop
+Account   polls; shows the fingerprint; credentials.get(…); POST /v1/join/{id}/approve
+```
+
+| Method, path | Who may call | Does |
+|--------------|--------------|------|
+| `POST /v1/join` `{device: {key, xkey?, name, kind, aal}}` | anyone; rate limited per address | Opens a request for a device that already holds its key. `kind` is `software` (`aal` 1) or `hardware` (`aal` 1 to 3); the device gets the caps `session` and `alias`. |
+| `POST /v1/join/invite` `{name?}` | a hub session (§7.6) | Opens a request for the session's identity, for a passkey not made yet. |
+| `GET /v1/join/{id}` | anyone with the id | The request as it stands: `state`, `did`, `device` (with its `fingerprint`), the unsigned `event` and its `message`, the signer ids in `approvals`, whether the manage policy is `approved`, whether the proof (`pop`) is in, `expires_at`, and `error` if it failed. |
+| `POST /v1/join/{id}/claim` | a hub session | Binds a terminal's request to the session's identity and builds the event. Once per request. |
+| `POST /v1/join/{id}/device` `{key, name?}` | anyone with the id | Supplies the new passkey (`ES256`) for an invite and builds the event. Once per request. The device is a `passkey` at `aal` 2 with the cap `session`, scoped to the hub's RP id. |
+| `POST /v1/join/{id}/approve` `{sig}` or `{webauthn}` | a manage signer | Adds one approval (below). |
+| `POST /v1/join/{id}/pop` `{sig}` or `{webauthn}` | the new device | Adds the proof of possession. |
+| `GET /join/{id}` | a browser | The page for every step and role. |
+| `GET /join/{id}/qr.svg` | a browser | A QR code of the request's link. |
+
+`state` is one of `waiting_for_identity` (a terminal's request nobody has claimed),
+`waiting_for_device` (an invite with no passkey yet), `waiting_for_approval`, `done`
+and `failed`.
+
+Rules:
+- The hub builds the event: `add_device` at the next `seq`, on the log as it holds it
+  then. The terminal checks it before it signs: the DID that claimed it, the next `seq`
+  and `prev` of that log, and exactly the device it asked for.
+- An approval is a signature over the message by a signer of the manage policy that
+  has not approved yet. It is `{sig}`, checked as §1.3 says, or `{webauthn}`: the
+  assertion's `authenticator_data`, `client_data_json` and `signature`, which the
+  browser sends without knowing its passkey's `did:key`. The hub tries each P-256
+  signer of the manage policy and keeps the one it verifies against. Any WebAuthn
+  signature, approval or proof, is checked as a login is: this hub's RP id and origins.
+- The proof is a signature by the new device's key over the same message. A passkey
+  proves with a WebAuthn assertion.
+- When the approvals satisfy the manage policy and the proof is in, the hub appends the
+  event, and `PUT /v1/kel` checks it again (§1.6). If the log moved in the meantime the
+  request fails and must be started again.
+- A request lasts 15 minutes and is held in memory. `POST /v1/join` counts against a
+  per-address limit (default 20 an hour), and at most 1000 requests are open at once.
+
+What a person checks:
+- **The terminal**: the link is a bearer value, and whoever signs in and opens it first
+  can claim the request. The terminal names the identity that claimed it and asks
+  before it signs; `--did` makes it refuse any other.
+- **The phone**: its page names the identity before it makes a passkey.
+- **Fingerprints**: the approving page shows the new key's fingerprint (§7.7), and the
+  terminal or the phone shows the same code for its own key. The person compares them
+  before approving.
+
+A terminal whose device key is a manage signer approves with
+`kith device approve <link or id>`, after the same check.
+
+**Changing who approves.** Only a `rotate` replaces the manage policy (§1.5), and only
+the keys committed in `next` sign one. For an identity made in the browser that is its
+recovery key. On a device that has joined:
+
+```bash
+kith manage set 2 passkey mac phone --recovery-key kith-recovery-key.json   # or --recovery-words
+```
+
+This signs a `rotate` whose manage policy is 2 of those devices' keys (named by device
+name, device id or `did:key`). It commits a new recovery key, saved as a file in the
+format the sign-up page downloads, unless `--next did:key:…` names one held elsewhere.
+The rotation reveals the old recovery key in the log, and it can't rotate again: the
+new one replaces it. Sign-in is unchanged; each device still signs in alone.
+
+The recovery key file:
+
+```json
+{ "kith": "recovery-key", "version": 1, "created": "2026-11-04T01:01:43.906Z",
+  "hub": "https://hub.example", "signer": "did:key:zDn…",
+  "private_key_jwk": { "kty": "EC", "crv": "P-256", "x": "…", "y": "…", "d": "…" } }
+```
+
+## 7.14 Not yet implemented
 
 - A page for the user to review and withdraw remembered consent (the admin API can).
 - Open client registration, and the registration management endpoint (RFC 7592).
+- Admitting applications (§7.2.1, draft): requests at `/v1/client-requests`, the
+  operator's queue to approve or deny them, and adding a client under a chosen
+  `client_id` through `POST /v1/admin/clients`.
 - `jwks_uri` and `sector_identifier_uri` for clients; encrypted userinfo.
 - Logout notices when a session expires or its device is revoked; retries.
 - Session management through `check_session_iframe`.
 - Pushed authorization requests (PAR), DPoP-bound tokens.
 - `claims` request parameter; request objects (JAR).
 - TOTP enrollment from the browser (CLI only today).
-- Linking started from the new device: a phone shows a QR code and a device that can
-  reach the manage key approves it. Today the CLI holding the manage key starts every
-  enrollment (§7.7).
+- Recovery with the recovery key from a browser, or from a machine that is not a device
+  of the identity (§7.11, §7.13); profile attributes and email verification for an
+  identity created in the browser.
+- Removing a device from the account page; joins that survive a hub restart.
 - Editing clients, and an audit log, through the admin API.

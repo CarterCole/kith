@@ -4,6 +4,46 @@ Kith is a draft. The format will change until v1, so entries record what changed
 behaviour, not a promise about compatibility. Versions follow the workspace version in
 `Cargo.toml`.
 
+## Unreleased
+
+### Added
+
+- **Joining devices** (spec §7.13). `kith device join --hub …` makes this machine's key
+  (in the Secure Enclave when there is one) and prints a link and a QR code; a browser
+  signed in to the hub claims it, and the terminal checks the event the hub built before
+  it signs. The account page's "Add a device" shows a QR code for a phone, which makes
+  its own passkey there. Manage signers approve in the browser, or with
+  `kith device approve`, until the manage policy is met; then the hub appends the event.
+- **`kith manage set`** replaces the manage policy with a rotation signed by the recovery
+  key from browser sign-up (its file, or `--recovery-words`), for example 2 of a passkey,
+  a Mac and a phone, and saves a new recovery key in the same format. `kith manage show`
+  lists the signers by device name.
+- **Browser sign-up** (spec §7.11, `--signup`): a passkey and a recovery key the browser
+  makes, or derives from secret words, create an identity the hub holds no key for. A
+  provider account that no identity links can sign up the same way and is linked to it.
+- **Work** (spec §7.12): `kith work` and the sign-up page spend compute on an identity,
+  and tokens carry the best proof as `work`.
+- `GET /login` redirects to the account page, `/whoami`, instead of answering 404.
+- **`kith bundle check`** (spec §4.1.1) refuses a bundle file that a loader would quietly
+  misread: a key written twice, an unknown member such as `"rols"`, a `group:` or `role:`
+  member that names no set, or a policy or rule that does not parse. It warns about
+  likely mistakes. `kith_core::bundle::check` is the library form.
+- **`kith bundle edit`**: a local browser editor for a bundle file kept in git, with
+  organizations (`org:` groups), roles by site, groups, people and raw JSON. It shows
+  each person's groups and roles as the draft stands, saves only a file that passes the
+  check, and renames it into place. Loopback only, behind a per-run token.
+- **`GET /v1/admin/identities`** lists every identity with its contacts, devices, last
+  sign-in and standing groups and roles. `GET /v1/admin/stats` gains `bundle`: which
+  bundle file is in force, and why a newer one is not.
+- Spec §7.2.1 drafts how an app asks to be admitted and waits for the operator.
+
+### Changed
+
+- **A bundle file that fails to load leaves the last good one in force** (spec §7.9).
+  Before, a half-written or invalid file made every sign-in fail until it was fixed.
+  The hub logs the error and reports it in the stats; at startup a bad file still stops
+  it. A file is now read again when its length changes as well as its modification time.
+
 ## 0.2.0 (2026-11-08)
 
 ### Security (November 2026 review)

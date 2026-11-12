@@ -45,7 +45,7 @@ pub const PENDING_TTL: i64 = 600;
 const JWKS_TTL: i64 = 3600;
 const JWKS_MIN_REFETCH: i64 = 60;
 /// Attributes the KEL and the login decide. No provider may assert them.
-const RESERVED_ATTRIBUTES: [&str; 3] = ["aliases", "aal", "email_verified"];
+const RESERVED_ATTRIBUTES: [&str; 4] = ["aliases", "aal", "work", "email_verified"];
 const FACEBOOK_GRAPH_VERSION: &str = "v25.0";
 
 fn default_scope() -> String {
@@ -103,7 +103,10 @@ pub struct Upstream {
 }
 
 fn secure_url(u: &str) -> bool {
-    u.starts_with("https://") || ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter().any(|p| u.starts_with(p))
+    u.starts_with("https://")
+        || ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+            .iter()
+            .any(|p| u.starts_with(p))
 }
 
 impl Upstream {
@@ -136,8 +139,12 @@ impl Upstream {
             client_id: app_id.into(),
             client_secret: None,
             scope: default_scope(),
-            authorization_endpoint: Some(format!("https://www.facebook.com/{FACEBOOK_GRAPH_VERSION}/dialog/oauth")),
-            token_endpoint: Some(format!("https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/oauth/access_token")),
+            authorization_endpoint: Some(format!(
+                "https://www.facebook.com/{FACEBOOK_GRAPH_VERSION}/dialog/oauth"
+            )),
+            token_endpoint: Some(format!(
+                "https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/oauth/access_token"
+            )),
             jwks_uri: Some("https://www.facebook.com/.well-known/oauth/openid/jwks/".into()),
             userinfo_endpoint: None,
             attributes: BTreeMap::new(),
@@ -146,27 +153,50 @@ impl Upstream {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.id.is_empty() || !self.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
-            anyhow::bail!("upstream id {:?} must be lowercase letters, digits and '-'", self.id);
+        if self.id.is_empty()
+            || !self
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            anyhow::bail!(
+                "upstream id {:?} must be lowercase letters, digits and '-'",
+                self.id
+            );
         }
         if self.issuer.ends_with('/') || self.issuer.contains(['#', '?']) {
-            anyhow::bail!("upstream {}: issuer must have no trailing slash, query or fragment", self.id);
+            anyhow::bail!(
+                "upstream {}: issuer must have no trailing slash, query or fragment",
+                self.id
+            );
         }
-        let urls = [Some(&self.issuer), self.authorization_endpoint.as_ref(), self.token_endpoint.as_ref(), self.jwks_uri.as_ref(), self.userinfo_endpoint.as_ref()];
+        let urls = [
+            Some(&self.issuer),
+            self.authorization_endpoint.as_ref(),
+            self.token_endpoint.as_ref(),
+            self.jwks_uri.as_ref(),
+            self.userinfo_endpoint.as_ref(),
+        ];
         for u in urls.into_iter().flatten() {
             if !secure_url(u) {
                 anyhow::bail!("upstream {}: {u} must be https or loopback http", self.id);
             }
         }
         if self.token_request == TokenRequest::Get && self.client_secret.is_some() {
-            anyhow::bail!("upstream {}: token_request get would put client_secret in a URL; leave it out", self.id);
+            anyhow::bail!(
+                "upstream {}: token_request get would put client_secret in a URL; leave it out",
+                self.id
+            );
         }
         if !self.scope.split_whitespace().any(|s| s == "openid") {
             anyhow::bail!("upstream {}: scope must include openid", self.id);
         }
         for (claim, attr) in &self.attributes {
             if claim.is_empty() || attr.is_empty() || RESERVED_ATTRIBUTES.contains(&attr.as_str()) {
-                anyhow::bail!("upstream {}: claim {claim:?} cannot become attribute {attr:?}", self.id);
+                anyhow::bail!(
+                    "upstream {}: claim {claim:?} cannot become attribute {attr:?}",
+                    self.id
+                );
             }
         }
         Ok(())
@@ -223,8 +253,28 @@ struct Pending {
     created: i64,
 }
 
+/// Seconds a verified provider account may take to create its identity.
+pub const TICKET_TTL: i64 = 900;
+pub const TICKET_COOKIE: &str = "kith_ticket";
+const MAX_TICKETS: usize = 1000;
+
+/// A provider account that signed in but has no identity yet, and may make one
+/// (spec §7.11). Held in memory; the browser that came back from the provider holds
+/// the matching cookie.
+#[derive(Debug, Clone)]
+pub(crate) struct Ticket {
+    pub provider: String,
+    pub name: String,
+    pub alias: String,
+    pub request_id: String,
+    /// What the provider asserted, already filtered ([`Upstream::attributes_from`]).
+    pub attrs: Map<String, Value>,
+    pub created: i64,
+}
+
 #[derive(Default)]
 pub struct UpstreamState {
+    tickets: HashMap<String, Ticket>,
     pending: HashMap<String, Pending>,
     meta: HashMap<String, Meta>,
     jwks: HashMap<String, (i64, Value)>,
@@ -255,18 +305,36 @@ fn claim_str(v: &Value) -> Option<String> {
 /// A missing `nonce` is tolerated: the token came straight from the token endpoint
 /// over TLS in exchange for a PKCE-bound code, so it cannot have been injected. A
 /// `nonce` that is present must match.
-pub fn verify_id_token(p: &Upstream, jwks: &Value, token: &str, nonce: &str, t: i64) -> ApiResult<Value> {
+pub fn verify_id_token(
+    p: &Upstream,
+    jwks: &Value,
+    token: &str,
+    nonce: &str,
+    t: i64,
+) -> ApiResult<Value> {
     let bad = |m: &str| ApiError::unauthorized(format!("{} ID token: {m}", p.display_name()));
     let tok = jws::decode(token).map_err(|e| bad(&e.to_string()))?;
     let alg = tok.header["alg"].as_str().unwrap_or_default();
-    let key = find_key(jwks, &tok.header).ok_or_else(|| bad("no matching key in the provider's JWKS"))?;
+    let key =
+        find_key(jwks, &tok.header).ok_or_else(|| bad("no matching key in the provider's JWKS"))?;
     match alg {
         "RS256" => {
-            let part = |k: &str| key[k].as_str().and_then(|s| b64u_decode(s).ok()).map(|b| BigUint::from_bytes_be(&b));
-            let (n, e) = part("n").zip(part("e")).ok_or_else(|| bad("malformed RSA key"))?;
-            let vk = VerifyingKey::<Sha256>::new(RsaPublicKey::new(n, e).map_err(|e| bad(&e.to_string()))?);
-            let sig = Signature::try_from(tok.signature.as_slice()).map_err(|_| bad("malformed signature"))?;
-            vk.verify(tok.signing_input.as_bytes(), &sig).map_err(|_| bad("bad signature"))?;
+            let part = |k: &str| {
+                key[k]
+                    .as_str()
+                    .and_then(|s| b64u_decode(s).ok())
+                    .map(|b| BigUint::from_bytes_be(&b))
+            };
+            let (n, e) = part("n")
+                .zip(part("e"))
+                .ok_or_else(|| bad("malformed RSA key"))?;
+            let vk = VerifyingKey::<Sha256>::new(
+                RsaPublicKey::new(n, e).map_err(|e| bad(&e.to_string()))?,
+            );
+            let sig = Signature::try_from(tok.signature.as_slice())
+                .map_err(|_| bad("malformed signature"))?;
+            vk.verify(tok.signing_input.as_bytes(), &sig)
+                .map_err(|_| bad("bad signature"))?;
         }
         "ES256" | "EdDSA" | "ES256K" => {
             let pk = PublicKey::from_jwk(key).map_err(|e| bad(&e.to_string()))?;
@@ -279,7 +347,9 @@ pub fn verify_id_token(p: &Upstream, jwks: &Value, token: &str, nonce: &str, t: 
         return Err(bad("wrong issuer"));
     }
     let aud_ok = match &c["aud"] {
-        Value::Array(a) => a.iter().any(|v| claim_str(v).as_deref() == Some(&p.client_id)),
+        Value::Array(a) => a
+            .iter()
+            .any(|v| claim_str(v).as_deref() == Some(&p.client_id)),
         v => claim_str(v).as_deref() == Some(&p.client_id),
     };
     if !aud_ok {
@@ -328,9 +398,39 @@ impl Hub {
         self.cfg.upstreams.iter().find(|u| u.id == id)
     }
 
+    fn new_ticket(&self, t: Ticket) -> Option<String> {
+        let mut u = self.upstream.lock().unwrap();
+        u.tickets.retain(|_, x| x.created + TICKET_TTL > now());
+        if u.tickets.len() >= MAX_TICKETS {
+            return None;
+        }
+        let id = random_id();
+        u.tickets.insert(id.clone(), t);
+        Some(id)
+    }
+
+    /// The provider's name, for the sign-up page; the ticket stays.
+    pub(crate) fn ticket_name(&self, id: &str) -> Option<String> {
+        let u = self.upstream.lock().unwrap();
+        u.tickets
+            .get(id)
+            .filter(|t| t.created + TICKET_TTL > now())
+            .map(|t| t.name.clone())
+    }
+
+    pub(crate) fn take_ticket(&self, id: &str) -> Option<Ticket> {
+        let t = self.upstream.lock().unwrap().tickets.remove(id)?;
+        (t.created + TICKET_TTL > now()).then_some(t)
+    }
+
     /// The attestation for a login that came through a provider this hub still trusts
     /// (spec 7.8.1). `None` for any other login, whatever aliases the KEL lists.
-    pub(crate) fn account_attestation(&self, client_id: &str, sub: &str, a: &Authn) -> ApiResult<Option<String>> {
+    pub(crate) fn account_attestation(
+        &self,
+        client_id: &str,
+        sub: &str,
+        a: &Authn,
+    ) -> ApiResult<Option<String>> {
         let Some(alias) = &a.alias else {
             return Ok(None);
         };
@@ -361,27 +461,49 @@ impl Hub {
     }
 
     async fn fetch_json(&self, url: &str) -> anyhow::Result<Value> {
-        Ok(self.http.get(url).send().await?.error_for_status()?.json().await?)
+        Ok(self
+            .http
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     async fn upstream_meta(&self, p: &Upstream) -> anyhow::Result<Meta> {
         if let Some(m) = self.upstream.lock().unwrap().meta.get(&p.id) {
             return Ok(m.clone());
         }
-        let configured = (p.authorization_endpoint.clone(), p.token_endpoint.clone(), p.jwks_uri.clone());
+        let configured = (
+            p.authorization_endpoint.clone(),
+            p.token_endpoint.clone(),
+            p.jwks_uri.clone(),
+        );
         // UserInfo is only looked up when the provider is trusted for attributes.
         let wants_userinfo = !p.attributes.is_empty() && p.userinfo_endpoint.is_none();
         let meta = match configured {
-            (Some(authorization_endpoint), Some(token_endpoint), Some(jwks_uri)) if !wants_userinfo => {
-                Meta { authorization_endpoint, token_endpoint, jwks_uri, userinfo_endpoint: p.userinfo_endpoint.clone() }
+            (Some(authorization_endpoint), Some(token_endpoint), Some(jwks_uri))
+                if !wants_userinfo =>
+            {
+                Meta {
+                    authorization_endpoint,
+                    token_endpoint,
+                    jwks_uri,
+                    userinfo_endpoint: p.userinfo_endpoint.clone(),
+                }
             }
             (a, t, j) => {
-                let d = self.fetch_json(&format!("{}/.well-known/openid-configuration", p.issuer)).await?;
+                let d = self
+                    .fetch_json(&format!("{}/.well-known/openid-configuration", p.issuer))
+                    .await?;
                 if d["issuer"] != p.issuer.as_str() {
                     anyhow::bail!("discovery document is for another issuer");
                 }
                 let pick = |have: Option<String>, k: &str| -> anyhow::Result<String> {
-                    let u = have.or_else(|| d[k].as_str().map(String::from)).ok_or_else(|| anyhow::anyhow!("discovery document has no {k}"))?;
+                    let u = have
+                        .or_else(|| d[k].as_str().map(String::from))
+                        .ok_or_else(|| anyhow::anyhow!("discovery document has no {k}"))?;
                     if !secure_url(&u) {
                         anyhow::bail!("{k} must be https");
                     }
@@ -392,31 +514,55 @@ impl Hub {
                     token_endpoint: pick(t, "token_endpoint")?,
                     jwks_uri: pick(j, "jwks_uri")?,
                     // Optional in discovery (OIDC Discovery §3).
-                    userinfo_endpoint: if p.attributes.is_empty() { None } else { pick(p.userinfo_endpoint.clone(), "userinfo_endpoint").ok() },
+                    userinfo_endpoint: if p.attributes.is_empty() {
+                        None
+                    } else {
+                        pick(p.userinfo_endpoint.clone(), "userinfo_endpoint").ok()
+                    },
                 }
             }
         };
-        self.upstream.lock().unwrap().meta.insert(p.id.clone(), meta.clone());
+        self.upstream
+            .lock()
+            .unwrap()
+            .meta
+            .insert(p.id.clone(), meta.clone());
         Ok(meta)
     }
 
     /// The provider's JWKS, cached. `kid` forces a refetch when the cached set lacks
     /// it (key rotation), at most once a minute.
-    async fn upstream_jwks(&self, p: &Upstream, meta: &Meta, header: &Value) -> anyhow::Result<Value> {
+    async fn upstream_jwks(
+        &self,
+        p: &Upstream,
+        meta: &Meta,
+        header: &Value,
+    ) -> anyhow::Result<Value> {
         let t = now();
         let cached = self.upstream.lock().unwrap().jwks.get(&p.id).cloned();
         if let Some((at, jwks)) = cached {
-            let stale = at + JWKS_TTL < t || (find_key(&jwks, header).is_none() && at + JWKS_MIN_REFETCH < t);
+            let stale = at + JWKS_TTL < t
+                || (find_key(&jwks, header).is_none() && at + JWKS_MIN_REFETCH < t);
             if !stale {
                 return Ok(jwks);
             }
         }
         let jwks = self.fetch_json(&meta.jwks_uri).await?;
-        self.upstream.lock().unwrap().jwks.insert(p.id.clone(), (t, jwks.clone()));
+        self.upstream
+            .lock()
+            .unwrap()
+            .jwks
+            .insert(p.id.clone(), (t, jwks.clone()));
         Ok(jwks)
     }
 
-    async fn upstream_exchange(&self, p: &Upstream, meta: &Meta, code: &str, pending: &Pending) -> ApiResult<Value> {
+    async fn upstream_exchange(
+        &self,
+        p: &Upstream,
+        meta: &Meta,
+        code: &str,
+        pending: &Pending,
+    ) -> ApiResult<Value> {
         let callback = self.upstream_callback(p);
         let form = [
             ("grant_type", "authorization_code"),
@@ -427,57 +573,105 @@ impl Hub {
         ];
         // Basic for confidential clients (what Telegram documents); public ones rely on PKCE.
         let req = match p.token_request {
-            TokenRequest::Get => self.http.get(with_params(&meta.token_endpoint, &form.map(|(k, v)| (k, Some(v))))),
+            TokenRequest::Get => self.http.get(with_params(
+                &meta.token_endpoint,
+                &form.map(|(k, v)| (k, Some(v))),
+            )),
             TokenRequest::Post => {
-                let body = form.iter().map(|(k, v)| format!("{k}={}", enc(v))).collect::<Vec<_>>().join("&");
-                let req = self.http.post(&meta.token_endpoint).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded").body(body);
+                let body = form
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", enc(v)))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                let req = self
+                    .http
+                    .post(&meta.token_endpoint)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(body);
                 match &p.client_secret {
                     Some(secret) => req.basic_auth(&p.client_id, Some(secret)),
                     None => req,
                 }
             }
         };
-        let unavailable = |e: String| ApiError(StatusCode::BAD_GATEWAY, "upstream_error".into(), e, None);
+        let unavailable =
+            |e: String| ApiError(StatusCode::BAD_GATEWAY, "upstream_error".into(), e, None);
         let resp = req.send().await.map_err(|e| unavailable(e.to_string()))?;
         let status = resp.status();
         let v: Value = resp.json().await.map_err(|e| unavailable(e.to_string()))?;
         if !status.is_success() {
-            return Err(unavailable(format!("token endpoint refused the code: {}", v["error"].as_str().unwrap_or(status.as_str()))));
+            return Err(unavailable(format!(
+                "token endpoint refused the code: {}",
+                v["error"].as_str().unwrap_or(status.as_str())
+            )));
         }
-        let token = v["id_token"].as_str().ok_or_else(|| unavailable("token response has no id_token".into()))?;
+        let token = v["id_token"]
+            .as_str()
+            .ok_or_else(|| unavailable("token response has no id_token".into()))?;
         let header = jws::decode(token).map_err(ApiError::unauthorized)?.header;
-        let jwks = self.upstream_jwks(p, meta, &header).await.map_err(|e| unavailable(e.to_string()))?;
+        let jwks = self
+            .upstream_jwks(p, meta, &header)
+            .await
+            .map_err(|e| unavailable(e.to_string()))?;
         let mut claims = verify_id_token(p, &jwks, token, &pending.nonce, now())?;
-        if let (Some(endpoint), Some(access_token)) = (&meta.userinfo_endpoint, v["access_token"].as_str()) {
+        if let (Some(endpoint), Some(access_token)) =
+            (&meta.userinfo_endpoint, v["access_token"].as_str())
+        {
             match self.upstream_userinfo(endpoint, access_token).await {
                 // OIDC Core §5.3.2: an answer about another subject must not be used.
                 Ok(info) if claim_str(&info["sub"]) != claim_str(&claims["sub"]) => {
-                    return Err(ApiError::unauthorized(format!("{} UserInfo is about another account", p.display_name())));
+                    return Err(ApiError::unauthorized(format!(
+                        "{} UserInfo is about another account",
+                        p.display_name()
+                    )));
                 }
                 Ok(Value::Object(info)) => {
                     // The signed ID token wins; UserInfo only adds what it lacks.
-                    let have = claims.as_object_mut().expect("verified claims are an object");
+                    let have = claims
+                        .as_object_mut()
+                        .expect("verified claims are an object");
                     for (k, val) in info {
                         have.entry(k).or_insert(val);
                     }
                 }
                 Ok(_) => {}
                 // The login stands on the ID token; it just carries fewer attributes.
-                Err(e) => eprintln!("upstream {}: UserInfo failed, continuing without it: {e}", p.id),
+                Err(e) => eprintln!(
+                    "upstream {}: UserInfo failed, continuing without it: {e}",
+                    p.id
+                ),
             }
         }
         Ok(claims)
     }
 
     async fn upstream_userinfo(&self, endpoint: &str, access_token: &str) -> anyhow::Result<Value> {
-        Ok(self.http.get(endpoint).bearer_auth(access_token).send().await?.error_for_status()?.json().await?)
+        Ok(self
+            .http
+            .get(endpoint)
+            .bearer_auth(access_token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     /// The identity an upstream account signs in: the one whose KEL links `alias`.
     /// Anyone can link any alias, so when several identities do, the browser has to
     /// say which one it means.
     fn identity_for_alias(&self, alias: &str, hint: Option<&str>) -> Result<String, &'static str> {
-        let mut linked: Vec<String> = self.kel_dids().into_iter().filter(|d| self.resolve_aliases(d).is_some_and(|a| a.contains(alias))).collect();
+        let mut linked: Vec<String> = self
+            .kel_dids()
+            .into_iter()
+            .filter(|d| self.resolve_aliases(d).is_some_and(|a| a.contains(alias)))
+            .collect();
+        // Accounts linked at sign-up are kept by the hub, not in the identity's log.
+        if let Ok(Some(d)) = self.store.provider_link(alias) {
+            if !linked.contains(&d) {
+                linked.push(d);
+            }
+        }
         match hint {
             Some(did) if linked.iter().any(|d| d == did) => Ok(did.to_string()),
             Some(_) => Err("not_linked"),
@@ -493,24 +687,58 @@ impl Hub {
     }
 }
 
+pub(crate) fn ticket_cookie(h: &Hub, value: &str, max_age: i64) -> HeaderValue {
+    let secure = if h.cfg.issuer.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    HeaderValue::from_str(&format!(
+        "{TICKET_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
+    ))
+    .expect("cookie")
+}
+
 fn state_cookie(h: &Hub, value: &str, max_age: i64) -> HeaderValue {
-    let secure = if h.cfg.issuer.starts_with("https://") { "; Secure" } else { "" };
+    let secure = if h.cfg.issuer.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
     HeaderValue::from_str(&format!("{STATE_COOKIE}={value}; Path=/oauth/upstream; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")).expect("cookie")
 }
 
 /// `GET /oauth/upstream/{id}/start?request_id=…[&did=…]`: the login page sends the
 /// browser here; it leaves for the provider's authorization endpoint.
-pub async fn start(State(h): State<Arc<Hub>>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+pub async fn start(
+    State(h): State<Arc<Hub>>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let Some(p) = h.upstream(&id).cloned() else {
-        return pages::message(StatusCode::NOT_FOUND, "Unknown sign-in method", "This hub doesn't accept that sign-in method.");
+        return pages::message(
+            StatusCode::NOT_FOUND,
+            "Unknown sign-in method",
+            "This hub doesn't accept that sign-in method.",
+        );
     };
     let request_id = q.get("request_id").cloned().unwrap_or_default();
     if h.store.request(&request_id).ok().flatten().is_none() {
-        return pages::message(StatusCode::BAD_REQUEST, "Sign-in expired", "This sign-in request expired. Go back to the app and try again.");
+        return pages::message(
+            StatusCode::BAD_REQUEST,
+            "Sign-in expired",
+            "This sign-in request expired. Go back to the app and try again.",
+        );
     }
     let meta = match h.upstream_meta(&p).await {
         Ok(m) => m,
-        Err(e) => return pages::message(StatusCode::BAD_GATEWAY, "Sign-in unavailable", &format!("{} can't be reached right now ({e}).", p.display_name())),
+        Err(e) => {
+            return pages::message(
+                StatusCode::BAD_GATEWAY,
+                "Sign-in unavailable",
+                &format!("{} can't be reached right now ({e}).", p.display_name()),
+            )
+        }
     };
     let (state, nonce) = (random_id(), random_id());
     let verifier = format!("{}{}", random_id(), random_id());
@@ -532,26 +760,59 @@ pub async fn start(State(h): State<Arc<Hub>>, Path(id): Path<String>, Query(q): 
         let t = now();
         u.pending.retain(|_, x| x.created + PENDING_TTL > t);
         let did = q.get("did").cloned().filter(|d| !d.is_empty());
-        u.pending.insert(state.clone(), Pending { provider: p.id.clone(), request_id, verifier, nonce, did, created: t });
+        u.pending.insert(
+            state.clone(),
+            Pending {
+                provider: p.id.clone(),
+                request_id,
+                verifier,
+                nonce,
+                did,
+                created: t,
+            },
+        );
     }
     let mut r = Redirect::to(&url).into_response();
-    r.headers_mut().insert(header::SET_COOKIE, state_cookie(&h, &state, PENDING_TTL));
-    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r.headers_mut()
+        .insert(header::SET_COOKIE, state_cookie(&h, &state, PENDING_TTL));
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
 }
 
 /// `GET /oauth/upstream/{id}/callback?code=…&state=…`: the provider sends the
 /// browser back here.
-pub async fn callback(State(h): State<Arc<Hub>>, Path(id): Path<String>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
+pub async fn callback(
+    State(h): State<Arc<Hub>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let mut r = finish(&h, &id, &headers, &q).await;
-    r.headers_mut().append(header::SET_COOKIE, state_cookie(&h, "", 0));
+    r.headers_mut()
+        .append(header::SET_COOKIE, state_cookie(&h, "", 0));
     r
 }
 
-async fn finish(h: &Arc<Hub>, id: &str, headers: &HeaderMap, q: &HashMap<String, String>) -> Response {
-    let expired = || pages::message(StatusCode::BAD_REQUEST, "Sign-in expired", "This sign-in request expired or was already used. Go back to the app and try again.");
+async fn finish(
+    h: &Arc<Hub>,
+    id: &str,
+    headers: &HeaderMap,
+    q: &HashMap<String, String>,
+) -> Response {
+    let expired = || {
+        pages::message(
+            StatusCode::BAD_REQUEST,
+            "Sign-in expired",
+            "This sign-in request expired or was already used. Go back to the app and try again.",
+        )
+    };
     let Some(p) = h.upstream(id).cloned() else {
-        return pages::message(StatusCode::NOT_FOUND, "Unknown sign-in method", "This hub doesn't accept that sign-in method.");
+        return pages::message(
+            StatusCode::NOT_FOUND,
+            "Unknown sign-in method",
+            "This hub doesn't accept that sign-in method.",
+        );
     };
     let name = p.display_name();
     // `state` must be one this hub issued, for this provider, to this browser.
@@ -559,11 +820,18 @@ async fn finish(h: &Arc<Hub>, id: &str, headers: &HeaderMap, q: &HashMap<String,
     let Some(pending) = h.upstream.lock().unwrap().pending.remove(&state) else {
         return expired();
     };
-    if pending.provider != p.id || pending.created + PENDING_TTL < now() || cookie(headers, STATE_COOKIE).as_deref() != Some(state.as_str()) {
+    if pending.provider != p.id
+        || pending.created + PENDING_TTL < now()
+        || cookie(headers, STATE_COOKIE).as_deref() != Some(state.as_str())
+    {
         return expired();
     }
     if q.contains_key("error") {
-        return pages::message(StatusCode::UNAUTHORIZED, "Sign-in cancelled", &format!("{name} did not sign you in. Go back to the app and try again."));
+        return pages::message(
+            StatusCode::UNAUTHORIZED,
+            "Sign-in cancelled",
+            &format!("{name} did not sign you in. Go back to the app and try again."),
+        );
     }
     let Some(code) = q.get("code") else {
         return expired();
@@ -573,11 +841,23 @@ async fn finish(h: &Arc<Hub>, id: &str, headers: &HeaderMap, q: &HashMap<String,
     };
     let meta = match h.upstream_meta(&p).await {
         Ok(m) => m,
-        Err(e) => return pages::message(StatusCode::BAD_GATEWAY, "Sign-in unavailable", &format!("{name} can't be reached right now ({e}).")),
+        Err(e) => {
+            return pages::message(
+                StatusCode::BAD_GATEWAY,
+                "Sign-in unavailable",
+                &format!("{name} can't be reached right now ({e})."),
+            )
+        }
     };
     let claims = match h.upstream_exchange(&p, &meta, code, &pending).await {
         Ok(c) => c,
-        Err(e) => return pages::message(e.0, "Sign-in failed", &format!("{name} sign-in could not be verified: {}", e.2)),
+        Err(e) => {
+            return pages::message(
+                e.0,
+                "Sign-in failed",
+                &format!("{name} sign-in could not be verified: {}", e.2),
+            )
+        }
     };
     let alias = p.alias(&claim_str(&claims["sub"]).unwrap_or_default());
     let did = match h.identity_for_alias(&alias, pending.did.as_deref()) {
@@ -589,6 +869,27 @@ async fn finish(h: &Arc<Hub>, id: &str, headers: &HeaderMap, q: &HashMap<String,
                 &format!("More than one Kith identity links this {name} account. Go back, enter your Kith identity under \"Other ways to sign in\", and try again."),
             )
         }
+        // A new account: with sign-up open, let it make an identity (a passkey) and link
+        // itself. Someone who typed an identity is signing in, not signing up.
+        Err(_) if pending.did.is_none() && h.cfg.signup => {
+            let ticket = Ticket {
+                provider: p.id.clone(),
+                name: name.clone(),
+                alias,
+                request_id: pending.request_id.clone(),
+                attrs: p.attributes_from(&claims),
+                created: now(),
+            };
+            return match h.new_ticket(ticket) {
+                Some(id) => {
+                    let mut r = Redirect::to(&format!("/signup?ticket={id}")).into_response();
+                    r.headers_mut().append(header::SET_COOKIE, ticket_cookie(h, &id, TICKET_TTL));
+                    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                    r
+                }
+                None => pages::message(StatusCode::SERVICE_UNAVAILABLE, "Busy", "Too many sign-ups are in progress. Try again shortly."),
+            };
+        }
         Err(_) => {
             return pages::message(
                 StatusCode::UNAUTHORIZED,
@@ -597,14 +898,21 @@ async fn finish(h: &Arc<Hub>, id: &str, headers: &HeaderMap, q: &HashMap<String,
             )
         }
     };
-    let factor = Factor::Federated { provider: p.id.clone(), alias: alias.clone() };
+    let factor = Factor::Federated {
+        provider: p.id.clone(),
+        alias: alias.clone(),
+    };
     let attrs = p.attributes_from(&claims);
     let a = match h.authenticate(&did, "", &[factor]) {
-        Ok(a) => crate::Authn { attrs: attrs.clone(), ..a },
+        Ok(a) => crate::Authn {
+            attrs: attrs.clone(),
+            ..a
+        },
         Err(e) => return pages::message(e.0, "Sign-in failed", &e.2),
     };
     if a.aal >= ar.min_aal {
-        let Some((url, session)) = crate::oidc::complete_login(h, &pending.request_id, ar, a) else {
+        let Some((url, session)) = crate::oidc::complete_login(h, &pending.request_id, ar, a)
+        else {
             return expired();
         };
         let mut r = Redirect::to(&url).into_response();
@@ -612,11 +920,23 @@ async fn finish(h: &Arc<Hub>, id: &str, headers: &HeaderMap, q: &HashMap<String,
         return r;
     }
     // Not strong enough alone: back to the login page to add a one-time code.
-    let fed = Federated { did, provider: p.id.clone(), alias, attrs, token: random_id() };
-    crate::oidc::login_page(h, &pending.request_id, &ar, Some((&fed, &name))).unwrap_or_else(expired)
+    let fed = Federated {
+        did,
+        provider: p.id.clone(),
+        alias,
+        attrs,
+        token: random_id(),
+    };
+    crate::oidc::login_page(h, &pending.request_id, &ar, Some((&fed, &name)))
+        .unwrap_or_else(expired)
 }
 
 /// What discovery and the login page say about the configured providers.
 pub(crate) fn summary(h: &Hub) -> Value {
-    json!(h.cfg.upstreams.iter().map(|u| json!({"id": u.id, "name": u.display_name(), "issuer": u.issuer})).collect::<Vec<_>>())
+    json!(h
+        .cfg
+        .upstreams
+        .iter()
+        .map(|u| json!({"id": u.id, "name": u.display_name(), "issuer": u.issuer}))
+        .collect::<Vec<_>>())
 }

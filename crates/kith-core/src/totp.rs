@@ -33,7 +33,11 @@ pub fn code_for_step(secret: &[u8], step: i64, digits: u32) -> String {
     let h = mac.finalize().into_bytes();
     let off = (h[19] & 0x0f) as usize;
     let bin = u32::from_be_bytes([h[off] & 0x7f, h[off + 1], h[off + 2], h[off + 3]]);
-    format!("{:0width$}", bin % 10u32.pow(digits), width = digits as usize)
+    format!(
+        "{:0width$}",
+        bin % 10u32.pow(digits),
+        width = digits as usize
+    )
 }
 
 pub fn code_at(secret: &[u8], unix: i64) -> String {
@@ -44,7 +48,12 @@ pub fn code_at(secret: &[u8], unix: i64) -> String {
 /// within ±`skew` steps.
 pub fn verify(secret: &[u8], code: &str, unix: i64, skew: i64) -> Option<i64> {
     let step = unix / STEP;
-    (step - skew..=step + skew).find(|s| constant_time_eq(code_for_step(secret, *s, DIGITS).as_bytes(), code.as_bytes()))
+    (step - skew..=step + skew).find(|s| {
+        constant_time_eq(
+            code_for_step(secret, *s, DIGITS).as_bytes(),
+            code.as_bytes(),
+        )
+    })
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -52,8 +61,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 pub fn otpauth_uri(secret: &[u8], issuer: &str, account: &str) -> String {
-    let enc = |s: &str| s.replace('%', "%25").replace(' ', "%20").replace(':', "%3A").replace('&', "%26").replace('?', "%3F").replace('/', "%2F");
-    format!("otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits=6&period=30", enc(issuer), enc(account), to_base32(secret), enc(issuer))
+    let enc = |s: &str| {
+        s.replace('%', "%25")
+            .replace(' ', "%20")
+            .replace(':', "%3A")
+            .replace('&', "%26")
+            .replace('?', "%3F")
+            .replace('/', "%2F")
+    };
+    format!(
+        "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits=6&period=30",
+        enc(issuer),
+        enc(account),
+        to_base32(secret),
+        enc(issuer)
+    )
 }
 
 #[cfg(test)]

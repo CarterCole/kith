@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bundle editor</title>
+<style nonce="{{NONCE}}">
+:root {
+  --bg: #f6f5f2; --card: #ffffff; --ink: #1b1b1f; --muted: #62626b; --line: #e3e1dc;
+  --accent: #2f5bd3; --accent-ink: #ffffff; --danger: #b3261e; --warn: #8a5a00; --ok: #1e7a3c;
+  --chip: #eef1fb; --chip-group: #eef7f0; --chip-role: #f7f0fa;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #121214; --card: #1c1c20; --ink: #ececf1; --muted: #a0a0ab; --line: #2e2e35;
+          --accent: #7b9cff; --accent-ink: #0d0d10; --danger: #ff8a80; --warn: #f3c56b; --ok: #7bd88f;
+          --chip: #252b40; --chip-group: #1f3326; --chip-role: #33263a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+       font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--line);
+         padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+header .title { font-weight: 700; }
+header code { color: var(--muted); font-size: 13px; word-break: break-all; }
+header .spacer { flex: 1; }
+.pill { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.pill.dirty { color: var(--warn); border-color: var(--warn); }
+.pill.bad { color: var(--danger); border-color: var(--danger); }
+.pill.saved { color: var(--ok); border-color: var(--ok); }
+.wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; margin: 4px 0 16px; }
+nav button { width: auto; background: transparent; border: 1px solid transparent; color: var(--muted); padding: 6px 12px; }
+nav button[aria-selected="true"] { background: var(--card); border-color: var(--line); color: var(--ink); }
+button { border: 0; border-radius: 8px; padding: 8px 12px; font: inherit; font-weight: 600; cursor: pointer;
+         background: var(--card); color: var(--ink); border: 1px solid var(--line); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.danger { color: var(--danger); }
+button:disabled { opacity: .5; cursor: default; }
+button.x { padding: 0 6px; border: 0; background: transparent; color: var(--muted); font-weight: 400; }
+input, select, textarea { padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
+                          background: transparent; color: var(--ink); font: inherit; }
+select option, select optgroup { background: var(--card); color: var(--ink); }
+textarea { width: 100%; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+textarea.json { min-height: 60vh; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.problems { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; margin-bottom: 16px; }
+.problems ul { margin: 4px 0; padding-left: 20px; }
+.problems li.error { color: var(--danger); }
+.problems li.warning { color: var(--warn); }
+.problems .none { color: var(--ok); }
+.note { color: var(--muted); font-size: 13px; margin: 6px 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+article { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+article .head { display: flex; gap: 8px; align-items: center; }
+article h3 { margin: 0; font-size: 15px; flex: 1; word-break: break-all; }
+article .desc { width: 100%; margin: 8px 0; }
+article details { margin-top: 8px; }
+article summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+h2 { font-size: 16px; margin: 20px 0 8px; }
+h2:first-child { margin-top: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; min-height: 28px; }
+.chip { display: inline-flex; align-items: center; gap: 2px; padding: 2px 4px 2px 10px; border-radius: 999px;
+        background: var(--chip); font-size: 13px; max-width: 100%; }
+.chip.group { background: var(--chip-group); }
+.chip.role { background: var(--chip-role); }
+.chip .kind { color: var(--muted); margin-right: 4px; }
+.chip span.t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.add { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.add select { flex: 1; min-width: 140px; }
+.add input { flex: 1; min-width: 140px; }
+.new { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 12px; }
+.empty { color: var(--muted); font-size: 13px; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+th, td { text-align: left; padding: 8px 10px; border-top: 1px solid var(--line); vertical-align: top; font-size: 13px; }
+th { color: var(--muted); font-weight: 600; border-top: 0; }
+td code { font-size: 12px; color: var(--muted); word-break: break-all; }
+td input { width: 100%; min-width: 150px; }
+.banner { background: var(--card); border: 1px solid var(--danger); color: var(--danger); border-radius: 12px; padding: 10px 14px; margin-bottom: 16px; }
+.hidden { display: none !important; }
+@media (max-width: 600px) { .grid { grid-template-columns: 1fr; } table { display: block; overflow-x: auto; } }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">Bundle editor</span>
+  <code id="file"></code>
+  <span class="spacer"></span>
+  <span id="status" class="pill">Loading…</span>
+  <button id="save" class="primary" disabled>Save</button>
+</header>
+<div class="wrap">
+  <div id="banner" class="banner hidden"></div>
+  <section class="problems" aria-live="polite">
+    <div id="problems"></div>
+  </section>
+  <nav role="tablist" id="tabs"></nav>
+  <main id="view"></main>
+</div>
+<script nonce="{{NONCE}}">
+"use strict";
+const token = location.hash.slice(1);
+const TABS = [["orgs", "Organizations"], ["roles", "Roles"], ["groups", "Groups"], ["people", "People"], ["json", "JSON"]];
+let tab = "orgs";
+let file = "", sha = "", savedText = "", text = "";
+let bundle = null;            // the parsed bundle the views edit; null while the JSON does not parse
+let people = [], peopleNote = null;
+let report = { errors: [], warnings: [] }, analysis = {};
+let jsonDraft = null;         // text typed in the JSON tab that has not been applied
+
+const $ = (id) => document.getElementById(id);
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v;
+    else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat(Infinity)) if (kid != null) e.append(kid);
+  return e;
+}
+
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    headers: { "x-kith-editor": token, "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await r.json(); } catch (_) { data = null; }
+  return { status: r.status, data: data || {} };
+}
+
+// Stable output for clean diffs: fixed member order, set names sorted.
+function sortedObject(o, fn) {
+  const out = {};
+  for (const k of Object.keys(o || {}).sort()) out[k] = fn ? fn(o[k]) : o[k];
+  return out;
+}
+function orderSet(def) {
+  const out = {};
+  for (const k of ["description", "members", "rule"]) if (def && def[k] !== undefined) out[k] = def[k];
+  for (const k of Object.keys(def || {})) if (!(k in out)) out[k] = def[k];
+  return out;
+}
+function serialize(b) {
+  const out = {};
+  out.version = b.version;
+  if (b.groups !== undefined) out.groups = sortedObject(b.groups, orderSet);
+  if (b.roles !== undefined) out.roles = sortedObject(b.roles, orderSet);
+  if (b.directory !== undefined) out.directory = sortedObject(b.directory);
+  if (b.policies !== undefined) out.policies = b.policies;
+  for (const k of Object.keys(b)) if (!(k in out)) out[k] = b[k];
+  return JSON.stringify(out, null, 2) + "\n";
+}
+
+// ---- names ---------------------------------------------------------------
+function person(did) { return people.find((p) => p.did === did); }
+function short(did) { return did.length > 26 ? did.slice(0, 14) + "…" + did.slice(-6) : did; }
+function label(did) {
+  const attrs = (bundle && bundle.directory && bundle.directory[did] && bundle.directory[did].attrs) || {};
+  if (typeof attrs.name === "string" && attrs.name) return attrs.name;
+  const p = person(did);
+  const c = p && p.contacts && p.contacts[0] && p.contacts[0].address;
+  if (c) return c.replace(/^(mailto|tel):/, "");
+  if (p && p.aliases && p.aliases.length) return p.aliases[0];
+  if (p && p.linked && p.linked.length) return p.linked[0];
+  return short(did);
+}
+function allDids() {
+  const s = new Set(people.map((p) => p.did));
+  for (const d of Object.keys(analysis)) s.add(d);
+  return [...s].sort((a, b) => label(a).localeCompare(label(b)));
+}
+function memberChip(m, onRemove) {
+  let kind = "", t = m, cls = "chip";
+  if (m.startsWith("group:org:")) { kind = "org"; t = m.slice(10); cls += " group"; }
+  else if (m.startsWith("group:")) { kind = "group"; t = m.slice(6); cls += " group"; }
+  else if (m.startsWith("role:")) { kind = "role"; t = m.slice(5); cls += " role"; }
+  else if (m.startsWith("did:")) { t = label(m); }
+  return el("span", { class: cls, title: m },
+    kind ? el("span", { class: "kind", text: kind }) : null,
+    el("span", { class: "t", text: t }),
+    el("button", { class: "x", "aria-label": "Remove " + t, text: "×", onclick: onRemove }));
+}
+
+// ---- state ---------------------------------------------------------------
+function changed() {
+  text = serialize(bundle);
+  render();
+  scheduleCheck();
+}
+let checkTimer = null;
+function scheduleCheck(raw) {
+  clearTimeout(checkTimer);
+  checkTimer = setTimeout(async () => {
+    const r = await api("POST", "/api/check", { text: raw === undefined ? text : raw });
+    if (r.status !== 200) return showBanner(r.data.error || "check failed (" + r.status + ")");
+    report = r.data.report; analysis = r.data.analysis || {};
+    renderStatus(); renderProblems();
+    if (tab !== "json") renderView();
+  }, 200);
+}
+function showBanner(msg, action) {
+  const b = $("banner");
+  b.replaceChildren(el("span", { text: msg }), action || null);
+  b.classList.toggle("hidden", !msg);
+}
+
+async function load() {
+  if (!token) return showBanner("This page needs the address `kith bundle edit` printed (it ends in #…).");
+  const r = await api("GET", "/api/state");
+  if (r.status !== 200) return showBanner(r.data.error || "could not load (" + r.status + ")");
+  const s = r.data;
+  file = s.file; sha = s.sha; savedText = s.text; text = s.text;
+  people = s.people || []; peopleNote = s.people_error;
+  report = s.report; analysis = s.analysis || {};
+  jsonDraft = null;
+  try { bundle = JSON.parse(s.text); } catch (_) { bundle = null; tab = "json"; jsonDraft = s.text; }
+  $("file").textContent = file;
+  showBanner(null);
+  render();
+}
+
+async function save() {
+  const r = await api("PUT", "/api/bundle", { text, sha });
+  if (r.status === 200) {
+    sha = r.data.sha; savedText = text; report = r.data.report;
+    showBanner(null);
+  } else if (r.status === 409) {
+    showBanner(r.data.error, el("button", { text: "Reload", onclick: load }));
+  } else {
+    if (r.data.report) report = r.data.report;
+    showBanner(r.data.error || "save failed (" + r.status + ")");
+  }
+  render();
+}
+
+// ---- edits ---------------------------------------------------------------
+function sets(kind) { if (!bundle[kind]) bundle[kind] = {}; return bundle[kind]; }
+function addSet(kind, name) {
+  name = name.trim();
+  if (!name) return;
+  if (sets(kind)[name]) return showBanner(kind.slice(0, -1) + " " + name + " already exists");
+  sets(kind)[name] = { members: [] };
+  changed();
+}
+function deleteSet(kind, name) {
+  const ref = (kind === "groups" ? "group:" : "role:") + name;
+  const users = referrers(ref);
+  const more = users.length ? " It is also taken out of " + users.length + " set(s) that list it." : "";
+  if (!confirm("Delete " + kind.slice(0, -1) + " " + name + "?" + more)) return;
+  delete bundle[kind][name];
+  for (const k of ["groups", "roles"]) for (const def of Object.values(bundle[k] || {}))
+    if (Array.isArray(def.members)) def.members = def.members.filter((m) => m !== ref);
+  changed();
+}
+function referrers(ref) {
+  const out = [];
+  for (const [k, singular] of [["groups", "group"], ["roles", "role"]])
+    for (const [n, def] of Object.entries(bundle[k] || {}))
+      if (Array.isArray(def.members) && def.members.includes(ref)) out.push(singular + " " + n);
+  return out;
+}
+function addMember(def, m) {
+  m = (m || "").trim();
+  if (!m) return;
+  if (!Array.isArray(def.members)) def.members = [];
+  if (!def.members.includes(m)) def.members.push(m);
+  changed();
+}
+function setDirectoryName(did, name) {
+  if (!bundle.directory) bundle.directory = {};
+  const entry = bundle.directory[did] || { attrs: {} };
+  entry.attrs = entry.attrs || {};
+  if (name.trim()) entry.attrs.name = name.trim(); else delete entry.attrs.name;
+  if (Object.keys(entry.attrs).length || Object.keys(entry).length > 1) bundle.directory[did] = entry;
+  else delete bundle.directory[did];
+  changed();
+}
+
+// ---- views ---------------------------------------------------------------
+function render() { renderStatus(); renderProblems(); renderTabs(); renderView(); }
+
+function renderStatus() {
+  const s = $("status");
+  const dirty = text !== savedText || jsonDraft !== null;
+  const bad = report.errors.length > 0;
+  s.className = "pill" + (bad ? " bad" : dirty ? " dirty" : " saved");
+  s.textContent = bad ? report.errors.length + " error" + (report.errors.length > 1 ? "s" : "")
+    : dirty ? "Unsaved changes" : "Saved";
+  $("save").disabled = bad || text === savedText || jsonDraft !== null || bundle === null;
+}
+
+function renderProblems() {
+  const box = $("problems");
+  const items = [...report.errors.map((m) => ["error", m]), ...report.warnings.map((m) => ["warning", m])];
+  const kids = [];
+  if (!items.length) kids.push(el("span", { class: "none", text: "No problems. " }));
+  else kids.push(el("ul", {}, items.map(([c, m]) => el("li", { class: c, text: (c === "error" ? "Error: " : "Warning: ") + m }))));
+  kids.push(el("p", { class: "note", text: text === savedText && jsonDraft === null
+    ? "Saving writes the file. Review it with git diff, commit, then deploy."
+    : "Changes are not written until you save. The file on disk always passes the check." }));
+  if (peopleNote) kids.push(el("p", { class: "note", text: peopleNote }));
+  box.replaceChildren(...kids);
+}
+
+function renderTabs() {
+  $("tabs").replaceChildren(...TABS.map(([id, name]) => el("button", {
+    role: "tab", "aria-selected": String(tab === id), text: name,
+    onclick: () => { if (tab === "json" && jsonDraft !== null && !confirm("Leave without applying the JSON you typed?")) return; if (tab === "json") jsonDraft = null; tab = id; render(); },
+    disabled: bundle === null && id !== "json",
+  })));
+}
+
+function renderView() {
+  const v = $("view");
+  if (tab === "json" || bundle === null) return v.replaceChildren(jsonView());
+  if (tab === "orgs") return v.replaceChildren(orgsView());
+  if (tab === "roles") return v.replaceChildren(rolesView());
+  if (tab === "groups") return v.replaceChildren(groupsView());
+  if (tab === "people") return v.replaceChildren(peopleView());
+}
+
+function memberOptions(selfRef, existing) {
+  const sel = el("select", { "aria-label": "Member to add" }, el("option", { value: "", text: "Add a member…" }));
+  const group = (name, items) => { if (items.length) sel.append(el("optgroup", { label: name }, items.map(([v, t]) => el("option", { value: v, text: t })))); };
+  const left = (v) => v !== selfRef && !existing.includes(v);
+  group("People", allDids().filter(left).map((d) => [d, label(d)]));
+  const gs = Object.keys(bundle.groups || {}).sort();
+  group("Organizations", gs.filter((g) => g.startsWith("org:")).map((g) => ["group:" + g, g.slice(4)]).filter(([v]) => left(v)));
+  group("Groups", gs.filter((g) => !g.startsWith("org:")).map((g) => ["group:" + g, g]).filter(([v]) => left(v)));
+  group("Roles", Object.keys(bundle.roles || {}).sort().map((r) => ["role:" + r, r]).filter(([v]) => left(v)));
+  return sel;
+}
+
+function whoIsIn(kind, name) {
+  const key = kind === "groups" ? "groups" : "roles";
+  const now = [], strong = [];
+  for (const [did, a] of Object.entries(analysis)) {
+    if ((a.standing[key] || []).includes(name)) now.push(label(did));
+    else if ((a.strong[key] || []).includes(name)) strong.push(label(did));
+  }
+  const parts = [];
+  parts.push(now.length ? "In it: " + now.sort().join(", ") + "." : "Nobody is in it yet.");
+  if (strong.length) parts.push("With a passkey sign-in: " + strong.sort().join(", ") + ".");
+  return parts.join(" ");
+}
+
+function setCard(kind, name, title) {
+  const def = bundle[kind][name];
+  const ref = (kind === "groups" ? "group:" : "role:") + name;
+  const members = Array.isArray(def.members) ? def.members : [];
+  const sel = memberOptions(ref, members);
+  const did = el("input", { placeholder: "or paste a DID", "aria-label": "DID to add" });
+  const used = referrers(ref);
+  return el("article", {},
+    el("div", { class: "head" },
+      el("h3", { text: title || name, title: name }),
+      el("button", { class: "danger", text: "Delete", onclick: () => deleteSet(kind, name) })),
+    el("input", { class: "desc", placeholder: "What it is for", value: def.description || "",
+      "aria-label": "Description of " + name,
+      onchange: (e) => { if (e.target.value.trim()) def.description = e.target.value.trim(); else delete def.description; changed(); } }),
+    el("div", { class: "chips" }, members.length ? members.map((m) => memberChip(m, () => { def.members = members.filter((x) => x !== m); changed(); }))
+      : el("span", { class: "empty", text: def.rule ? "No listed members; the rule decides." : "No members." })),
+    el("div", { class: "add" }, sel, el("button", { text: "Add", onclick: () => addMember(def, sel.value) }),
+      did, el("button", { text: "Add", onclick: () => addMember(def, did.value) })),
+    el("details", def.rule ? { open: true } : {},
+      el("summary", { text: "Rule: members by condition (Cedar)" }),
+      el("textarea", { rows: 2, placeholder: "principal.aal >= 2", "aria-label": "Rule for " + name,
+        onchange: (e) => { if (e.target.value.trim()) def.rule = e.target.value.trim(); else delete def.rule; changed(); } }, def.rule || "")),
+    el("p", { class: "note", text: whoIsIn(kind, name) }),
+    used.length ? el("p", { class: "note", text: "Listed by " + used.join(", ") + "." }) : null);
+}
+
+function newBox(placeholder, button, onAdd, prefixPlaceholder) {
+  const pre = prefixPlaceholder ? el("input", { placeholder: prefixPlaceholder, "aria-label": prefixPlaceholder, size: 12 }) : null;
+  const name = el("input", { placeholder, "aria-label": placeholder });
+  const go = () => { onAdd(pre ? pre.value.trim() : null, name.value.trim()); };
+  name.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+  return el("div", { class: "new" }, pre, name, el("button", { text: button, onclick: go }));
+}
+
+function orgsView() {
+  const names = Object.keys(bundle.groups || {}).filter((g) => g.startsWith("org:")).sort();
+  return el("div", {},
+    el("p", { class: "note", text: "An organization is a group named org:…. Put people in it here, then list it in a site's roles." }),
+    newBox("New organization, e.g. acme", "Add organization", (_, n) => addSet("groups", "org:" + n.replace(/^org:/, ""))),
+    names.length ? el("div", { class: "grid" }, names.map((n) => setCard("groups", n, n.slice(4))))
+      : el("p", { class: "empty", text: "No organizations yet." }));
+}
+
+function rolesView() {
+  const names = Object.keys(bundle.roles || {}).sort();
+  const bySite = new Map();
+  for (const n of names) {
+    const site = n.includes(":") ? n.slice(0, n.indexOf(":")) : "";
+    if (!bySite.has(site)) bySite.set(site, []);
+    bySite.get(site).push(n);
+  }
+  const sites = [...bySite.keys()].sort((a, b) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
+  const policies = el("textarea", { rows: 6, "aria-label": "Policies", placeholder: "permit(principal in Role::\"carterbox:admin\", action, resource);",
+    onchange: (e) => { bundle.policies = e.target.value; changed(); } }, bundle.policies || "");
+  return el("div", {},
+    el("p", { class: "note", text: "Apps read roles from the sign-in token. Name a site's roles site:role, such as carterbox:admin." }),
+    newBox("Role, e.g. admin", "Add role", (site, n) => addSet("roles", site ? site + ":" + n : n), "site (optional)"),
+    sites.map((site) => [
+      el("h2", { text: site || "Hub-wide" }),
+      el("div", { class: "grid" }, bySite.get(site).map((n) => setCard("roles", n))),
+    ]),
+    el("h2", { text: "Policies (Cedar)" }),
+    el("p", { class: "note", text: "Optional. Apps that ask the Kith libraries for a decision use these; apps that only read roles do not." }),
+    policies);
+}
+
+function groupsView() {
+  const names = Object.keys(bundle.groups || {}).filter((g) => !g.startsWith("org:")).sort();
+  return el("div", {},
+    el("p", { class: "note", text: "Groups collect people (or other groups) for roles to list. Organizations are on their own tab." }),
+    newBox("New group, e.g. testers", "Add group", (_, n) => addSet("groups", n)),
+    names.length ? el("div", { class: "grid" }, names.map((n) => setCard("groups", n)))
+      : el("p", { class: "empty", text: "No groups besides organizations." }));
+}
+
+function peopleView() {
+  const rows = allDids().map((did) => {
+    const p = person(did);
+    const a = analysis[did] || { standing: { groups: [], roles: [] }, strong: { groups: [], roles: [] } };
+    const extra = a.strong.roles.filter((r) => !a.standing.roles.includes(r));
+    const attrs = (bundle.directory && bundle.directory[did] && bundle.directory[did].attrs) || {};
+    const contact = p ? [...(p.contacts || []).map((c) => c.address.replace(/^(mailto|tel):/, "")), ...(p.aliases || []), ...(p.linked || [])].join(", ") : "";
+    const last = p && p.last_sign_in ? new Date(p.last_sign_in * 1000).toLocaleString() : "";
+    return el("tr", {},
+      el("td", {}, el("input", { value: typeof attrs.name === "string" ? attrs.name : "", placeholder: label(did),
+        "aria-label": "Name for " + did, onchange: (e) => setDirectoryName(did, e.target.value) })),
+      el("td", { text: contact || (p ? "" : "Not on the hub's list") }),
+      el("td", {}, el("code", { text: did })),
+      el("td", { text: [a.standing.roles.join(", "), extra.length ? "with a passkey: " + extra.join(", ") : ""].filter(Boolean).join("; ") }),
+      el("td", { text: a.standing.groups.map((g) => g.replace(/^org:/, "org ")).join(", ") }),
+      el("td", { text: last }));
+  });
+  return el("div", {},
+    el("p", { class: "note", text: "The name goes in the bundle's directory, so apps also see it as the name attribute. Leave it empty to show the contact instead." }),
+    rows.length ? el("table", {},
+      el("thead", {}, el("tr", {}, ["Name", "Contact", "DID", "Roles", "Groups", "Last sign-in"].map((h) => el("th", { text: h })))),
+      el("tbody", {}, rows))
+      : el("p", { class: "empty", text: "Nobody yet." }));
+}
+
+function jsonView() {
+  const area = el("textarea", { class: "json", spellcheck: "false", "aria-label": "Bundle JSON" }, jsonDraft !== null ? jsonDraft : text);
+  const msg = el("p", { class: "note" });
+  area.addEventListener("input", () => { jsonDraft = area.value; renderStatus(); scheduleCheck(area.value); });
+  const apply = async () => {
+    let parsed;
+    try { parsed = JSON.parse(area.value); }
+    catch (e) { msg.textContent = "Not valid JSON yet: " + e.message; return; }
+    // Parsing keeps only the last of a repeated key, so the other tabs would lose one.
+    const r = await api("POST", "/api/check", { text: area.value });
+    if ((r.data.report?.errors || []).some((e) => e.includes("more than once"))) {
+      msg.textContent = "Fix the repeated keys first: applying would keep only the last of each.";
+      return;
+    }
+    bundle = parsed;
+    jsonDraft = null;
+    changed();
+  };
+  return el("div", {},
+    el("p", { class: "note", text: "Edit the whole file. Apply puts it back into the other tabs; Save still writes it." }),
+    area,
+    el("div", { class: "new" }, el("button", { class: "primary", text: "Apply", onclick: apply }),
+      el("button", { text: "Discard", onclick: () => { jsonDraft = null; scheduleCheck(); render(); } })),
+    msg);
+}
+
+$("save").addEventListener("click", save);
+window.addEventListener("beforeunload", (e) => { if (text !== savedText || jsonDraft !== null) e.preventDefault(); });
+window.addEventListener("hashchange", () => location.reload());
+load();
+</script>
+</body>
+</html>

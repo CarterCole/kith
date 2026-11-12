@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Add a passkey · Kith</title>
+<title>Add a passkey · {{BRAND}}</title>
 <style nonce="{{NONCE}}">{{STYLE}}</style>
 </head>
 <body>
 <main>
-  <div class="brand">Kith</div>
+  <div class="brand">{{BRAND}}</div>
   <h1>Add a passkey to your identity</h1>
   <p>This passkey becomes a device of<code id="did" class="block"></code>Your terminal approves it with your manage key.</p>
   <p id="check" class="hidden">Your terminal asks you to approve a passkey. Check that it shows this code:<code id="fingerprint" class="block"></code></p>
@@ -23,21 +23,6 @@
 $("did").textContent = D.did;
 let key, rawId;
 
-const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-function base58(bytes) {
-  let n = 0n;
-  for (const b of bytes) n = n * 256n + BigInt(b);
-  let out = "";
-  while (n > 0n) { out = B58[Number(n % 58n)] + out; n /= 58n; }
-  for (const b of bytes) { if (b !== 0) break; out = "1" + out; }
-  return out;
-}
-function p256DidKey(spki) {
-  const b = new Uint8Array(spki);
-  const pt = b.slice(b.length - 65);
-  const compressed = [pt[64] & 1 ? 3 : 2, ...pt.slice(1, 33)];
-  return "did:key:z" + base58(new Uint8Array([0x80, 0x24, ...compressed]));
-}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // The first six bytes of SHA-256(did:key), as xxxx-xxxx-xxxx. `kith` prints the same.
 async function fingerprint(k) {
@@ -53,7 +38,7 @@ $("create").onclick = async () => {
   try {
     const cred = await navigator.credentials.create({
       publicKey: {
-        rp: { id: D.rp_id, name: "Kith" },
+        rp: { id: D.rp_id, name: "{{BRAND}}" },
         user: { id: new TextEncoder().encode(D.did), name: D.name, displayName: D.name },
         challenge: crypto.getRandomValues(new Uint8Array(32)),
         pubKeyCredParams: [{ type: "public-key", alg: -7 }],

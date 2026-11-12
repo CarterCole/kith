@@ -6,6 +6,8 @@
 //! Real deployments keep the manage key on hardware or in a wallet and recovery keys
 //! offline.
 
+mod bundle;
+mod join;
 mod keystore;
 mod names;
 mod org;
@@ -17,7 +19,9 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
 use kith_core::alias::{verify_alias_proof, AliasProof, PrivateAlias};
-use kith_core::kel::{new_inception, next_event, verify_log, Device, DeviceKind, Event, EventBody, KeyState};
+use kith_core::kel::{
+    new_inception, next_event, verify_log, Device, DeviceKind, Event, EventBody, KeyState,
+};
 use kith_core::keys::{KeyType, LocalSigner, Scheme, SecretKey, Sig, VerifyOptions};
 use kith_core::policy::SignerPolicy;
 use kith_core::session::{Capability, DeviceSigner, SessionKey};
@@ -28,7 +32,11 @@ use kith_core::{jws, totp};
 use keystore::Backend;
 
 #[derive(Parser)]
-#[command(name = "kith", version, about = "Universal identity: one root, many devices, sessions, aliases and delegation")]
+#[command(
+    name = "kith",
+    version,
+    about = "Universal identity: one root, many devices, sessions, aliases and delegation"
+)]
 struct Cli {
     /// State directory.
     #[arg(long, env = "KITH_HOME", global = true)]
@@ -77,6 +85,10 @@ enum Cmd {
     /// keychain, or forget them.
     #[command(subcommand)]
     Keys(KeysCmd),
+    /// Who approves new devices and other changes (the manage policy), and changing it
+    /// with the recovery key (spec §7.13).
+    #[command(subcommand)]
+    Manage(ManageCmd),
     /// Rotate the manage key using the pre-committed recovery keys.
     Rotate {
         /// Also revoke every device (use after a compromise).
@@ -95,6 +107,17 @@ enum Cmd {
     /// `--to ada` anywhere a DID is expected.
     #[command(subcommand)]
     Name(names::NameCmd),
+    /// Spend compute on your identity (spec §7.12): find a nonce whose SHA-256 with your
+    /// DID has many leading zero bits, and give the best one to the hub. Each extra bit
+    /// doubles the effort; apps can read the result as the `work` attribute.
+    Work {
+        /// Stop once this many bits are found (0 keeps going until `--seconds`).
+        #[arg(long, default_value_t = 24)]
+        bits: u32,
+        /// Stop after this long, whatever was found.
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
     /// Resolve a public alias to its root: the alias side's back-link (WebFinger,
     /// DNS TXT or did:web) must name the root, and the root's KEL must link the alias.
     Resolve { alias: String },
@@ -149,6 +172,9 @@ enum Cmd {
     Inspect { token: String },
     #[command(subcommand)]
     Hub(HubCmd),
+    /// Policy bundle files: check one before it is deployed, or edit one in the browser.
+    #[command(subcommand)]
+    Bundle(bundle::BundleCmd),
     /// Policy DAGs: publish a bundle, fetch provable slices, list grants.
     #[command(subcommand)]
     Policy(org::PolicyCmd),
@@ -205,6 +231,45 @@ enum DeviceCmd {
         #[arg(long)]
         sig: String,
     },
+    /// Join an identity from this machine (spec §7.13). Makes this machine's key (in the
+    /// Secure Enclave when there is one) and prints a link and QR code; a browser signed
+    /// in to the hub adds it, and a manage signer approves it.
+    Join {
+        /// The hub that holds the identity, e.g. https://accounts.example.com.
+        #[arg(long, env = "KITH_HUB")]
+        hub: String,
+        /// Refuse to join any identity but this one.
+        #[arg(long)]
+        did: Option<String>,
+        /// This device's name in the identity's log, which is public (default: mac, or
+        /// computer).
+        #[arg(long)]
+        name: Option<String>,
+        /// `keychain` or `file` (default: keychain on macOS, file elsewhere).
+        #[arg(long)]
+        keystore: Option<String>,
+        /// Keep this device's key in software even when a Secure Enclave is available.
+        #[arg(long)]
+        no_secure_enclave: bool,
+        /// Ask for Touch ID on every signature by this device's Secure Enclave key, and
+        /// join at AAL3.
+        #[arg(long)]
+        touch_id: bool,
+        /// Don't try to open the browser; just print the link and QR code.
+        #[arg(long)]
+        no_open: bool,
+        /// Join without asking once an identity claims this device.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Approve a device that is joining this identity, with this device's key. The key
+    /// must be one of the identity's manage signers (`kith manage show`).
+    Approve {
+        /// The join link, or its id.
+        request: String,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Use an exported device on this machine.
     Import {
         file: PathBuf,
@@ -212,7 +277,40 @@ enum DeviceCmd {
         #[arg(long)]
         keystore: Option<String>,
     },
-    Revoke { id: String },
+    Revoke {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManageCmd {
+    /// Show who approves changes to this identity, by device name where they are devices.
+    Show,
+    /// Replace the manage policy with a rotation signed by the recovery key, e.g.
+    /// `kith manage set 2 passkey mac phone --recovery-key kith-recovery-key.json`.
+    /// Commits a new recovery key, saved as a file unless `--next` names one.
+    Set {
+        /// How many of the signers must approve.
+        threshold: usize,
+        /// Device names, device ids or did:keys.
+        #[arg(required = true)]
+        signers: Vec<String>,
+        /// The recovery key file the sign-up page downloaded, or an earlier
+        /// `kith manage set` saved.
+        #[arg(long, conflicts_with = "recovery_words")]
+        recovery_key: Option<PathBuf>,
+        /// Read the recovery phrase from standard input instead.
+        #[arg(long)]
+        recovery_words: bool,
+        /// Commit to this did:key as the next recovery key instead of making one.
+        #[arg(long, conflicts_with = "next_out")]
+        next: Option<String>,
+        /// Where to save the new recovery key (default: kith-recovery-key-<seq>.json here).
+        #[arg(long)]
+        next_out: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -234,7 +332,9 @@ enum KeysCmd {
 enum AliasCmd {
     List,
     /// Create a private alias and commit to it in the KEL.
-    New { label: String },
+    New {
+        label: String,
+    },
     /// Prove a private alias is yours.
     Prove {
         label: String,
@@ -256,14 +356,18 @@ enum AliasCmd {
         max_age: i64,
     },
     /// Publicly link an alias (mailto:, https:, did:web:, eip155:…).
-    Link { alias: String },
+    Link {
+        alias: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum TotpCmd {
     /// Enroll TOTP at the hub; prints the otpauth URI for your authenticator app.
     Enroll,
-    Confirm { code: String },
+    Confirm {
+        code: String,
+    },
     /// Forget the authenticator so a new one can be enrolled. Needs a current code, or
     /// a strong (AAL 2) sign-in such as a passkey. Sign-ins that rested on the
     /// authenticator alone end. An operator can also do it: `DELETE /v1/admin/identities/{did}/totp`.
@@ -273,7 +377,9 @@ enum TotpCmd {
         code: Option<String>,
     },
     /// Compute the current code for a base32 secret (acts as an authenticator app).
-    Code { secret: String },
+    Code {
+        secret: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -351,6 +457,13 @@ enum HubCmd {
         /// that proxy appended to `X-Forwarded-For`.
         #[arg(long)]
         behind_proxy: bool,
+        /// Let anyone create an account in the browser at `/signup` (a passkey, and a
+        /// recovery key the browser makes). Off by default: it opens the registry.
+        #[arg(long)]
+        signup: bool,
+        /// The name the hub's pages show (letters, digits and spaces). Default: Kith.
+        #[arg(long)]
+        brand: Option<String>,
         /// Take groups and roles from this org's policy DAG instead of --bundle.
         #[arg(long)]
         policy_org: Option<String>,
@@ -425,7 +538,12 @@ impl DeviceKey {
         match self {
             DeviceKey::Software(s) => Ok(s.sign(msg)?),
             #[cfg(target_os = "macos")]
-            DeviceKey::Enclave(k) => Ok(Sig { signer: k.id.clone(), alg: kith_core::keys::key_sig_alg(KeyType::P256).into(), sig: b64u(k.sign(msg)?), webauthn: None }),
+            DeviceKey::Enclave(k) => Ok(Sig {
+                signer: k.id.clone(),
+                alg: kith_core::keys::key_sig_alg(KeyType::P256).into(),
+                sig: b64u(k.sign(msg)?),
+                webauthn: None,
+            }),
         }
     }
 
@@ -447,14 +565,35 @@ impl DeviceKey {
     /// Certify a fresh session key.
     fn grant_session(&self, did: &str, dev: &Device, ttl: i64) -> Result<SessionKey> {
         Ok(match self {
-            DeviceKey::Software(s) if dev.kind == DeviceKind::Passkey => {
-                SessionKey::create(did, dev, DeviceSigner::Passkey { key: &s.secret, rp_id: "localhost", origin: "http://localhost", user_verified: true }, ttl)?
+            DeviceKey::Software(s) if dev.kind == DeviceKind::Passkey => SessionKey::create(
+                did,
+                dev,
+                DeviceSigner::Passkey {
+                    key: &s.secret,
+                    rp_id: "localhost",
+                    origin: "http://localhost",
+                    user_verified: true,
+                },
+                ttl,
+            )?,
+            DeviceKey::Software(s) => {
+                SessionKey::create(did, dev, DeviceSigner::Key(&s.secret), ttl)?
             }
-            DeviceKey::Software(s) => SessionKey::create(did, dev, DeviceSigner::Key(&s.secret), ttl)?,
             #[cfg(target_os = "macos")]
             DeviceKey::Enclave(k) => {
-                let sign = |m: &[u8]| k.sign(m).map_err(|e| kith_core::Error::Signature(e.to_string()));
-                SessionKey::create(did, dev, DeviceSigner::External { kty: KeyType::P256, sign: &sign }, ttl)?
+                let sign = |m: &[u8]| {
+                    k.sign(m)
+                        .map_err(|e| kith_core::Error::Signature(e.to_string()))
+                };
+                SessionKey::create(
+                    did,
+                    dev,
+                    DeviceSigner::External {
+                        kty: KeyType::P256,
+                        sign: &sign,
+                    },
+                    ttl,
+                )?
             }
         })
     }
@@ -490,7 +629,11 @@ fn session_slot(dev_id: &str) -> String {
 impl Home {
     fn load(dir: PathBuf) -> Result<Self> {
         let p = dir.join("identity.json");
-        let v = if p.exists() { serde_json::from_str(&std::fs::read_to_string(&p)?)? } else { json!({}) };
+        let v = if p.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&p)?)?
+        } else {
+            json!({})
+        };
         Ok(Home { dir, v })
     }
 
@@ -507,11 +650,17 @@ impl Home {
     }
 
     fn did(&self) -> Result<String> {
-        self.v["did"].as_str().map(String::from).ok_or_else(|| anyhow!("no identity here; run `kith init`"))
+        self.v["did"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow!("no identity here; run `kith init`"))
     }
 
     fn hub(&self) -> Result<String> {
-        self.v["hub"].as_str().map(|s| s.trim_end_matches('/').to_string()).ok_or_else(|| anyhow!("no hub configured"))
+        self.v["hub"]
+            .as_str()
+            .map(|s| s.trim_end_matches('/').to_string())
+            .ok_or_else(|| anyhow!("no hub configured"))
     }
 
     fn kel(&self) -> Result<Vec<Event>> {
@@ -531,7 +680,10 @@ impl Home {
     }
 
     fn device_id(&self) -> Result<String> {
-        self.v["device"]["id"].as_str().map(String::from).ok_or_else(|| anyhow!("no device on this machine"))
+        self.v["device"]["id"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow!("no device on this machine"))
     }
 
     /// Put a secret where this home keeps them. Returns what goes in the JSON file:
@@ -553,7 +705,10 @@ impl Home {
         }
         match self.backend() {
             Backend::Keychain => keystore::get(&self.did()?, slot),
-            Backend::File => bail!("no secret for {slot} in {}", self.dir.join("identity.json").display()),
+            Backend::File => bail!(
+                "no secret for {slot} in {}",
+                self.dir.join("identity.json").display()
+            ),
         }
     }
 
@@ -576,15 +731,23 @@ impl Home {
     }
 
     fn signer_from_json(&self, v: &Value) -> Result<LocalSigner> {
-        let id = v["id"].as_str().ok_or_else(|| anyhow!("signer without an id"))?;
+        let id = v["id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("signer without an id"))?;
         let kty: KeyType = serde_json::from_value(v["kty"].clone())?;
         let scheme: Scheme = serde_json::from_value(v["scheme"].clone())?;
         let secret = SecretKey::from_bytes(kty, &self.fetch(id, &v["secret"])?)?;
-        Ok(LocalSigner::from_secret(secret, scheme, Some(id.to_string()))?)
+        Ok(LocalSigner::from_secret(
+            secret,
+            scheme,
+            Some(id.to_string()),
+        )?)
     }
 
     fn signers(&self, key: &str) -> Result<Vec<LocalSigner>> {
-        let arr = self.v[key].as_array().ok_or_else(|| anyhow!("no {key} keys on this machine"))?;
+        let arr = self.v[key]
+            .as_array()
+            .ok_or_else(|| anyhow!("no {key} keys on this machine"))?;
         arr.iter().map(|s| self.signer_from_json(s)).collect()
     }
 
@@ -593,7 +756,10 @@ impl Home {
         for old in self.v[key].as_array().cloned().unwrap_or_default() {
             self.forget(old["id"].as_str().unwrap_or_default(), &old["secret"])?;
         }
-        let vals = new.iter().map(|s| self.signer_json(s)).collect::<Result<Vec<_>>>()?;
+        let vals = new
+            .iter()
+            .map(|s| self.signer_json(s))
+            .collect::<Result<Vec<_>>>()?;
         self.v[key] = json!(vals);
         Ok(())
     }
@@ -684,7 +850,9 @@ impl Home {
         let mut mv = |v: &mut Value, field: &str, slot: &str| -> Result<()> {
             if let Some(b) = v[field].as_str() {
                 keystore::put(&did, slot, &b64u_decode(b)?)?;
-                v.as_object_mut().ok_or_else(|| anyhow!("bad state"))?.remove(field);
+                v.as_object_mut()
+                    .ok_or_else(|| anyhow!("bad state"))?
+                    .remove(field);
                 moved += 1;
             }
             Ok(())
@@ -699,7 +867,10 @@ impl Home {
             let id = a["signer"]["id"].as_str().unwrap_or_default().to_string();
             mv(&mut a["signer"], "secret", &id)?;
         }
-        let id = self.v["device"]["signer"]["id"].as_str().unwrap_or_default().to_string();
+        let id = self.v["device"]["signer"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         mv(&mut self.v["device"]["signer"], "secret", &id)?;
         mv(&mut self.v["device"], "xkey", &xkey_slot(&dev_id))?;
         if self.v["session"].is_object() {
@@ -742,7 +913,12 @@ fn check(resp: reqwest::blocking::Response) -> Result<Value> {
     let status = resp.status();
     let body: Value = resp.json().unwrap_or(json!({}));
     if !status.is_success() {
-        bail!("hub returned {status}: {}", body["error_description"].as_str().unwrap_or(&body.to_string()));
+        bail!(
+            "hub returned {status}: {}",
+            body["error_description"]
+                .as_str()
+                .unwrap_or(&body.to_string())
+        );
     }
     Ok(body)
 }
@@ -750,12 +926,18 @@ fn check(resp: reqwest::blocking::Response) -> Result<Value> {
 fn publish(home: &Home) -> Result<()> {
     let Ok(hub) = home.hub() else { return Ok(()) };
     let did = home.did()?;
-    check(http().put(format!("{hub}/v1/kel/{did}")).json(&home.v["kel"]).send()?)?;
+    check(
+        http()
+            .put(format!("{hub}/v1/kel/{did}"))
+            .json(&home.v["kel"])
+            .send()?,
+    )?;
     Ok(())
 }
 
 fn fetch_state(hub: &str, did: &str) -> Result<KeyState> {
-    let events: Vec<Event> = serde_json::from_value(check(http().get(format!("{hub}/v1/kel/{did}")).send()?)?)?;
+    let events: Vec<Event> =
+        serde_json::from_value(check(http().get(format!("{hub}/v1/kel/{did}")).send()?)?)?;
     let st = verify_log(&events, &VerifyOptions::default())?;
     if st.did != did {
         bail!("hub returned a log for a different DID");
@@ -764,7 +946,11 @@ fn fetch_state(hub: &str, did: &str) -> Result<KeyState> {
 }
 
 fn new_device(name: &str, kind: DeviceKind, aal: u8) -> (Device, LocalSigner, ExchangeKey) {
-    let signer = LocalSigner::generate(if kind == DeviceKind::Passkey { KeyType::P256 } else { KeyType::Ed25519 });
+    let signer = LocalSigner::generate(if kind == DeviceKind::Passkey {
+        KeyType::P256
+    } else {
+        KeyType::Ed25519
+    });
     let xkey = ExchangeKey::generate();
     let dev = Device {
         id: format!("dev_{}", &random_id()[..8]),
@@ -783,7 +969,12 @@ fn new_device(name: &str, kind: DeviceKind, aal: u8) -> (Device, LocalSigner, Ex
 fn device_sign(ev: &mut Event, signer: &LocalSigner, kind: DeviceKind) -> Result<()> {
     if kind == DeviceKind::Passkey {
         let msg = ev.signing_message()?;
-        ev.add_sig(kith_core::webauthn::soft_sign_message(signer, "localhost", "http://localhost", &msg)?);
+        ev.add_sig(kith_core::webauthn::soft_sign_message(
+            signer,
+            "localhost",
+            "http://localhost",
+            &msg,
+        )?);
     } else {
         ev.sign(signer)?;
     }
@@ -796,11 +987,18 @@ fn session(home: &mut Home) -> Result<SessionKey> {
     let s = &home.v["session"];
     if s["exp"].as_i64().unwrap_or(0) > now() + 300 {
         let secret = SecretKey::from_bytes(KeyType::Ed25519, &home.fetch(&slot, &s["secret"])?)?;
-        return Ok(SessionKey { did, secret, grant: s["grant"].as_str().unwrap_or_default().into() });
+        return Ok(SessionKey {
+            did,
+            secret,
+            grant: s["grant"].as_str().unwrap_or_default().into(),
+        });
     }
     let (dev_id, signer) = home.device()?;
     let st = home.state()?;
-    let dev = st.device(&dev_id).ok_or_else(|| anyhow!("this device ({dev_id}) is not active in the KEL"))?.clone();
+    let dev = st
+        .device(&dev_id)
+        .ok_or_else(|| anyhow!("this device ({dev_id}) is not active in the KEL"))?
+        .clone();
     let ttl = 12 * 3600;
     let sk = signer.grant_session(&did, &dev, ttl)?;
     let secret = home.stash(&slot, &sk.secret.to_bytes())?;
@@ -813,37 +1011,71 @@ fn session(home: &mut Home) -> Result<SessionKey> {
 }
 
 fn store_token(home: &mut Home, aud: &str, resp: &Value) -> Result<String> {
-    let tok = resp["access_token"].as_str().ok_or_else(|| anyhow!("no access_token in response"))?.to_string();
-    home.v["tokens"][aud] = json!({"access_token": tok, "exp": now() + resp["expires_in"].as_i64().unwrap_or(0)});
+    let tok = resp["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no access_token in response"))?
+        .to_string();
+    home.v["tokens"][aud] =
+        json!({"access_token": tok, "exp": now() + resp["expires_in"].as_i64().unwrap_or(0)});
     home.save()?;
     Ok(tok)
 }
 
-fn login(home: &mut Home, aud: Option<String>, method: &str, totp_code: Option<String>, delegation: Option<String>) -> Result<(String, String)> {
+fn login(
+    home: &mut Home,
+    aud: Option<String>,
+    method: &str,
+    totp_code: Option<String>,
+    delegation: Option<String>,
+) -> Result<(String, String)> {
     let hub = home.hub()?;
     let aud = aud.unwrap_or_else(|| hub.clone());
     let resp = if let Some(dtok) = delegation {
         let sk = session(home)?;
         let actor = sk.session_token(&hub, json!({}))?;
-        check(http().post(format!("{hub}/v1/oauth/token")).form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
-            ("subject_token", dtok.as_str()),
-            ("subject_token_type", kith_hub::TT_DELEGATION),
-            ("actor_token", actor.as_str()),
-            ("actor_token_type", kith_hub::TT_SESSION),
-            ("audience", aud.as_str()),
-        ]).send()?)?
+        check(
+            http()
+                .post(format!("{hub}/v1/oauth/token"))
+                .form(&[
+                    (
+                        "grant_type",
+                        "urn:ietf:params:oauth:grant-type:token-exchange",
+                    ),
+                    ("subject_token", dtok.as_str()),
+                    ("subject_token_type", kith_hub::TT_DELEGATION),
+                    ("actor_token", actor.as_str()),
+                    ("actor_token_type", kith_hub::TT_SESSION),
+                    ("audience", aud.as_str()),
+                ])
+                .send()?,
+        )?
     } else if method == "challenge" {
         let did = home.did()?;
-        let ch = check(http().post(format!("{hub}/v1/auth/challenge")).json(&json!({"did": did})).send()?)?;
+        let ch = check(
+            http()
+                .post(format!("{hub}/v1/auth/challenge"))
+                .json(&json!({"did": did}))
+                .send()?,
+        )?;
         let msg = ch["message"].as_str().unwrap_or_default();
         // The device key also signs grants: sign only what is plainly a sign-in challenge.
         kith_core::session::check_login_challenge(msg, &did, now()).map_err(|e| anyhow!("refusing to sign what the hub sent: {e}"))?;
         let (dev_id, signer) = home.device()?;
-        let dev = home.state()?.device(&dev_id).cloned().ok_or_else(|| anyhow!("device not active"))?;
+        let dev = home
+            .state()?
+            .device(&dev_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("device not active"))?;
         let mut factors = vec![];
         if dev.kind == DeviceKind::Passkey {
-            let (data, sig) = kith_core::webauthn::soft_assert(signer.secret()?, "localhost", "http://localhost", &kith_core::util::sha256(msg.as_bytes()), true, 1)?;
+            let (data, sig) = kith_core::webauthn::soft_assert(
+                signer.secret()?,
+                "localhost",
+                "http://localhost",
+                &kith_core::util::sha256(msg.as_bytes()),
+                true,
+                1,
+            )?;
             factors.push(json!({"type": "webauthn", "device_id": dev_id, "authenticator_data": data.authenticator_data, "client_data_json": data.client_data_json, "signature": b64u(sig)}));
         } else {
             factors.push(json!({"type": "signature", "sig": signer.sign(msg.as_bytes())?}));
@@ -856,7 +1088,10 @@ fn login(home: &mut Home, aud: Option<String>, method: &str, totp_code: Option<S
         let sk = session(home)?;
         let st = sk.session_token(&hub, json!({}))?;
         let mut form = vec![
-            ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange".to_string()),
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+            ),
             ("subject_token", st),
             ("subject_token_type", kith_hub::TT_SESSION.to_string()),
             ("audience", aud.clone()),
@@ -864,7 +1099,12 @@ fn login(home: &mut Home, aud: Option<String>, method: &str, totp_code: Option<S
         if let Some(code) = totp_code {
             form.push(("totp", code));
         }
-        check(http().post(format!("{hub}/v1/oauth/token")).form(&form).send()?)?
+        check(
+            http()
+                .post(format!("{hub}/v1/oauth/token"))
+                .form(&form)
+                .send()?,
+        )?
     };
     let tok = store_token(home, &aud, &resp)?;
     Ok((aud, tok))
@@ -890,13 +1130,47 @@ fn print(v: &Value) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let dir = cli.home.clone().unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".kith"));
+    let dir = cli.home.clone().unwrap_or_else(|| {
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".kith")
+    });
 
-    if let Cmd::Hub(HubCmd::Serve { addr, issuer, data, bundle, rp_id, origins, clients, upstreams, registration_token, admin_token, behind_proxy, policy_org, beacon, heartbeat, contact_outbox, email_from, sms_from, sms_configuration_set, aws_region, phone_prefixes }) = cli.cmd {
+    if let Cmd::Hub(HubCmd::Serve {
+        addr,
+        issuer,
+        data,
+        bundle,
+        rp_id,
+        origins,
+        clients,
+        upstreams,
+        registration_token,
+        admin_token,
+        behind_proxy,
+        signup,
+        brand,
+        policy_org,
+        beacon,
+        heartbeat,
+        contact_outbox,
+        email_from,
+        sms_from,
+        sms_configuration_set,
+        aws_region,
+        phone_prefixes,
+    }) = cli.cmd
+    {
         // Browsers only allow passkeys on "localhost", not "127.0.0.1", so default to it.
         let port = addr.rsplit(':').next().unwrap_or("7777");
-        let local = ["127.0.0.1", "0.0.0.0", "localhost", "[::1]"].iter().any(|h| addr.starts_with(h));
-        let issuer = issuer.unwrap_or_else(|| if local { format!("http://localhost:{port}") } else { format!("http://{addr}") });
+        let local = ["127.0.0.1", "0.0.0.0", "localhost", "[::1]"]
+            .iter()
+            .any(|h| addr.starts_with(h));
+        let issuer = issuer.unwrap_or_else(|| {
+            if local {
+                format!("http://localhost:{port}")
+            } else {
+                format!("http://{addr}")
+            }
+        });
         let mut cfg = kith_hub::HubConfig::new(issuer, data);
         cfg.bundle_path = bundle;
         cfg.policy_org = policy_org;
@@ -912,42 +1186,93 @@ fn main() -> Result<()> {
             cfg.origins = origins;
         }
         if let Some(path) = clients {
-            cfg.clients = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?)?;
+            cfg.clients = serde_json::from_str(
+                &std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?,
+            )?;
         }
         cfg.registration_token = registration_token.filter(|t| !t.is_empty());
         cfg.admin_token = admin_token.filter(|t| !t.is_empty());
         cfg.behind_proxy = behind_proxy;
+        cfg.signup = signup;
+        if let Some(b) = &brand {
+            kith_hub::pages::set_brand(b);
+        }
         if let Some(path) = upstreams {
-            cfg.upstreams = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?)?;
+            cfg.upstreams = serde_json::from_str(
+                &std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?,
+            )?;
         }
         cfg.contacts.phone_prefixes = phone_prefixes;
         cfg.contacts.delivery = match (contact_outbox, email_from.is_some() || sms_from.is_some()) {
-            (Some(_), true) => bail!("--contact-outbox and AWS delivery (--email-from, --sms-from) exclude each other"),
+            (Some(_), true) => bail!(
+                "--contact-outbox and AWS delivery (--email-from, --sms-from) exclude each other"
+            ),
             (Some(path), false) => kith_hub::contacts::Delivery::Outbox(path),
-            (None, true) => kith_hub::contacts::Delivery::Aws(kith_hub::contacts::AwsDelivery { region: aws_region, email_from, sms_from, sms_configuration_set }),
+            (None, true) => kith_hub::contacts::Delivery::Aws(kith_hub::contacts::AwsDelivery {
+                region: aws_region,
+                email_from,
+                sms_from,
+                sms_configuration_set,
+            }),
             (None, false) => kith_hub::contacts::Delivery::None,
         };
         return tokio::runtime::Runtime::new()?.block_on(kith_hub::serve(cfg, &addr));
     }
 
+    // Bundle files need no identity of their own.
+    if let Cmd::Bundle(cmd) = cli.cmd {
+        return bundle::run(cmd);
+    }
+
     let mut home = Home::load(dir)?;
     match cli.cmd {
-        Cmd::Init { hub, device_name, wallet, keystore, no_secure_enclave, touch_id } => {
+        Cmd::Init {
+            hub,
+            device_name,
+            wallet,
+            keystore,
+            no_secure_enclave,
+            touch_id,
+        } => {
             if home.v.get("did").is_some() {
                 bail!("{} already holds an identity", home.dir.display());
             }
-            let backend = keystore.as_deref().map(Backend::parse).transpose()?.unwrap_or_else(Backend::platform_default).resolve();
+            let backend = keystore
+                .as_deref()
+                .map(Backend::parse)
+                .transpose()?
+                .unwrap_or_else(Backend::platform_default)
+                .resolve();
             let root = LocalSigner::generate(KeyType::Ed25519);
-            let mut recovery = vec![LocalSigner::generate(KeyType::Ed25519), LocalSigner::generate(KeyType::Ed25519)];
-            recovery.push(if wallet { LocalSigner::generate_eth_wallet(1) } else { LocalSigner::generate(KeyType::Ed25519) });
-            let rotation = SignerPolicy::threshold(2, recovery.iter().map(|s| SignerPolicy::single(&s.id)).collect());
+            let mut recovery = vec![
+                LocalSigner::generate(KeyType::Ed25519),
+                LocalSigner::generate(KeyType::Ed25519),
+            ];
+            recovery.push(if wallet {
+                LocalSigner::generate_eth_wallet(1)
+            } else {
+                LocalSigner::generate(KeyType::Ed25519)
+            });
+            let rotation = SignerPolicy::threshold(
+                2,
+                recovery
+                    .iter()
+                    .map(|s| SignerPolicy::single(&s.id))
+                    .collect(),
+            );
             // This device. A key alone is one possession factor, AAL1 (NIST 800-63B),
             // in software or in the Secure Enclave; step up with TOTP or a passkey. An
             // Enclave key that asks for Touch ID on every use is a multi-factor
             // hardware authenticator, AAL3.
             let dkey = new_device_key(backend, no_secure_enclave, touch_id);
             let xkey = ExchangeKey::generate();
-            let (kind, aal) = if dkey.is_hardware() { (DeviceKind::Hardware, if touch_id { 3 } else { 1 }) } else { (DeviceKind::Software, 1) };
+            let (kind, aal) = if dkey.is_hardware() {
+                (DeviceKind::Hardware, if touch_id { 3 } else { 1 })
+            } else {
+                (DeviceKind::Software, 1)
+            };
             let dev = Device {
                 id: format!("dev_{}", &random_id()[..8]),
                 key: dkey.id().to_string(),
@@ -958,7 +1283,8 @@ fn main() -> Result<()> {
                 rp_id: None,
                 xkey: Some(xkey.public_did_key()),
             };
-            let mut inc = new_inception(SignerPolicy::single(&root.id), &rotation, vec![dev.clone()]);
+            let mut inc =
+                new_inception(SignerPolicy::single(&root.id), &rotation, vec![dev.clone()]);
             inc.sign(&root)?;
             dkey.sign_event(&mut inc)?;
             let st = verify_log(std::slice::from_ref(&inc), &VerifyOptions::default())?;
@@ -971,7 +1297,18 @@ fn main() -> Result<()> {
                 eprintln!("warning: could not publish to hub ({e}); run `kith publish` later");
             }
             println!("{}", st.did);
-            eprintln!("created identity with device {} ({}, {} key, aal {}) and 2-of-3 recovery keys{}", dev.id, device_name, kind_str(kind), aal, if wallet { " (one is an Ethereum wallet)" } else { "" });
+            eprintln!(
+                "created identity with device {} ({}, {} key, aal {}) and 2-of-3 recovery keys{}",
+                dev.id,
+                device_name,
+                kind_str(kind),
+                aal,
+                if wallet {
+                    " (one is an Ethereum wallet)"
+                } else {
+                    ""
+                }
+            );
             match (backend, dkey.is_hardware()) {
                 (Backend::Keychain, true) => eprintln!("keys: in your login keychain (service `kith`); this device's key is in the Secure Enclave{}", if touch_id { " and asks for Touch ID on every signature" } else { "" }),
                 (Backend::Keychain, false) => eprintln!("keys: in your login keychain (service `kith`)"),
@@ -999,8 +1336,65 @@ fn main() -> Result<()> {
             eprintln!("published");
         }
         Cmd::Device(DeviceCmd::List) => print(&json!(home.state()?.devices)),
-        Cmd::Device(DeviceCmd::Add { name, key: Some(key), device_id, kind, aal, .. }) => {
-            let kind = if kind == "passkey" { DeviceKind::Passkey } else { DeviceKind::Hardware };
+        Cmd::Device(DeviceCmd::Join {
+            hub,
+            did,
+            name,
+            keystore,
+            no_secure_enclave,
+            touch_id,
+            no_open,
+            yes,
+        }) => join::join(
+            &mut home,
+            join::JoinOpts {
+                hub,
+                did,
+                name,
+                keystore,
+                no_secure_enclave,
+                touch_id,
+                no_open,
+                yes,
+            },
+        )?,
+        Cmd::Device(DeviceCmd::Approve { request, yes }) => {
+            join::approve(&mut home, &request, yes)?
+        }
+        Cmd::Manage(ManageCmd::Show) => join::manage_show(&mut home)?,
+        Cmd::Manage(ManageCmd::Set {
+            threshold,
+            signers,
+            recovery_key,
+            recovery_words,
+            next,
+            next_out,
+            yes,
+        }) => join::manage_set(
+            &mut home,
+            join::ManageSet {
+                threshold,
+                signers,
+                recovery_key,
+                recovery_words,
+                next,
+                next_out,
+                yes,
+            },
+        )?,
+        Cmd::Device(DeviceCmd::Add {
+            name,
+            key: Some(key),
+            device_id,
+            kind,
+            aal,
+            ..
+        }) => {
+            let kind = if kind == "passkey" {
+                DeviceKind::Passkey
+            } else {
+                DeviceKind::Hardware
+            };
             let st = home.state()?;
             let dev = Device {
                 id: device_id.unwrap_or_else(|| format!("dev_{}", &random_id()[..8])),
@@ -1012,7 +1406,12 @@ fn main() -> Result<()> {
                 rp_id: (kind == DeviceKind::Passkey).then(|| "localhost".to_string()),
                 xkey: None,
             };
-            let mut ev = next_event(&st, EventBody::AddDevice { device: dev.clone() });
+            let mut ev = next_event(
+                &st,
+                EventBody::AddDevice {
+                    device: dev.clone(),
+                },
+            );
             for m in home.signers("manage")? {
                 ev.sign(&m)?;
             }
@@ -1022,7 +1421,8 @@ fn main() -> Result<()> {
             print(&json!({"device_id": dev.id, "signer": dev.key, "message": msg}));
         }
         Cmd::Device(DeviceCmd::Complete { sig }) => {
-            let mut ev: Event = serde_json::from_value(home.v["pending"].take()).context("no pending device enrollment")?;
+            let mut ev: Event = serde_json::from_value(home.v["pending"].take())
+                .context("no pending device enrollment")?;
             ev.add_sig(serde_json::from_str(&sig)?);
             home.append(ev)?;
             home.v.as_object_mut().unwrap().remove("pending");
@@ -1030,8 +1430,15 @@ fn main() -> Result<()> {
             publish(&home)?;
             eprintln!("device enrolled");
         }
-        Cmd::Device(DeviceCmd::Add { name, kind, aal, out, .. }) => {
-            let out = out.ok_or_else(|| anyhow!("--out is required when kith generates the device key"))?;
+        Cmd::Device(DeviceCmd::Add {
+            name,
+            kind,
+            aal,
+            out,
+            ..
+        }) => {
+            let out =
+                out.ok_or_else(|| anyhow!("--out is required when kith generates the device key"))?;
             let kind = match kind.as_str() {
                 "software" => DeviceKind::Software,
                 "passkey" => DeviceKind::Passkey,
@@ -1045,7 +1452,12 @@ fn main() -> Result<()> {
             });
             let st = home.state()?;
             let (dev, signer, xkey) = new_device(&name, kind, aal);
-            let mut ev = next_event(&st, EventBody::AddDevice { device: dev.clone() });
+            let mut ev = next_event(
+                &st,
+                EventBody::AddDevice {
+                    device: dev.clone(),
+                },
+            );
             for m in home.signers("manage")? {
                 ev.sign(&m)?;
             }
@@ -1055,26 +1467,50 @@ fn main() -> Result<()> {
             let export = json!({"did": st.did, "hub": home.v["hub"], "kel": home.v["kel"], "device": {"id": dev.id, "signer": signer.to_json(), "xkey": b64u(xkey.to_bytes())}});
             std::fs::write(&out, serde_json::to_vec_pretty(&export)?)?;
             println!("{}", dev.id);
-            eprintln!("added {} device {}; import it elsewhere with `kith device import {}`", kind_str(kind), dev.id, out.display());
+            eprintln!(
+                "added {} device {}; import it elsewhere with `kith device import {}`",
+                kind_str(kind),
+                dev.id,
+                out.display()
+            );
         }
         Cmd::Device(DeviceCmd::Import { file, keystore }) => {
             if home.v.get("did").is_some() {
                 bail!("{} already holds an identity", home.dir.display());
             }
             let v: Value = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
-            let backend = keystore.as_deref().map(Backend::parse).transpose()?.unwrap_or_else(Backend::platform_default).resolve();
+            let backend = keystore
+                .as_deref()
+                .map(Backend::parse)
+                .transpose()?
+                .unwrap_or_else(Backend::platform_default)
+                .resolve();
             home.v = json!({"did": v["did"], "hub": v["hub"], "keystore": backend.name(), "kel": v["kel"], "aliases": []});
             home.state()?;
-            let dev_id = v["device"]["id"].as_str().ok_or_else(|| anyhow!("export has no device id"))?.to_string();
-            let signer = DeviceKey::Software(Box::new(LocalSigner::from_json(&v["device"]["signer"])?));
+            let dev_id = v["device"]["id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("export has no device id"))?
+                .to_string();
+            let signer =
+                DeviceKey::Software(Box::new(LocalSigner::from_json(&v["device"]["signer"])?));
             let xkey = v["device"]["xkey"].as_str().map(b64u_decode).transpose()?;
             home.v["device"] = home.device_json(&dev_id, &signer, xkey.as_deref())?;
             home.save()?;
-            eprintln!("imported device {dev_id} for {} (keys: {})", v["did"].as_str().unwrap_or("?"), backend.name());
+            eprintln!(
+                "imported device {dev_id} for {} (keys: {})",
+                v["did"].as_str().unwrap_or("?"),
+                backend.name()
+            );
         }
         Cmd::Device(DeviceCmd::Revoke { id }) => {
             let st = home.state()?;
-            let mut ev = next_event(&st, EventBody::RevokeDevice { device_id: id.clone(), reason: None });
+            let mut ev = next_event(
+                &st,
+                EventBody::RevokeDevice {
+                    device_id: id.clone(),
+                    reason: None,
+                },
+            );
             for m in home.signers("manage")? {
                 ev.sign(&m)?;
             }
@@ -1082,7 +1518,9 @@ fn main() -> Result<()> {
             publish(&home)?;
             eprintln!("revoked {id}");
         }
-        Cmd::Keys(KeysCmd::List) => print(&json!({"did": home.did()?, "keystore": home.backend().name(), "keys": home.key_inventory()?})),
+        Cmd::Keys(KeysCmd::List) => print(
+            &json!({"did": home.did()?, "keystore": home.backend().name(), "keys": home.key_inventory()?}),
+        ),
         Cmd::Keys(KeysCmd::Migrate) => {
             home.did()?;
             let moved = home.migrate_to_keychain()?;
@@ -1091,7 +1529,10 @@ fn main() -> Result<()> {
         Cmd::Keys(KeysCmd::Forget { yes }) => {
             let did = home.did()?;
             if home.backend() != Backend::Keychain {
-                eprintln!("this identity keeps its keys in {}; nothing in the keychain to forget", home.dir.join("identity.json").display());
+                eprintln!(
+                    "this identity keeps its keys in {}; nothing in the keychain to forget",
+                    home.dir.join("identity.json").display()
+                );
             } else if !yes {
                 bail!("this deletes every key of {did} from your keychain, and this machine can then no longer sign for it; pass --yes if you mean it");
             } else {
@@ -1099,39 +1540,70 @@ fn main() -> Result<()> {
                 eprintln!("removed {n} keychain items for {did}");
             }
         }
-        Cmd::Rotate { revoke_devices, add_cosigner, totp } => {
+        Cmd::Rotate {
+            revoke_devices,
+            add_cosigner,
+            totp,
+        } => {
             let st = home.state()?;
-            let rotation: SignerPolicy = serde_json::from_value(home.v["rotation_policy"].clone()).context("no rotation policy stored here")?;
+            let rotation: SignerPolicy = serde_json::from_value(home.v["rotation_policy"].clone())
+                .context("no rotation policy stored here")?;
             let new_root = LocalSigner::generate(KeyType::Ed25519);
-            let mut new_recovery = vec![LocalSigner::generate(KeyType::Ed25519), LocalSigner::generate(KeyType::Ed25519)];
+            let mut new_recovery = vec![
+                LocalSigner::generate(KeyType::Ed25519),
+                LocalSigner::generate(KeyType::Ed25519),
+            ];
             let mut next_ids: Vec<String> = new_recovery.iter().map(|s| s.id.clone()).collect();
             if add_cosigner {
                 let hub = home.hub()?;
                 let auth = bearer(&mut home)?;
-                let c = check(http().post(format!("{hub}/v1/cosigner")).header("authorization", auth).send()?)?;
+                let c = check(
+                    http()
+                        .post(format!("{hub}/v1/cosigner"))
+                        .header("authorization", auth)
+                        .send()?,
+                )?;
                 next_ids.push(c["signer"].as_str().unwrap_or_default().into());
             } else {
                 new_recovery.push(LocalSigner::generate(KeyType::Ed25519));
                 next_ids.push(new_recovery[2].id.clone());
             }
-            let next = SignerPolicy::threshold(2, next_ids.into_iter().map(SignerPolicy::Signer).collect());
-            let mut ev = next_event(&st, EventBody::Rotate { rotation: rotation.clone(), manage: SignerPolicy::single(&new_root.id), next: next.digest(), revoke_devices });
+            let next = SignerPolicy::threshold(
+                2,
+                next_ids.into_iter().map(SignerPolicy::Signer).collect(),
+            );
+            let mut ev = next_event(
+                &st,
+                EventBody::Rotate {
+                    rotation: rotation.clone(),
+                    manage: SignerPolicy::single(&new_root.id),
+                    next: next.digest(),
+                    revoke_devices,
+                },
+            );
             // Sign with local recovery keys that the rotation policy names…
             let local = home.signers("recovery")?;
             let names = rotation.signers();
             for s in local.iter().filter(|s| names.contains(&s.id)) {
                 ev.sign(s)?;
-                let signed: std::collections::BTreeSet<String> = ev.sigs.iter().map(|s| s.signer.clone()).collect();
+                let signed: std::collections::BTreeSet<String> =
+                    ev.sigs.iter().map(|s| s.signer.clone()).collect();
                 if rotation.is_satisfied_by(&signed) {
                     break;
                 }
             }
             // …and, if needed, ask the hub co-signer (gated by TOTP).
-            let signed: std::collections::BTreeSet<String> = ev.sigs.iter().map(|s| s.signer.clone()).collect();
+            let signed: std::collections::BTreeSet<String> =
+                ev.sigs.iter().map(|s| s.signer.clone()).collect();
             if !rotation.is_satisfied_by(&signed) {
                 let code = totp.ok_or_else(|| anyhow!("recovery keys alone don't satisfy the rotation policy; pass --totp for the hub co-signer"))?;
                 let hub = home.hub()?;
-                let sig = check(http().post(format!("{hub}/v1/cosign")).json(&json!({"did": st.did, "code": code, "event": ev})).send()?)?;
+                let sig = check(
+                    http()
+                        .post(format!("{hub}/v1/cosign"))
+                        .json(&json!({"did": st.did, "code": code, "event": ev}))
+                        .send()?,
+                )?;
                 ev.add_sig(serde_json::from_value(sig)?);
             }
             let st = home.append(ev)?;
@@ -1139,48 +1611,103 @@ fn main() -> Result<()> {
             home.replace_signers("recovery", &new_recovery)?;
             home.v["rotation_policy"] = serde_json::to_value(&next)?;
             if revoke_devices {
-                home.forget(&session_slot(&home.device_id()?), &home.v["session"]["secret"])?;
+                home.forget(
+                    &session_slot(&home.device_id()?),
+                    &home.v["session"]["secret"],
+                )?;
                 home.v["session"] = json!(null);
                 home.v["tokens"] = json!({});
             }
             home.save()?;
             publish(&home)?;
-            eprintln!("rotated to seq {}; new manage key {}{}", st.seq, new_root.id, if add_cosigner { "; hub co-signer is now a recovery signer" } else { "" });
+            eprintln!(
+                "rotated to seq {}; new manage key {}{}",
+                st.seq,
+                new_root.id,
+                if add_cosigner {
+                    "; hub co-signer is now a recovery signer"
+                } else {
+                    ""
+                }
+            );
         }
-        Cmd::Alias(AliasCmd::List) => print(&json!(home.v["aliases"].as_array().map(|a| a.iter().map(|x| json!({"label": x["label"], "alias": x["signer"]["id"], "seq": x["seq"]})).collect::<Vec<_>>()))),
+        Cmd::Alias(AliasCmd::List) => print(&json!(home.v["aliases"].as_array().map(|a| a
+            .iter()
+            .map(|x| json!({"label": x["label"], "alias": x["signer"]["id"], "seq": x["seq"]}))
+            .collect::<Vec<_>>()))),
         Cmd::Alias(AliasCmd::New { label }) => {
             // `prove` finds an alias by label, so a second one would never be reachable.
             // Refuse before anything is committed to the KEL.
-            if home.v["aliases"].as_array().is_some_and(|a| a.iter().any(|x| x["label"] == label.as_str())) {
+            if home.v["aliases"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x["label"] == label.as_str()))
+            {
                 bail!("you already have a private alias labelled {label:?}; labels are how `kith alias prove` finds one, so pick another");
             }
             let st = home.state()?;
             let alias = PrivateAlias::generate(&label);
-            let mut ev = next_event(&st, EventBody::AliasCommit { commitment: alias.commitment(&st.did) });
+            let mut ev = next_event(
+                &st,
+                EventBody::AliasCommit {
+                    commitment: alias.commitment(&st.did),
+                },
+            );
             let (_, dsigner) = home.device()?;
             dsigner.sign_event(&mut ev)?;
             let st = home.append(ev)?;
             let signer = home.signer_json(&alias.signer)?;
-            home.v["aliases"].as_array_mut().ok_or_else(|| anyhow!("bad state"))?.push(json!({"label": label, "signer": signer, "salt": alias.salt, "seq": st.seq}));
+            home.v["aliases"]
+                .as_array_mut()
+                .ok_or_else(|| anyhow!("bad state"))?
+                .push(json!({"label": label, "signer": signer, "salt": alias.salt, "seq": st.seq}));
             home.save()?;
             publish(&home)?;
             println!("{}", alias.id());
         }
         Cmd::Alias(AliasCmd::Prove { label, aud, nonce }) => {
             let did = home.did()?;
-            let a = home.v["aliases"].as_array().and_then(|a| a.iter().find(|x| x["label"] == label.as_str())).ok_or_else(|| anyhow!("no alias {label}"))?;
-            let alias = PrivateAlias { label: label.clone(), signer: home.signer_from_json(&a["signer"])?, salt: a["salt"].as_str().unwrap_or_default().into() };
-            print(&serde_json::to_value(alias.prove(&did, a["seq"].as_u64().unwrap_or(0), aud, nonce)?)?);
+            let a = home.v["aliases"]
+                .as_array()
+                .and_then(|a| a.iter().find(|x| x["label"] == label.as_str()))
+                .ok_or_else(|| anyhow!("no alias {label}"))?;
+            let alias = PrivateAlias {
+                label: label.clone(),
+                signer: home.signer_from_json(&a["signer"])?,
+                salt: a["salt"].as_str().unwrap_or_default().into(),
+            };
+            print(&serde_json::to_value(alias.prove(
+                &did,
+                a["seq"].as_u64().unwrap_or(0),
+                aud,
+                nonce,
+            )?)?);
         }
-        Cmd::Alias(AliasCmd::Verify { file, aud, nonce, max_age }) => {
+        Cmd::Alias(AliasCmd::Verify {
+            file,
+            aud,
+            nonce,
+            max_age,
+        }) => {
             let proof: AliasProof = serde_json::from_str(&std::fs::read_to_string(file)?)?;
             let st = fetch_state(&home.hub()?, &proof.root)?;
-            verify_alias_proof(&proof, &st, aud.as_deref(), nonce.as_deref(), now(), max_age)?;
+            verify_alias_proof(
+                &proof,
+                &st,
+                aud.as_deref(),
+                nonce.as_deref(),
+                now(),
+                max_age,
+            )?;
             println!("valid: {} is an alias of {}", proof.alias, proof.root);
         }
         Cmd::Alias(AliasCmd::Link { alias }) => {
             let st = home.state()?;
-            let mut ev = next_event(&st, EventBody::AliasLink { alias: alias.clone() });
+            let mut ev = next_event(
+                &st,
+                EventBody::AliasLink {
+                    alias: alias.clone(),
+                },
+            );
             for m in home.signers("manage")? {
                 ev.sign(&m)?;
             }
@@ -1189,11 +1716,25 @@ fn main() -> Result<()> {
             eprintln!("linked {alias} (add a back-link on the alias side so others can check both directions)");
         }
         Cmd::Name(cmd) => names::run(&home, cmd)?,
+        Cmd::Work { bits, seconds } => mine_work(&home, bits, seconds)?,
         Cmd::Resolve { alias } => print(&names::resolve(&home, &alias)?.json()),
-        Cmd::Login { aud, method, totp, delegation, print: show } => {
+        Cmd::Login {
+            aud,
+            method,
+            totp,
+            delegation,
+            print: show,
+        } => {
             let (aud, tok) = login(&mut home, aud, &method, totp, delegation)?;
             let c = jws::decode(&tok)?.claims;
-            eprintln!("logged in as {} for {aud} (aal {}, amr {}, groups {}, roles {})", c["sub"].as_str().unwrap_or("?"), c["aal"], c["amr"], c["groups"], c["roles"]);
+            eprintln!(
+                "logged in as {} for {aud} (aal {}, amr {}, groups {}, roles {})",
+                c["sub"].as_str().unwrap_or("?"),
+                c["aal"],
+                c["amr"],
+                c["groups"],
+                c["roles"]
+            );
             if show {
                 println!("{tok}");
             }
@@ -1207,34 +1748,76 @@ fn main() -> Result<()> {
             let to = names::principal(&home, &to)?;
             let hub = home.hub()?;
             let sk = session(&mut home)?;
-            println!("{}", sk.delegate(&to, &hub, actions.into_iter().map(Capability::new).collect(), ttl)?);
+            println!(
+                "{}",
+                sk.delegate(
+                    &to,
+                    &hub,
+                    actions.into_iter().map(Capability::new).collect(),
+                    ttl
+                )?
+            );
         }
         Cmd::Totp(TotpCmd::Enroll) => {
             let hub = home.hub()?;
             let auth = bearer(&mut home)?;
-            print(&check(http().post(format!("{hub}/v1/totp/enroll")).header("authorization", auth).send()?)?);
+            print(&check(
+                http()
+                    .post(format!("{hub}/v1/totp/enroll"))
+                    .header("authorization", auth)
+                    .send()?,
+            )?);
         }
         Cmd::Totp(TotpCmd::Confirm { code }) => {
             let hub = home.hub()?;
             let auth = bearer(&mut home)?;
-            print(&check(http().post(format!("{hub}/v1/totp/confirm")).header("authorization", auth).json(&json!({"code": code})).send()?)?);
+            print(&check(
+                http()
+                    .post(format!("{hub}/v1/totp/confirm"))
+                    .header("authorization", auth)
+                    .json(&json!({"code": code}))
+                    .send()?,
+            )?);
         }
         Cmd::Contact(cmd) => {
             let hub = home.hub()?;
             let out = match cmd {
-                ContactCmd::Lookup { address } => check(http().get(format!("{hub}/v1/contacts/lookup")).query(&[("address", address)]).send()?)?,
+                ContactCmd::Lookup { address } => check(
+                    http()
+                        .get(format!("{hub}/v1/contacts/lookup"))
+                        .query(&[("address", address)])
+                        .send()?,
+                )?,
                 cmd => {
                     let auth = bearer(&mut home)?;
                     let (method, path, body) = match cmd {
-                        ContactCmd::Add { address } => (reqwest::Method::POST, "", json!({"address": address})),
-                        ContactCmd::Confirm { address, code } => (reqwest::Method::POST, "/confirm", json!({"address": address, "code": code})),
+                        ContactCmd::Add { address } => {
+                            (reqwest::Method::POST, "", json!({"address": address}))
+                        }
+                        ContactCmd::Confirm { address, code } => (
+                            reqwest::Method::POST,
+                            "/confirm",
+                            json!({"address": address, "code": code}),
+                        ),
                         ContactCmd::List => (reqwest::Method::GET, "", Value::Null),
-                        ContactCmd::Publish { address } => (reqwest::Method::PUT, "/public", json!({"address": address, "public": true})),
-                        ContactCmd::Unpublish { address } => (reqwest::Method::PUT, "/public", json!({"address": address, "public": false})),
-                        ContactCmd::Remove { address } => (reqwest::Method::DELETE, "", json!({"address": address})),
+                        ContactCmd::Publish { address } => (
+                            reqwest::Method::PUT,
+                            "/public",
+                            json!({"address": address, "public": true}),
+                        ),
+                        ContactCmd::Unpublish { address } => (
+                            reqwest::Method::PUT,
+                            "/public",
+                            json!({"address": address, "public": false}),
+                        ),
+                        ContactCmd::Remove { address } => {
+                            (reqwest::Method::DELETE, "", json!({"address": address}))
+                        }
                         ContactCmd::Lookup { .. } => unreachable!(),
                     };
-                    let mut req = http().request(method, format!("{hub}/v1/contacts{path}")).header("authorization", auth);
+                    let mut req = http()
+                        .request(method, format!("{hub}/v1/contacts{path}"))
+                        .header("authorization", auth);
                     if !body.is_null() {
                         req = req.json(&body);
                     }
@@ -1246,7 +1829,13 @@ fn main() -> Result<()> {
         Cmd::Passkey(PasskeyCmd::Enroll { name, no_open, qr, yes }) => {
             let hub = home.hub()?;
             let auth = bearer(&mut home)?;
-            let e = check(http().post(format!("{hub}/v1/enroll")).header("authorization", &auth).json(&json!({"name": name})).send()?)?;
+            let e = check(
+                http()
+                    .post(format!("{hub}/v1/enroll"))
+                    .header("authorization", &auth)
+                    .json(&json!({"name": name}))
+                    .send()?,
+            )?;
             let id = e["id"].as_str().unwrap_or_default().to_string();
             let url = e["url"].as_str().unwrap_or_default().to_string();
             println!("{url}");
@@ -1280,8 +1869,16 @@ fn main() -> Result<()> {
             // The link is a bearer secret and the hub reports the key, so look before signing.
             // The page shows the same code, computed in the browser from the key it made.
             eprintln!("browser created passkey {key}");
-            eprintln!("fingerprint {}  (the enrollment page shows the same code)", kith_core::util::key_fingerprint(&key));
-            if !confirm("Add it as a device of your identity?", yes, &mut std::io::stdin().lock(), &mut std::io::stderr())? {
+            eprintln!(
+                "fingerprint {}  (the enrollment page shows the same code)",
+                kith_core::util::key_fingerprint(&key)
+            );
+            if !confirm(
+                "Add it as a device of your identity?",
+                yes,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stderr(),
+            )? {
                 bail!("not approved; nothing was added (pass --yes to skip the question)");
             }
             eprintln!("approving with your manage key");
@@ -1296,12 +1893,23 @@ fn main() -> Result<()> {
                 rp_id: e["rp_id"].as_str().map(String::from),
                 xkey: None,
             };
-            let mut ev = next_event(&st, EventBody::AddDevice { device: dev.clone() });
+            let mut ev = next_event(
+                &st,
+                EventBody::AddDevice {
+                    device: dev.clone(),
+                },
+            );
             for m in home.signers("manage")? {
                 ev.sign(&m)?;
             }
             let message = String::from_utf8(ev.signing_message()?)?;
-            check(http().post(format!("{hub}/v1/enroll/{id}/event")).header("authorization", &auth).json(&json!({"device_id": dev.id, "message": message})).send()?)?;
+            check(
+                http()
+                    .post(format!("{hub}/v1/enroll/{id}/event"))
+                    .header("authorization", &auth)
+                    .json(&json!({"device_id": dev.id, "message": message}))
+                    .send()?,
+            )?;
             let s = poll("sig")?;
             ev.add_sig(serde_json::from_value(s["sig"].clone())?);
             home.append(ev)?;
@@ -1311,17 +1919,26 @@ fn main() -> Result<()> {
         Cmd::Totp(TotpCmd::Reset { code }) => {
             let hub = home.hub()?;
             let auth = bearer(&mut home)?;
-            let mut req = http().delete(format!("{hub}/v1/totp")).header("authorization", auth);
+            let mut req = http()
+                .delete(format!("{hub}/v1/totp"))
+                .header("authorization", auth);
             if let Some(code) = code {
                 req = req.json(&json!({"code": code}));
             }
             print(&check(req.send()?)?);
         }
-        Cmd::Totp(TotpCmd::Code { secret }) => println!("{}", totp::code_at(&totp::from_base32(&secret)?, now())),
+        Cmd::Totp(TotpCmd::Code { secret }) => {
+            println!("{}", totp::code_at(&totp::from_base32(&secret)?, now()))
+        }
         Cmd::Cosigner => {
             let hub = home.hub()?;
             let auth = bearer(&mut home)?;
-            print(&check(http().post(format!("{hub}/v1/cosigner")).header("authorization", auth).send()?)?);
+            print(&check(
+                http()
+                    .post(format!("{hub}/v1/cosigner"))
+                    .header("authorization", auth)
+                    .send()?,
+            )?);
         }
         Cmd::Inspect { token } => {
             let t = jws::decode(&token)?;
@@ -1331,14 +1948,101 @@ fn main() -> Result<()> {
             }
             print(&json!({"header": header, "claims": t.claims}));
         }
-        Cmd::Hub(_) => unreachable!(),
+        Cmd::Hub(_) | Cmd::Bundle(_) => unreachable!(),
         Cmd::Policy(cmd) => org::policy(&mut home, cmd)?,
         Cmd::Revoke(cmd) => org::revoke(&mut home, cmd)?,
         Cmd::Anchor(cmd) => org::anchor(&home, cmd)?,
-        Cmd::Revocations { org, fresh_for, max_staleness, no_beacon, watch } => {
-            org::status(&home, org, kith_core::revoke::FreshnessPolicy { fresh_for, max_staleness, require_beacon: !no_beacon }, watch)?
+        Cmd::Revocations {
+            org,
+            fresh_for,
+            max_staleness,
+            no_beacon,
+            watch,
+        } => org::status(
+            &home,
+            org,
+            kith_core::revoke::FreshnessPolicy {
+                fresh_for,
+                max_staleness,
+                require_beacon: !no_beacon,
+            },
+            watch,
+        )?,
+    }
+    Ok(())
+}
+
+/// `kith work`: all cores search for nonces; the best proof goes to the hub as it improves.
+fn mine_work(home: &Home, target: u32, seconds: Option<u64>) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let (did, hub) = (home.did()?, home.hub()?);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+    let best = Arc::new(Mutex::new((0u32, 0u64)));
+    let top = Arc::new(AtomicU32::new(0));
+    let tried = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = u64::from_be_bytes(
+        kith_core::util::sha256(random_id())[..8]
+            .try_into()
+            .unwrap(),
+    );
+    for t in 0..threads {
+        let (did, best, top, tried, stop) = (
+            did.clone(),
+            best.clone(),
+            top.clone(),
+            tried.clone(),
+            stop.clone(),
+        );
+        std::thread::spawn(move || {
+            let mut n = start.wrapping_add(t);
+            while !stop.load(Ordering::Relaxed) {
+                for _ in 0..20_000 {
+                    let bits = kith_core::work::work_bits(&did, n);
+                    if bits > top.load(Ordering::Relaxed) {
+                        let mut b = best.lock().unwrap();
+                        if bits > b.0 {
+                            *b = (bits, n);
+                            top.store(bits, Ordering::Relaxed);
+                        }
+                    }
+                    n = n.wrapping_add(threads);
+                }
+                tried.fetch_add(20_000, Ordering::Relaxed);
+            }
+        });
+    }
+    let began = Instant::now();
+    let mut sent = 0;
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let (bits, nonce) = *best.lock().unwrap();
+        let done = (target > 0 && bits >= target)
+            || seconds.is_some_and(|s| began.elapsed().as_secs() >= s);
+        if bits >= 12 && bits > sent {
+            check(
+                http()
+                    .post(format!("{hub}/v1/work"))
+                    .json(&json!({"did": did, "nonce": nonce}))
+                    .send()?,
+            )?;
+            sent = bits;
+        }
+        let rate = tried.load(Ordering::Relaxed) as f64 / began.elapsed().as_secs_f64();
+        eprint!(
+            "\r{bits} bits (recorded {sent}), {:.1} M hashes/s on {threads} threads   ",
+            rate / 1e6
+        );
+        if done {
+            break;
         }
     }
+    stop.store(true, Ordering::Relaxed);
+    eprintln!();
+    print(&json!({"did": did, "work": sent}));
     Ok(())
 }
 
@@ -1353,7 +2057,12 @@ fn kind_str(k: DeviceKind) -> &'static str {
 
 /// Ask a yes/no question. `yes` answers it without asking; otherwise only a line that
 /// starts with y or Y counts, so end of input, an empty line or anything else is no.
-fn confirm(question: &str, yes: bool, input: &mut impl std::io::BufRead, out: &mut impl std::io::Write) -> Result<bool> {
+fn confirm(
+    question: &str,
+    yes: bool,
+    input: &mut impl std::io::BufRead,
+    out: &mut impl std::io::Write,
+) -> Result<bool> {
     if yes {
         return Ok(true);
     }
@@ -1407,7 +2116,9 @@ mod tests {
     #[test]
     fn only_an_explicit_yes_approves() {
         assert!(ask(true, ""), "--yes needs no answer");
-        assert!(ask(false, "y\n") && ask(false, "Y\n") && ask(false, "yes\n") && ask(false, "  yes\n"));
+        assert!(
+            ask(false, "y\n") && ask(false, "Y\n") && ask(false, "yes\n") && ask(false, "  yes\n")
+        );
         for no in ["", "\n", "n\n", "no\n", "maybe\n", "x y\n"] {
             assert!(!ask(false, no), "{no:?} was taken as a yes");
         }
@@ -1457,4 +2168,3 @@ mod tests {
         assert!(out.is_empty(), "--yes asks nothing");
     }
 }
-

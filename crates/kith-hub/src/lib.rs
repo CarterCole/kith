@@ -18,6 +18,8 @@
 //! | `POST /oauth/token`                       | code, refresh and RFC 8693 token exchange; `account_attestation` with the `linked_account` scope, `contact_attestations` with `email` or `phone` |
 //! | `GET  /oauth/userinfo`                    | OIDC userinfo                                   |
 //! | `GET  /oauth/logout`                      | RP-initiated logout                             |
+//! | `GET, POST /whoami`                       | the account page, and its passkey sign-in (see [`account`]) |
+//! | `GET  /login`                             | redirects to `/whoami`                          |
 //! | `GET/PUT /v1/kel/{did}`                   | fetch / append a key event log                  |
 //! | `GET  /v1/did/{did}`                      | DID document                                    |
 //! | `POST /v1/auth/challenge`, `/v1/auth/verify` | API challenge login (signature/passkey/TOTP) |
@@ -27,8 +29,9 @@
 //! | `POST, GET, DELETE /v1/contacts`, `POST /v1/contacts/confirm`, `PUT /v1/contacts/public` | verified email and phone contacts (bearer; see [`contacts`]) |
 //! | `GET  /v1/contacts/lookup`                | who holds a published contact, signed           |
 //! | `POST /v1/enroll`, `GET /enroll/{id}`     | enroll a browser passkey as a device            |
+//! | `POST /v1/join`, `/v1/join/invite`, `GET /join/{id}` | join a device, from a terminal or by QR code, approved by manage signers (see [`join`]) |
 //! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
-//! | `/v1/admin/…`                             | sessions, consent, clients and TOTP resets, for the operator (see [`admin`]) |
+//! | `/v1/admin/…`                             | identities, sessions, consent, clients, TOTP resets and the bundle in force, for the operator (see [`admin`]) |
 //!
 //! State that must outlive a restart is in one SQLite file in the data directory
 //! (see [`store`]).
@@ -36,15 +39,20 @@
 // ApiError carries an HTTP status plus a JSON body; boxing it buys nothing here.
 #![allow(clippy::result_large_err)]
 
+pub mod account;
 pub mod admin;
 pub mod contacts;
 pub mod enroll;
+pub mod join;
 pub mod jwe;
 pub mod oidc;
 pub mod org;
-mod pages;
+pub mod pages;
+pub mod qr;
+pub mod signup;
 pub mod store;
 pub mod upstream;
+pub mod work;
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -60,7 +68,7 @@ use axum::{Form, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use kith_core::authz::{Bundle, Engine};
+use kith_core::authz::{Bundle, Engine, Memberships};
 use kith_core::kel::{extends, verify_log, DeviceKind, Event, KeyState};
 use kith_core::keys::{verify_sig, PublicKey, Sig, VerifyOptions};
 use kith_core::session::{self, Capability, KelResolver};
@@ -118,6 +126,15 @@ pub struct HubConfig {
     /// Hub access tokens (`aud` = issuer) whose roles include this one may use the
     /// admin API too. The policy bundle decides who is in the role.
     pub admin_role: Option<String>,
+    /// Let anyone create an identity in the browser (`/signup`, spec §7.11). Off by
+    /// default: it makes a public hub an open registry.
+    pub signup: bool,
+    /// Sign-up attempts allowed per client address.
+    pub signup_limit: RateLimit,
+    /// Join requests a terminal may open per client address (spec §7.13).
+    pub join_limit: RateLimit,
+    /// Proofs of work submitted per client address (spec §7.12).
+    pub work_limit: RateLimit,
     /// Verified email addresses and phone numbers (spec 7.8.2): how codes are sent,
     /// how long a verification lasts, and limits.
     pub contacts: contacts::ContactConfig,
@@ -141,12 +158,34 @@ impl HubConfig {
             policy_org: None,
             beacon: org::BeaconSource::None,
             heartbeat_secs: 15,
-            login_limit: RateLimit { max: 20, window_secs: 60 },
-            register_limit: RateLimit { max: 20, window_secs: 3600 },
-            totp_limit: RateLimit { max: 20, window_secs: 60 },
+            login_limit: RateLimit {
+                max: 20,
+                window_secs: 60,
+            },
+            register_limit: RateLimit {
+                max: 20,
+                window_secs: 3600,
+            },
+            totp_limit: RateLimit {
+                max: 20,
+                window_secs: 60,
+            },
             behind_proxy: false,
             admin_token: None,
             admin_role: Some("hub-admin".into()),
+            signup: false,
+            signup_limit: RateLimit {
+                max: 5,
+                window_secs: 3600,
+            },
+            join_limit: RateLimit {
+                max: 20,
+                window_secs: 3600,
+            },
+            work_limit: RateLimit {
+                max: 120,
+                window_secs: 60,
+            },
             contacts: contacts::ContactConfig::default(),
         }
     }
@@ -155,7 +194,16 @@ impl HubConfig {
 pub fn host_of(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1)?;
     let hostport = rest.split(['/', '?', '#']).next()?;
-    let host = hostport.rsplit_once(':').map(|(h, p)| if p.chars().all(|c| c.is_ascii_digit()) { h } else { hostport }).unwrap_or(hostport);
+    let host = hostport
+        .rsplit_once(':')
+        .map(|(h, p)| {
+            if p.chars().all(|c| c.is_ascii_digit()) {
+                h
+            } else {
+                hostport
+            }
+        })
+        .unwrap_or(hostport);
     Some(host.trim_matches(['[', ']']).to_string())
 }
 
@@ -182,19 +230,32 @@ pub struct Authn {
     pub attrs: Map<String, Value>,
 }
 
+/// The policy engine in force, and what became of the last attempt to load the file.
+struct EngineSlot {
+    /// Modification time and length of the file last read, whether or not it loaded.
+    seen: Option<(std::time::SystemTime, u64)>,
+    engine: Arc<Engine>,
+    /// When `engine` was loaded; 0 for the empty bundle a hub without a file uses.
+    loaded_at: i64,
+    /// Why the file as it is now is not the one in force.
+    error: Option<String>,
+}
+
 pub struct Hub {
     pub cfg: HubConfig,
     pub signer: HubSigner,
     pub(crate) rsa: oidc::RsaSigner,
     pub(crate) pairwise_secret: Vec<u8>,
     kels: RwLock<HashMap<String, Vec<Event>>>,
-    engine: RwLock<(Option<std::time::SystemTime>, Arc<Engine>)>,
+    engine: RwLock<EngineSlot>,
     /// Login challenges live five minutes; a page whose challenge was lost to a
     /// restart is handed a fresh one and retries.
     pub(crate) challenges: Mutex<HashMap<String, Challenge>>,
     /// Everything that must survive a restart.
     pub store: store::Store,
     pub(crate) enrollments: Mutex<HashMap<String, enroll::Enrollment>>,
+    pub(crate) signups: Mutex<HashMap<String, signup::Attempt>>,
+    pub(crate) joins: Mutex<HashMap<String, join::Join>>,
     pub(crate) upstream: Mutex<upstream::UpstreamState>,
     pub(crate) http: reqwest::Client,
     pub orgs: org::Orgs,
@@ -211,10 +272,20 @@ impl ApiError {
         ApiError(StatusCode::BAD_REQUEST, code.into(), msg.to_string(), None)
     }
     pub fn unauthorized(msg: impl ToString) -> Self {
-        ApiError(StatusCode::UNAUTHORIZED, "invalid_token".into(), msg.to_string(), None)
+        ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token".into(),
+            msg.to_string(),
+            None,
+        )
     }
     pub fn grant(msg: impl ToString) -> Self {
-        ApiError(StatusCode::BAD_REQUEST, "invalid_grant".into(), msg.to_string(), None)
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant".into(),
+            msg.to_string(),
+            None,
+        )
     }
     /// Add fields to the error body (merged with any already present).
     pub fn with(mut self, extra: Value) -> Self {
@@ -234,7 +305,12 @@ impl From<kith_core::Error> for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string(), None)
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error".into(),
+            e.to_string(),
+            None,
+        )
     }
 }
 
@@ -247,7 +323,8 @@ impl IntoResponse for ApiError {
             }
         }
         let mut r = (self.0, Json(body)).into_response();
-        r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        r.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         r
     }
 }
@@ -255,7 +332,9 @@ impl IntoResponse for ApiError {
 pub type ApiResult<T> = Result<T, ApiError>;
 
 pub(crate) fn read_json(path: &std::path::Path) -> Option<Value> {
-    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
 }
 
 pub(crate) fn write_json(path: &std::path::Path, v: &Value) -> anyhow::Result<()> {
@@ -271,7 +350,9 @@ pub(crate) fn write_json(path: &std::path::Path, v: &Value) -> anyhow::Result<()
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Factor {
     /// Any signer on the identity (device key, wallet, manage key) signs the challenge.
-    Signature { sig: Sig },
+    Signature {
+        sig: Sig,
+    },
     /// A passkey answers `navigator.credentials.get({challenge: SHA-256(message)})`.
     /// `device_id` may be omitted; every passkey device of the identity is tried.
     Webauthn {
@@ -281,11 +362,16 @@ pub enum Factor {
         client_data_json: String,
         signature: String,
     },
-    Totp { code: String },
+    Totp {
+        code: String,
+    },
     /// An upstream provider vouched for the account behind `alias`. Only the hub's
     /// own callback creates this; it cannot be submitted.
     #[serde(skip)]
-    Federated { provider: String, alias: String },
+    Federated {
+        provider: String,
+        alias: String,
+    },
 }
 
 impl Authn {
@@ -367,55 +453,138 @@ impl Hub {
             rsa,
             pairwise_secret,
             kels: RwLock::new(kels),
-            engine: RwLock::new((None, Arc::new(Engine::new(Bundle { version: 1, ..Default::default() })?))),
+            engine: RwLock::new(EngineSlot {
+                seen: None,
+                engine: Arc::new(Engine::new(Bundle {
+                    version: 1,
+                    ..Default::default()
+                })?),
+                loaded_at: 0,
+                error: None,
+            }),
             challenges: Mutex::new(HashMap::new()),
             store,
             enrollments: Mutex::new(HashMap::new()),
+            signups: Mutex::new(HashMap::new()),
+            joins: Mutex::new(HashMap::new()),
             upstream: Mutex::new(upstream::UpstreamState::default()),
-            http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?,
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?,
             orgs: org::Orgs::open(&cfg_dir)?,
             started: now(),
             #[cfg(feature = "aws")]
             aws: Default::default(),
         };
-        hub.engine()?;
+        hub.load_bundle(true)?;
         Ok(Arc::new(hub))
     }
 
-    /// The policy engine, reloaded whenever the bundle file changes.
+    /// The policy engine, reloaded whenever the bundle file changes. A file that
+    /// fails to load (half written, invalid, gone) leaves the last good one in force,
+    /// and [`Hub::bundle_status`] says why.
     pub fn engine(&self) -> anyhow::Result<Arc<Engine>> {
+        self.load_bundle(false)
+    }
+
+    /// Load the bundle file if it changed since it was last read. `strict` is for
+    /// startup, when there is no good bundle to keep.
+    fn load_bundle(&self, strict: bool) -> anyhow::Result<Arc<Engine>> {
         let Some(path) = &self.cfg.bundle_path else {
-            return Ok(self.engine.read().unwrap().1.clone());
+            return Ok(self.engine.read().unwrap().engine.clone());
         };
-        let mtime = std::fs::metadata(path)?.modified()?;
-        if self.engine.read().unwrap().0 != Some(mtime) {
-            let engine = Arc::new(Engine::from_json(&std::fs::read_to_string(path)?)?);
-            *self.engine.write().unwrap() = (Some(mtime), engine);
+        let seen = std::fs::metadata(path).and_then(|m| Ok((m.modified()?, m.len())));
+        let key = seen.as_ref().ok().copied();
+        {
+            let slot = self.engine.read().unwrap();
+            if key.is_some() && slot.seen == key {
+                return Ok(slot.engine.clone());
+            }
         }
-        Ok(self.engine.read().unwrap().1.clone())
+        let loaded = seen
+            .map_err(anyhow::Error::from)
+            .and_then(|_| Ok(Engine::from_json(&std::fs::read_to_string(path)?)?));
+        let mut slot = self.engine.write().unwrap();
+        match loaded {
+            Ok(engine) => {
+                *slot = EngineSlot {
+                    seen: key,
+                    engine: Arc::new(engine),
+                    loaded_at: now(),
+                    error: None,
+                };
+            }
+            Err(e) if strict => {
+                return Err(e.context(format!("policy bundle {}", path.display())))
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if slot.error.as_deref() != Some(msg.as_str()) {
+                    eprintln!(
+                        "policy bundle {}: {msg}; still using the one loaded at {}",
+                        path.display(),
+                        slot.loaded_at
+                    );
+                }
+                slot.seen = key;
+                slot.error = Some(msg);
+            }
+        }
+        Ok(slot.engine.clone())
+    }
+
+    /// Which bundle is in force, for `/v1/admin/stats`.
+    pub fn bundle_status(&self) -> Value {
+        let _ = self.engine();
+        let slot = self.engine.read().unwrap();
+        json!({
+            "path": self.cfg.bundle_path,
+            "loaded_at": slot.loaded_at,
+            "error": slot.error,
+            "groups": slot.engine.bundle.groups.len(),
+            "roles": slot.engine.bundle.roles.len(),
+        })
     }
 
     /// Verification keys: EdDSA (access tokens) and RS256 (ID tokens).
     pub fn jwks(&self) -> Value {
         let mut keys = self.signer.jwks();
-        keys["keys"].as_array_mut().expect("keys").push(self.rsa.jwk());
+        keys["keys"]
+            .as_array_mut()
+            .expect("keys")
+            .push(self.rsa.jwk());
         keys
     }
 
     pub fn put_kel(&self, did: &str, events: Vec<Event>) -> ApiResult<KeyState> {
         let st = verify_log(&events, &VerifyOptions::default())?;
         if st.did != did {
-            return Err(ApiError::bad("invalid_request", "log does not belong to this DID"));
+            return Err(ApiError::bad(
+                "invalid_request",
+                "log does not belong to this DID",
+            ));
         }
         let mut kels = self.kels.write().unwrap();
         if let Some(old) = kels.get(did) {
             if !extends(old, &events)? {
                 // Duplicity: two different histories signed by the same identity.
-                return Err(ApiError(StatusCode::CONFLICT, "duplicity".into(), "log forks from the stored history".into(), None));
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "duplicity".into(),
+                    "log forks from the stored history".into(),
+                    None,
+                ));
             }
         }
-        let file = self.cfg.data_dir.join("kels").join(format!("{}.json", did.replace(':', "_")));
-        write_json(&file, &serde_json::to_value(&events).map_err(kith_core::Error::from)?)?;
+        let file = self
+            .cfg
+            .data_dir
+            .join("kels")
+            .join(format!("{}.json", did.replace(':', "_")));
+        write_json(
+            &file,
+            &serde_json::to_value(&events).map_err(kith_core::Error::from)?,
+        )?;
         kels.insert(did.into(), events);
         Ok(st)
     }
@@ -479,7 +648,12 @@ impl Hub {
         match verdict {
             Verdict::Accepted => Ok(()),
             Verdict::Unconfirmed => Err(ApiError::unauthorized("TOTP not confirmed")),
-            Verdict::Locked(retry) => Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "locked".into(), "too many TOTP failures".into(), Some(json!({"retry_after": retry})))),
+            Verdict::Locked(retry) => Err(ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "locked".into(),
+                "too many TOTP failures".into(),
+                Some(json!({"retry_after": retry})),
+            )),
             Verdict::Used => Err(ApiError::unauthorized("TOTP code already used")),
             Verdict::Wrong => Err(ApiError::unauthorized("invalid TOTP code")),
         }
@@ -488,40 +662,84 @@ impl Hub {
     /// Count a TOTP attempt from `ip` against [`HubConfig::totp_limit`]. The identity's
     /// own lockout still applies; this stops one address from trying many identities.
     pub(crate) fn limit_totp(&self, ip: &ClientIp) -> ApiResult<()> {
-        match self.store.hit(&format!("totp|{}", ip.0), self.cfg.totp_limit, now())? {
+        match self
+            .store
+            .hit(&format!("totp|{}", ip.0), self.cfg.totp_limit, now())?
+        {
             None => Ok(()),
-            Some(retry) => Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited".into(), format!("too many TOTP attempts from your address; try again in {retry}s"), Some(json!({"retry_after": retry})))),
+            Some(retry) => Err(ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited".into(),
+                format!("too many TOTP attempts from your address; try again in {retry}s"),
+                Some(json!({"retry_after": retry})),
+            )),
         }
+    }
+
+    /// Whether the upstream account `alias` may still sign in as `st`: linked in the
+    /// identity's own log, or at sign-up with that provider (spec §7.11).
+    pub(crate) fn alias_linked(&self, st: &KeyState, alias: &str) -> bool {
+        st.aliases.contains(alias)
+            || self.store.provider_link(alias).ok().flatten().as_deref() == Some(st.did.as_str())
     }
 
     /// Count an attempt at `what` from `ip`; `Err` is the `429` to return when it
     /// is one too many.
-    pub(crate) fn rate_limit(&self, what: &str, ip: &ClientIp, limit: RateLimit) -> Result<(), Response> {
+    pub(crate) fn rate_limit(
+        &self,
+        what: &str,
+        ip: &ClientIp,
+        limit: RateLimit,
+    ) -> Result<(), Response> {
         match self.store.hit(&format!("{what}|{}", ip.0), limit, now()) {
             Ok(None) => Ok(()),
             Ok(Some(retry)) => {
-                let e = ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited".into(), format!("too many {what} attempts from your address; try again in {retry}s"), Some(json!({"retry_after": retry})));
+                let e = ApiError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited".into(),
+                    format!("too many {what} attempts from your address; try again in {retry}s"),
+                    Some(json!({"retry_after": retry})),
+                );
                 let mut r = e.into_response();
-                r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_str(&retry.to_string()).expect("retry-after"));
+                r.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from_str(&retry.to_string()).expect("retry-after"),
+                );
                 Err(r)
             }
             Err(e) => Err(ApiError::from(e).into_response()),
         }
     }
 
-    pub(crate) fn new_challenge(&self, did: Option<String>, message_for: impl FnOnce(&str, i64, i64) -> String) -> (String, String, i64) {
+    pub(crate) fn new_challenge(
+        &self,
+        did: Option<String>,
+        message_for: impl FnOnce(&str, i64, i64) -> String,
+    ) -> (String, String, i64) {
         let id = random_id();
         let iat = now();
         let exp = iat + 300;
         let message = message_for(&id, iat, exp);
         let mut ch = self.challenges.lock().unwrap();
         ch.retain(|_, c| c.expires > iat);
-        ch.insert(id.clone(), Challenge { did, message: message.clone(), expires: exp });
+        ch.insert(
+            id.clone(),
+            Challenge {
+                did,
+                message: message.clone(),
+                expires: exp,
+            },
+        );
         (id, message, exp)
     }
 
     pub(crate) fn take_challenge(&self, id: &str) -> ApiResult<Challenge> {
-        let ch = self.challenges.lock().unwrap().remove(id).ok_or_else(|| ApiError::unauthorized("unknown or used challenge"))?;
+        let ch = self
+            .challenges
+            .lock()
+            .unwrap()
+            .remove(id)
+            .ok_or_else(|| ApiError::unauthorized("unknown or used challenge"))?;
         if ch.expires < now() {
             return Err(ApiError::unauthorized("challenge expired"));
         }
@@ -530,7 +748,9 @@ impl Hub {
 
     /// Verify authentication `factors` for `did` over a challenge `message`.
     pub fn authenticate(&self, did: &str, message: &str, factors: &[Factor]) -> ApiResult<Authn> {
-        let st = self.resolve(did).map_err(|e| ApiError::unauthorized(format!("unknown identity: {e}")))?;
+        let st = self
+            .resolve(did)
+            .map_err(|e| ApiError::unauthorized(format!("unknown identity: {e}")))?;
         let mut aal = 0u8;
         let mut amr = Vec::<String>::new();
         let mut kinds = BTreeSet::new();
@@ -540,12 +760,18 @@ impl Hub {
             match f {
                 Factor::Signature { sig } => {
                     if !st.is_authentication_signer(&sig.signer) {
-                        return Err(ApiError::unauthorized("signer is not a device or manage key of this identity"));
+                        return Err(ApiError::unauthorized(
+                            "signer is not a device or manage key of this identity",
+                        ));
                     }
                     if sig.alg == "WebAuthn" {
-                        return Err(ApiError::bad("invalid_request", "use the webauthn factor for passkeys"));
+                        return Err(ApiError::bad(
+                            "invalid_request",
+                            "use the webauthn factor for passkeys",
+                        ));
                     }
-                    verify_sig(sig, message.as_bytes(), &VerifyOptions::default()).map_err(ApiError::unauthorized)?;
+                    verify_sig(sig, message.as_bytes(), &VerifyOptions::default())
+                        .map_err(ApiError::unauthorized)?;
                     let d = st.devices.values().find(|d| d.key == sig.signer);
                     aal = aal.max(d.map(|d| d.aal).unwrap_or(2));
                     amr.push(if sig.alg.starts_with("EIP") {
@@ -558,14 +784,26 @@ impl Hub {
                     dev = dev.or(d.map(|d| d.id.clone()));
                     kinds.insert("possession");
                 }
-                Factor::Webauthn { device_id, authenticator_data, client_data_json, signature } => {
-                    let data = webauthn::WebAuthnSigData { authenticator_data: authenticator_data.clone(), client_data_json: client_data_json.clone() };
+                Factor::Webauthn {
+                    device_id,
+                    authenticator_data,
+                    client_data_json,
+                    signature,
+                } => {
+                    let data = webauthn::WebAuthnSigData {
+                        authenticator_data: authenticator_data.clone(),
+                        client_data_json: client_data_json.clone(),
+                    };
                     let sig = b64u_decode(signature)?;
                     let challenge = sha256(message.as_bytes()).to_vec();
                     let candidates: Vec<_> = st
                         .devices
                         .values()
-                        .filter(|d| d.kind == DeviceKind::Passkey && d.has_cap("session") && device_id.as_ref().is_none_or(|id| &d.id == id))
+                        .filter(|d| {
+                            d.kind == DeviceKind::Passkey
+                                && d.has_cap("session")
+                                && device_id.as_ref().is_none_or(|id| &d.id == id)
+                        })
                         .collect();
                     let mut matched = None;
                     for d in candidates {
@@ -583,7 +821,11 @@ impl Hub {
                     }
                     let (d, info) = matched.ok_or_else(|| ApiError::unauthorized("passkey assertion did not verify for any passkey device of this identity"))?;
                     // A user-verified passkey is multi-factor by itself (possession + PIN/biometric).
-                    aal = aal.max(if info.user_verified { d.aal } else { d.aal.min(1) });
+                    aal = aal.max(if info.user_verified {
+                        d.aal
+                    } else {
+                        d.aal.min(1)
+                    });
                     amr.push("hwk".into());
                     if info.user_verified {
                         amr.push("user".into());
@@ -599,8 +841,10 @@ impl Hub {
                     kinds.insert("otp");
                 }
                 Factor::Federated { alias: linked, .. } => {
-                    if !st.aliases.contains(linked) {
-                        return Err(ApiError::unauthorized("that account is not linked to this identity"));
+                    if !self.alias_linked(&st, linked) {
+                        return Err(ApiError::unauthorized(
+                            "that account is not linked to this identity",
+                        ));
                     }
                     // The hub can't see how the provider authenticated the user.
                     aal = aal.max(1);
@@ -617,14 +861,50 @@ impl Hub {
             aal = aal.max(2);
             amr.push("mfa".into());
         }
-        Ok(Authn { st, dev, aal, amr, auth_time: now(), alias, attrs: Map::new() })
+        Ok(Authn {
+            st,
+            dev,
+            aal,
+            amr,
+            auth_time: now(),
+            alias,
+            attrs: Map::new(),
+        })
+    }
+
+    /// Groups, roles and merged attributes for `did`: from the org's policy DAG when
+    /// the hub follows one, otherwise from the bundle file.
+    pub(crate) fn memberships_for(
+        &self,
+        did: &str,
+        dev: Option<&str>,
+        kel_attrs: &Map<String, Value>,
+    ) -> ApiResult<(Memberships, Map<String, Value>)> {
+        Ok(match self.org_memberships(did, dev, kel_attrs)? {
+            Some(found) => (found.memberships, found.attrs),
+            None => {
+                let engine = self.engine()?;
+                let attrs = engine.attributes(did, kel_attrs);
+                (engine.memberships(did, &attrs)?, attrs)
+            }
+        })
     }
 
     /// Access token claims for an authenticated principal.
-    pub fn access_claims(&self, a: &Authn, audience: &str, delegation: Option<(String, Vec<Capability>)>) -> ApiResult<AccessClaims> {
+    pub fn access_claims(
+        &self,
+        a: &Authn,
+        audience: &str,
+        delegation: Option<(String, Vec<Capability>)>,
+    ) -> ApiResult<AccessClaims> {
         let mut kel_attrs = Map::new();
         kel_attrs.insert("aliases".into(), json!(a.st.aliases));
         kel_attrs.insert("aal".into(), json!(a.aal));
+        // Compute spent on this account (spec §7.12); 0 for one that has spent none.
+        kel_attrs.insert(
+            "work".into(),
+            json!(self.store.work_for(&a.st.did)?.map_or(0, |(bits, _)| bits)),
+        );
         // Memberships from an org carry its name and the root they came from (spec §10.8).
         // Memberships from the bundle file carry nothing: they have no provenance.
         let resolve = |kel_attrs: &Map<String, Value>| -> ApiResult<_> {
@@ -640,14 +920,24 @@ impl Hub {
         let (mut m, mut attrs, mut provenance) = resolve(&kel_attrs)?;
         // Upstream attributes only fill gaps: they never replace what the directory
         // or the KEL says. Group rules see them, so memberships are worked out again.
-        let extra: Vec<_> = a.attrs.iter().filter(|(k, _)| !attrs.contains_key(*k)).collect();
+        let extra: Vec<_> = a
+            .attrs
+            .iter()
+            .filter(|(k, _)| !attrs.contains_key(*k))
+            .collect();
         if !extra.is_empty() {
             kel_attrs.extend(extra.into_iter().map(|(k, v)| (k.clone(), v.clone())));
             (m, attrs, provenance) = resolve(&kel_attrs)?;
         }
         let iat = now();
         let (act, cap) = match delegation {
-            Some((actor, caps)) => (Some(Actor { sub: actor, act: None }), Some(caps)),
+            Some((actor, caps)) => (
+                Some(Actor {
+                    sub: actor,
+                    act: None,
+                }),
+                Some(caps),
+            ),
             None => (None, None),
         };
         Ok(AccessClaims {
@@ -683,16 +973,28 @@ impl Hub {
     }
 
     /// Mint an access token after authentication.
-    pub fn issue(&self, a: &Authn, audience: &str, delegation: Option<(String, Vec<Capability>)>) -> ApiResult<Value> {
+    pub fn issue(
+        &self,
+        a: &Authn,
+        audience: &str,
+        delegation: Option<(String, Vec<Capability>)>,
+    ) -> ApiResult<Value> {
         self.token_response(&self.access_claims(a, audience, delegation)?)
     }
 
     pub(crate) fn bearer_any(&self, headers: &HeaderMap) -> ApiResult<AccessClaims> {
-        let h = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default();
-        let tok = h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")).ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+        let h = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let tok = h
+            .strip_prefix("Bearer ")
+            .or_else(|| h.strip_prefix("bearer "))
+            .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
         let t = kith_core::jws::decode(tok).map_err(ApiError::unauthorized)?;
         let aud = t.claims["aud"].as_str().unwrap_or_default().to_string();
-        verify_access_token(tok, &self.signer.jwks(), &self.cfg.issuer, &aud, now()).map_err(ApiError::unauthorized)
+        verify_access_token(tok, &self.signer.jwks(), &self.cfg.issuer, &aud, now())
+            .map_err(ApiError::unauthorized)
     }
 
     /// Bearer token issued for the hub itself (CLI management calls).
@@ -707,7 +1009,9 @@ impl Hub {
 
 impl KelResolver for Hub {
     fn resolve(&self, did: &str) -> kith_core::Result<KeyState> {
-        let events = self.get_kel(did).ok_or_else(|| kith_core::Error::NotFound(format!("no KEL for {did}")))?;
+        let events = self
+            .get_kel(did)
+            .ok_or_else(|| kith_core::Error::NotFound(format!("no KEL for {did}")))?;
         verify_log(&events, &VerifyOptions::default())
     }
 }
@@ -722,12 +1026,22 @@ impl FromRequestParts<Arc<Hub>> for ClientIp {
 
     async fn from_request_parts(parts: &mut Parts, h: &Arc<Hub>) -> Result<Self, Self::Rejection> {
         if h.cfg.behind_proxy {
-            let forwarded = parts.headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).rfind(|s| !s.is_empty());
+            let forwarded = parts
+                .headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .map(str::trim)
+                .rfind(|s| !s.is_empty());
             if let Some(ip) = forwarded {
                 return Ok(ClientIp(ip.to_string()));
             }
         }
-        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_string());
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip().to_string());
         Ok(ClientIp(peer.unwrap_or_else(|| "local".into())))
     }
 }
@@ -739,17 +1053,32 @@ async fn jwks(State(h): State<Arc<Hub>>) -> Json<Value> {
 }
 
 async fn get_kel(State(h): State<Arc<Hub>>, Path(did): Path<String>) -> ApiResult<Json<Value>> {
-    let events = h.get_kel(&did).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "not_found".into(), did.clone(), None))?;
+    let events = h
+        .get_kel(&did)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "not_found".into(), did.clone(), None))?;
     Ok(Json(json!(events)))
 }
 
-async fn put_kel(State(h): State<Arc<Hub>>, Path(did): Path<String>, Json(events): Json<Vec<Event>>) -> ApiResult<Json<Value>> {
+async fn put_kel(
+    State(h): State<Arc<Hub>>,
+    Path(did): Path<String>,
+    Json(events): Json<Vec<Event>>,
+) -> ApiResult<Json<Value>> {
     let st = h.put_kel(&did, events)?;
-    Ok(Json(json!({"did": st.did, "seq": st.seq, "digest": st.digest})))
+    Ok(Json(
+        json!({"did": st.did, "seq": st.seq, "digest": st.digest}),
+    ))
 }
 
 async fn did_doc(State(h): State<Arc<Hub>>, Path(did): Path<String>) -> ApiResult<Json<Value>> {
-    let st = h.resolve(&did).map_err(|e| ApiError(StatusCode::NOT_FOUND, "not_found".into(), e.to_string(), None))?;
+    let st = h.resolve(&did).map_err(|e| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "not_found".into(),
+            e.to_string(),
+            None,
+        )
+    })?;
     Ok(Json(st.did_document(Some(&h.cfg.issuer))))
 }
 
@@ -758,14 +1087,20 @@ struct ChallengeReq {
     did: String,
 }
 
-async fn challenge(State(h): State<Arc<Hub>>, Json(req): Json<ChallengeReq>) -> ApiResult<Json<Value>> {
-    h.resolve(&req.did).map_err(|e| ApiError::bad("unknown_identity", e))?;
+async fn challenge(
+    State(h): State<Arc<Hub>>,
+    Json(req): Json<ChallengeReq>,
+) -> ApiResult<Json<Value>> {
+    h.resolve(&req.did)
+        .map_err(|e| ApiError::bad("unknown_identity", e))?;
     let (rp, iss, did) = (h.cfg.rp_id.clone(), h.cfg.issuer.clone(), req.did.clone());
     // CAIP-122 / SIWE-shaped so wallets render it sensibly.
     let (id, message, exp) = h.new_challenge(Some(req.did.clone()), |id, iat, exp| {
         session::login_challenge(&rp, &did, &iss, id, iat, exp)
     });
-    Ok(Json(json!({"challenge_id": id, "message": message, "expires_at": exp})))
+    Ok(Json(
+        json!({"challenge_id": id, "message": message, "expires_at": exp}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -775,12 +1110,18 @@ struct VerifyReq {
     factors: Vec<Factor>,
 }
 
-async fn verify(State(h): State<Arc<Hub>>, ip: ClientIp, Json(req): Json<VerifyReq>) -> ApiResult<Json<Value>> {
+async fn verify(
+    State(h): State<Arc<Hub>>,
+    ip: ClientIp,
+    Json(req): Json<VerifyReq>,
+) -> ApiResult<Json<Value>> {
     if req.factors.iter().any(|f| matches!(f, Factor::Totp { .. })) {
         h.limit_totp(&ip)?;
     }
     let ch = h.take_challenge(&req.challenge_id)?;
-    let did = ch.did.ok_or_else(|| ApiError::bad("invalid_request", "challenge is not bound to an identity"))?;
+    let did = ch
+        .did
+        .ok_or_else(|| ApiError::bad("invalid_request", "challenge is not bound to an identity"))?;
     let a = h.authenticate(&did, &ch.message, &req.factors)?;
     Ok(Json(h.issue(&a, &req.audience, None)?))
 }
@@ -806,7 +1147,12 @@ pub struct TokenReq {
     pub scope: Option<String>,
 }
 
-async fn token(State(h): State<Arc<Hub>>, ip: ClientIp, headers: HeaderMap, Form(req): Form<TokenReq>) -> ApiResult<Response> {
+async fn token(
+    State(h): State<Arc<Hub>>,
+    ip: ClientIp,
+    headers: HeaderMap,
+    Form(req): Form<TokenReq>,
+) -> ApiResult<Response> {
     if req.totp.is_some() {
         h.limit_totp(&ip)?;
     }
@@ -817,18 +1163,26 @@ async fn token(State(h): State<Arc<Hub>>, ip: ClientIp, headers: HeaderMap, Form
         other => return Err(ApiError::bad("unsupported_grant_type", other)),
     };
     let mut r = Json(body).into_response();
-    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(r)
 }
 
 fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
     let audience = req.audience.clone().unwrap_or_else(|| h.cfg.issuer.clone());
-    let subject = req.subject_token.as_deref().ok_or_else(|| ApiError::bad("invalid_request", "subject_token required"))?;
+    let subject = req
+        .subject_token
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("invalid_request", "subject_token required"))?;
     let t = now();
     match req.subject_token_type.as_deref().unwrap_or_default() {
         TT_SESSION => {
-            let v = session::verify_session_token(subject, &h.cfg.issuer, h, t).map_err(ApiError::unauthorized)?;
-            h.check_jti(v.claims["jti"].as_str().unwrap_or_default(), v.claims["exp"].as_i64().unwrap_or(t))?;
+            let v = session::verify_session_token(subject, &h.cfg.issuer, h, t)
+                .map_err(ApiError::unauthorized)?;
+            h.check_jti(
+                v.claims["jti"].as_str().unwrap_or_default(),
+                v.claims["exp"].as_i64().unwrap_or(t),
+            )?;
             let st = h.resolve(&v.did)?;
             let mut a = Authn {
                 st,
@@ -856,7 +1210,9 @@ fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
             h.check_jti(actor.claims["jti"].as_str().unwrap_or_default(), actor.claims["exp"].as_i64().unwrap_or(t))?;
             let (chain, d) = session::verify_delegation(subject, &h.cfg.issuer, h, t).map_err(ApiError::unauthorized)?;
             if d.sub != actor.did {
-                return Err(ApiError::unauthorized("delegation was issued to someone else"));
+                return Err(ApiError::unauthorized(
+                    "delegation was issued to someone else",
+                ));
             }
             // The org's revocations bind the actor as well as the principal (spec §8.7).
             h.check_org_revocations(&actor.did, Some(&actor.device.id))?;
@@ -867,19 +1223,36 @@ fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
             let a = Authn { st, dev: Some(chain.device.id.clone()), aal: actor.aal, amr: vec!["delegated".into()], auth_time: t, alias: None, attrs: Map::new() };
             h.issue(&a, &audience, Some((actor.did.clone(), d.cap.clone())))
         }
-        other => Err(ApiError::bad("invalid_request", format!("unsupported subject_token_type {other}"))),
+        other => Err(ApiError::bad(
+            "invalid_request",
+            format!("unsupported subject_token_type {other}"),
+        )),
     }
 }
 
 async fn totp_enroll(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let c = h.bearer(&headers)?;
     if h.store.totp(&c.sub)?.is_some_and(|r| r.confirmed) {
-        return Err(ApiError(StatusCode::CONFLICT, "exists".into(), "TOTP already enrolled".into(), None));
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "exists".into(),
+            "TOTP already enrolled".into(),
+            None,
+        ));
     }
     let secret = totp::generate_secret();
     let uri = totp::otpauth_uri(&secret, &h.cfg.rp_id, &c.sub);
     let b32 = totp::to_base32(&secret);
-    h.store.put_totp(&c.sub, &store::TotpRecord { secret, confirmed: false, last_step: 0, failures: 0, locked_until: 0 })?;
+    h.store.put_totp(
+        &c.sub,
+        &store::TotpRecord {
+            secret,
+            confirmed: false,
+            last_step: 0,
+            failures: 0,
+            locked_until: 0,
+        },
+    )?;
     Ok(Json(json!({"secret": b32, "otpauth_uri": uri})))
 }
 
@@ -888,7 +1261,11 @@ struct CodeReq {
     code: String,
 }
 
-async fn totp_confirm(State(h): State<Arc<Hub>>, headers: HeaderMap, Json(req): Json<CodeReq>) -> ApiResult<Json<Value>> {
+async fn totp_confirm(
+    State(h): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Json(req): Json<CodeReq>,
+) -> ApiResult<Json<Value>> {
     let c = h.bearer(&headers)?;
     h.check_totp(&c.sub, &req.code, false)?;
     Ok(Json(json!({"confirmed": true})))
@@ -905,7 +1282,12 @@ struct ResetReq {
 /// weak session, a stolen laptop's say, could swap in its own authenticator and with
 /// it the TOTP gate on the co-signer. Sign-ins that rested on the authenticator alone
 /// end with it. An operator without either uses `DELETE /v1/admin/identities/{did}/totp`.
-async fn totp_reset(State(h): State<Arc<Hub>>, ip: ClientIp, headers: HeaderMap, body: Option<Json<ResetReq>>) -> ApiResult<Json<Value>> {
+async fn totp_reset(
+    State(h): State<Arc<Hub>>,
+    ip: ClientIp,
+    headers: HeaderMap,
+    body: Option<Json<ResetReq>>,
+) -> ApiResult<Json<Value>> {
     let c = h.bearer(&headers)?;
     match body.and_then(|Json(b)| b.code) {
         Some(code) => {
@@ -913,7 +1295,14 @@ async fn totp_reset(State(h): State<Arc<Hub>>, ip: ClientIp, headers: HeaderMap,
             h.check_totp(&c.sub, &code, true)?;
         }
         None if c.aal >= 2 => {}
-        None => return Err(ApiError(StatusCode::FORBIDDEN, "forbidden".into(), "resetting the authenticator needs a current code or an AAL 2 sign-in".into(), None)),
+        None => {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "forbidden".into(),
+                "resetting the authenticator needs a current code or an AAL 2 sign-in".into(),
+                None,
+            ))
+        }
     }
     Ok(Json(json!({"reset": h.store.delete_totp(&c.sub, now())?})))
 }
@@ -934,26 +1323,60 @@ struct CosignReq {
     event: Event,
 }
 
-async fn cosign(State(h): State<Arc<Hub>>, ip: ClientIp, Json(req): Json<CosignReq>) -> ApiResult<Json<Value>> {
+async fn cosign(
+    State(h): State<Arc<Hub>>,
+    ip: ClientIp,
+    Json(req): Json<CosignReq>,
+) -> ApiResult<Json<Value>> {
     h.limit_totp(&ip)?;
     let st = h.resolve(&req.did)?;
-    if req.event.did.as_deref() != Some(st.did.as_str()) || req.event.seq != st.seq + 1 || req.event.prev.as_deref() != Some(st.digest.as_str()) {
-        return Err(ApiError::bad("invalid_request", "event must be the next event of this identity's KEL"));
+    if req.event.did.as_deref() != Some(st.did.as_str())
+        || req.event.seq != st.seq + 1
+        || req.event.prev.as_deref() != Some(st.digest.as_str())
+    {
+        return Err(ApiError::bad(
+            "invalid_request",
+            "event must be the next event of this identity's KEL",
+        ));
     }
-    let signer = h.store.cosigner(&st.did)?.ok_or_else(|| ApiError::bad("invalid_request", "no co-signer for this identity"))?;
+    let signer = h
+        .store
+        .cosigner(&st.did)?
+        .ok_or_else(|| ApiError::bad("invalid_request", "no co-signer for this identity"))?;
     h.check_totp(&st.did, &req.code, true)?;
     let sig = signer.sign(&req.event.signing_message()?)?;
     Ok(Json(json!(sig)))
 }
 
+/// The bare hostname: sign-up when this hub takes it, otherwise a plain note.
+async fn home(State(h): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+    if account::current(&h, &headers).is_some() {
+        axum::response::Redirect::to("/whoami").into_response()
+    } else if h.cfg.signup {
+        axum::response::Redirect::to("/signup").into_response()
+    } else {
+        pages::message(
+            StatusCode::OK,
+            "Kith hub",
+            "This is an identity service. Apps send people here to sign in.",
+        )
+    }
+}
+
 pub fn router(hub: Arc<Hub>) -> Router {
     Router::new()
         .route("/.well-known/openid-configuration", get(oidc::discovery))
-        .route("/.well-known/oauth-authorization-server", get(oidc::discovery))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oidc::discovery),
+        )
         .route("/.well-known/jwks.json", get(jwks))
         .route("/oauth/authorize", get(oidc::authorize))
         .route("/oauth/login", post(oidc::login))
-        .route("/oauth/consent", get(oidc::consent_page).post(oidc::consent))
+        .route(
+            "/oauth/consent",
+            get(oidc::consent_page).post(oidc::consent),
+        )
         .route("/oauth/register", post(oidc::register))
         .route("/oauth/upstream/{id}/start", get(upstream::start))
         .route("/oauth/upstream/{id}/callback", get(upstream::callback))
@@ -970,9 +1393,17 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/totp", delete(totp_reset))
         .route("/v1/cosigner", post(cosigner))
         .route("/v1/cosign", post(cosign))
-        .route("/v1/contacts", post(contacts::request_code).get(contacts::list).delete(contacts::remove))
+        .route(
+            "/v1/contacts",
+            post(contacts::request_code)
+                .get(contacts::list)
+                .delete(contacts::remove),
+        )
         .route("/v1/contacts/confirm", post(contacts::confirm))
-        .route("/v1/contacts/public", axum::routing::put(contacts::set_public))
+        .route(
+            "/v1/contacts/public",
+            axum::routing::put(contacts::set_public),
+        )
         .route("/v1/contacts/lookup", get(contacts::lookup))
         .route("/v1/enroll", post(enroll::start))
         .route("/v1/enroll/{id}", get(enroll::status))
@@ -980,6 +1411,28 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/enroll/{id}/event", post(enroll::submit_event))
         .route("/v1/enroll/{id}/sig", post(enroll::submit_sig))
         .route("/enroll/{id}", get(enroll::page))
+        .route("/v1/join", post(join::start))
+        .route("/v1/join/invite", post(join::invite))
+        .route("/v1/join/{id}", get(join::status))
+        .route("/v1/join/{id}/claim", post(join::claim))
+        .route("/v1/join/{id}/device", post(join::submit_device))
+        .route("/v1/join/{id}/approve", post(join::approve))
+        .route("/v1/join/{id}/pop", post(join::pop))
+        .route("/join/{id}", get(join::page))
+        .route("/join/{id}/qr.svg", get(join::qr_svg))
+        .route("/", get(home))
+        .route("/whoami", get(account::page).post(account::login))
+        .route(
+            "/login",
+            get(|| async { axum::response::Redirect::to("/whoami") }),
+        )
+        .route("/signup", get(signup::page))
+        .route("/v1/signup", post(signup::begin))
+        .route("/v1/signup/check", post(signup::check))
+        .route("/v1/work", post(work::submit))
+        .route("/v1/work/{did}", get(work::get))
+        .route("/v1/signup/{id}/key", post(signup::submit_key))
+        .route("/v1/signup/{id}/sig", post(signup::submit_sig))
         .route("/v1/hub", get(org::info))
         .route("/v1/hub/revoker", post(org::sign_revoker))
         .route("/v1/blocks", axum::routing::put(org::put_blocks))
@@ -987,18 +1440,28 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/ipfs/{cid}", get(org::get_block))
         .route("/v1/policy/{org}", get(org::policy))
         .route("/v1/policy/{org}/slice", post(org::slice))
-        .route("/v1/revocations/{org}", get(org::get_revocations).post(org::post_revocation))
+        .route(
+            "/v1/revocations/{org}",
+            get(org::get_revocations).post(org::post_revocation),
+        )
         .route("/v1/revocations/{org}/heartbeat", get(org::get_heartbeat))
         .route("/v1/revocations/{org}/events", get(org::events))
         .route("/v1/admin/stats", get(admin::stats))
         .route("/v1/admin/sessions", get(admin::sessions))
         .route("/v1/admin/sessions/{sid}", delete(admin::end_session))
-        .route("/v1/admin/identities/{did}/sessions", delete(admin::end_sessions_of))
+        .route("/v1/admin/identities", get(admin::identities))
+        .route(
+            "/v1/admin/identities/{did}/sessions",
+            delete(admin::end_sessions_of),
+        )
         .route("/v1/admin/identities/{did}/totp", delete(admin::reset_totp))
         .route("/v1/admin/clients", get(admin::clients))
         .route("/v1/admin/clients/{id}", delete(admin::delete_client))
         .route("/v1/admin/grants/{did}", get(admin::grants))
-        .route("/v1/admin/grants/{did}/{client_id}", delete(admin::revoke_grant))
+        .route(
+            "/v1/admin/grants/{did}/{client_id}",
+            delete(admin::revoke_grant),
+        )
         .with_state(hub)
 }
 
@@ -1025,7 +1488,11 @@ pub async fn serve(cfg: HubConfig, addr: &str) -> anyhow::Result<()> {
         hub.cfg.upstreams.len(),
         hub.cfg.data_dir.join(store::FILE).display()
     );
-    axum::serve(listener, router(hub).into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        router(hub).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1041,7 +1508,18 @@ mod tests {
 
     fn enrolled(h: &Hub, did: &str) -> Vec<u8> {
         let secret = totp::generate_secret();
-        h.store.put_totp(did, &store::TotpRecord { secret: secret.clone(), confirmed: true, last_step: 0, failures: 0, locked_until: 0 }).unwrap();
+        h.store
+            .put_totp(
+                did,
+                &store::TotpRecord {
+                    secret: secret.clone(),
+                    confirmed: true,
+                    last_step: 0,
+                    failures: 0,
+                    locked_until: 0,
+                },
+            )
+            .unwrap();
         secret
     }
 
@@ -1068,8 +1546,14 @@ mod tests {
         for round in 0..300 {
             let did = format!("did:kith:race{round}");
             let code = totp::code_at(&enrolled(&h, &did), now());
-            let accepted = together(4, |_| h.check_totp(&did, &code, true).is_ok()).into_iter().filter(|ok| *ok).count();
-            assert_eq!(accepted, 1, "round {round}: one code, accepted {accepted} times");
+            let accepted = together(4, |_| h.check_totp(&did, &code, true).is_ok())
+                .into_iter()
+                .filter(|ok| *ok)
+                .count();
+            assert_eq!(
+                accepted, 1,
+                "round {round}: one code, accepted {accepted} times"
+            );
         }
     }
 
@@ -1079,11 +1563,21 @@ mod tests {
         for round in 0..300 {
             let did = format!("did:kith:count{round}");
             let secret = enrolled(&h, &did);
-            let valid: Vec<String> = [-30, 0, 30].iter().map(|d| totp::code_at(&secret, now() + d)).collect();
-            let wrong = ["000000", "000001"].iter().find(|c| !valid.iter().any(|v| v == *c)).unwrap().to_string();
+            let valid: Vec<String> = [-30, 0, 30]
+                .iter()
+                .map(|d| totp::code_at(&secret, now() + d))
+                .collect();
+            let wrong = ["000000", "000001"]
+                .iter()
+                .find(|c| !valid.iter().any(|v| v == *c))
+                .unwrap()
+                .to_string();
             together(4, |_| h.check_totp(&did, &wrong, true).is_err());
             let failures = h.store.totp(&did).unwrap().unwrap().failures;
-            assert_eq!(failures, 4, "round {round}: four wrong codes, {failures} counted");
+            assert_eq!(
+                failures, 4,
+                "round {round}: four wrong codes, {failures} counted"
+            );
         }
     }
 }

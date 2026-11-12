@@ -24,7 +24,16 @@ reqwest.workspace = true
 clap.workspace = true
 rand.workspace = true
 hickory-resolver.workspace = true
+# `kith passkey enroll --qr` and `kith device join` print QR codes.
 qrcode = { version = "0.14", default-features = false }
+# `kith bundle edit` serves its page on loopback.
+axum.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# Reads back the QR codes the CLI prints.
+rqrr = { version = "0.11", default-features = false }
 
 # The macOS keychain and Secure Enclave backends (`keystore.rs`). Other platforms
 # fall back to the plaintext file backend.
@@ -34,5 +43,3 @@ security-framework-sys = { version = "2.17", default-features = false, features 
 core-foundation = "0.10"
 p256.workspace = true
 
-[dev-dependencies]
-rqrr = { version = "0.11", default-features = false }

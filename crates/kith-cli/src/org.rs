@@ -12,7 +12,7 @@ use kith_core::beacon::{BeaconValue, Verifiers};
 use kith_core::dag::{blocks_from_json, blocks_to_json, MemStore};
 use kith_core::kel::{next_event, Device, DeviceKind, EventBody, KeyState};
 use kith_core::pdag::{self, Query};
-use kith_core::revoke::{Entry, FreshnessPolicy, Follower, Heartbeat, Revocation};
+use kith_core::revoke::{Entry, Follower, FreshnessPolicy, Heartbeat, Revocation};
 use kith_core::util::now;
 
 use super::{check, fetch_state, http, print, publish, Home};
@@ -114,31 +114,60 @@ pub enum AnchorCmd {
 }
 
 fn digest32(s: &str) -> Result<[u8; 32]> {
-    let b = kith_core::ots::hex_decode(s).or_else(|_| kith_core::util::b64u_decode(s)).map_err(|_| anyhow!("digest must be hex or base64url"))?;
+    let b = kith_core::ots::hex_decode(s)
+        .or_else(|_| kith_core::util::b64u_decode(s))
+        .map_err(|_| anyhow!("digest must be hex or base64url"))?;
     b.try_into().map_err(|_| anyhow!("digest must be 32 bytes"))
 }
 
 fn ots_http() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).user_agent("kith-cli").build()?)
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("kith-cli")
+        .build()?)
 }
 
 pub fn anchor(home: &Home, cmd: AnchorCmd) -> Result<()> {
     use kith_core::ots::{self, DetachedFile, Timestamp};
     match cmd {
-        AnchorCmd::Stamp { digest, revocation, out } => {
+        AnchorCmd::Stamp {
+            digest,
+            revocation,
+            out,
+        } => {
             let (digest, what) = match (digest, revocation) {
                 (Some(d), _) => (digest32(&d)?, "digest".to_string()),
                 (None, Some(n)) => {
                     let did = home.did()?;
-                    let r = check(http().get(format!("{}/v1/revocations/{did}?after={}", home.hub()?, n.saturating_sub(1))).send()?)?;
-                    let e: Entry = serde_json::from_value(r["entries"].get(0).cloned().ok_or_else(|| anyhow!("no revocation {n}"))?)?;
+                    let r = check(
+                        http()
+                            .get(format!(
+                                "{}/v1/revocations/{did}?after={}",
+                                home.hub()?,
+                                n.saturating_sub(1)
+                            ))
+                            .send()?,
+                    )?;
+                    let e: Entry = serde_json::from_value(
+                        r["entries"]
+                            .get(0)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("no revocation {n}"))?,
+                    )?;
                     (digest32(&e.digest()?)?, format!("revocation {n}"))
                 }
                 (None, None) => {
                     let st = home.state()?;
-                    let seq = st.policy.as_ref().ok_or_else(|| anyhow!("no policy_root yet"))?.seq;
+                    let seq = st
+                        .policy
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("no policy_root yet"))?
+                        .seq;
                     let ev = &home.kel()?[seq as usize];
-                    (digest32(&ev.digest()?)?, format!("policy_root at kel seq {seq}"))
+                    (
+                        digest32(&ev.digest()?)?,
+                        format!("policy_root at kel seq {seq}"),
+                    )
                 }
             };
             let mut nonce = [0u8; 16];
@@ -179,7 +208,10 @@ pub fn anchor(home: &Home, cmd: AnchorCmd) -> Result<()> {
                     eprintln!("skipping calendar not on the allowlist: {uri}");
                     continue;
                 }
-                let r = client.get(format!("{uri}/timestamp/{}", ots::hex(&commitment))).header("accept", "application/vnd.opentimestamps.v1").send()?;
+                let r = client
+                    .get(format!("{uri}/timestamp/{}", ots::hex(&commitment)))
+                    .header("accept", "application/vnd.opentimestamps.v1")
+                    .send()?;
                 if r.status().is_success() {
                     let ts = Timestamp::parse(&r.bytes()?)?;
                     changed |= f.timestamp.merge_at(&digest, &commitment, &ts)?;
@@ -190,28 +222,50 @@ pub fn anchor(home: &Home, cmd: AnchorCmd) -> Result<()> {
             if changed {
                 std::fs::write(&file, f.to_bytes())?;
             }
-            let atts: Vec<String> = f.attestations()?.into_iter().map(|r| format!("{:?}", r.attestation)).collect();
+            let atts: Vec<String> = f
+                .attestations()?
+                .into_iter()
+                .map(|r| format!("{:?}", r.attestation))
+                .collect();
             print(&json!({"upgraded": changed, "attestations": atts}));
         }
         AnchorCmd::Verify { file, esplora } => {
             let f = DetachedFile::parse(&std::fs::read(&file)?)?;
             let client = ots_http()?;
             let header = |height: u64| -> kith_core::Result<Vec<u8>> {
-                let io = |e: reqwest::Error| kith_core::Error::NotFound(format!("block {height}: {e}"));
-                let get = |url: String| client.get(url).send().and_then(|r| r.error_for_status()).and_then(|r| r.text()).map_err(io);
+                let io =
+                    |e: reqwest::Error| kith_core::Error::NotFound(format!("block {height}: {e}"));
+                let get = |url: String| {
+                    client
+                        .get(url)
+                        .send()
+                        .and_then(|r| r.error_for_status())
+                        .and_then(|r| r.text())
+                        .map_err(io)
+                };
                 let hash = get(format!("{esplora}/block-height/{height}"))?;
-                let h = ots::hex_decode(get(format!("{esplora}/block/{}/header", hash.trim()))?.trim())?;
+                let h = ots::hex_decode(
+                    get(format!("{esplora}/block/{}/header", hash.trim()))?.trim(),
+                )?;
                 // The header must hash to the block hash we asked about.
                 let mut id = kith_core::util::sha256(kith_core::util::sha256(&h)).to_vec();
                 id.reverse();
                 if ots::hex(&id) != hash.trim() {
-                    return Err(kith_core::Error::Signature(format!("block {height}: header does not hash to {}", hash.trim())));
+                    return Err(kith_core::Error::Signature(format!(
+                        "block {height}: header does not hash to {}",
+                        hash.trim()
+                    )));
                 }
                 Ok(h)
             };
             match f.verify_bitcoin(&header)? {
-                Some((height, time)) => print(&json!({"digest": ots::hex(&f.digest), "bitcoin_block": height, "existed_by": time})),
-                None => bail!("no Bitcoin attestation yet (pending at {:?}); try `kith anchor upgrade`", f.pending()?.keys().collect::<Vec<_>>()),
+                Some((height, time)) => print(
+                    &json!({"digest": ots::hex(&f.digest), "bitcoin_block": height, "existed_by": time}),
+                ),
+                None => bail!(
+                    "no Bitcoin attestation yet (pending at {:?}); try `kith anchor upgrade`",
+                    f.pending()?.keys().collect::<Vec<_>>()
+                ),
             }
         }
     }
@@ -220,11 +274,15 @@ pub fn anchor(home: &Home, cmd: AnchorCmd) -> Result<()> {
 
 /// The org argument as a DID: a DID, an alias or a name (see `names`), or this identity.
 fn org_or_self(home: &Home, org: Option<String>) -> Result<String> {
-    org.map(|o| super::names::principal(home, &o)).unwrap_or_else(|| home.did())
+    org.map(|o| super::names::principal(home, &o))
+        .unwrap_or_else(|| home.did())
 }
 
 fn policy_root(st: &KeyState) -> Result<(String, u64)> {
-    let p = st.policy.as_ref().ok_or_else(|| anyhow!("{} has not published a policy root", st.did))?;
+    let p = st
+        .policy
+        .as_ref()
+        .ok_or_else(|| anyhow!("{} has not published a policy root", st.did))?;
     Ok((p.root.clone(), p.revocations_through))
 }
 
@@ -234,15 +292,27 @@ pub fn verifiers_for(h: Option<&Heartbeat>) -> Result<Verifiers> {
     let mut v = Verifiers::default();
     if let Some(BeaconValue::Nist2 { pulse }) = h.and_then(|h| h.beacon.as_ref()) {
         let (base, id) = v.nist_certificate_url(pulse)?;
-        let pem = http().get(format!("{base}/certificate/{id}")).send()?.error_for_status()?.text()?;
+        let pem = http()
+            .get(format!("{base}/certificate/{id}"))
+            .send()?
+            .error_for_status()?
+            .text()?;
         v.add_nist_certificate(&pem)?;
     }
     Ok(v)
 }
 
-fn follow(hub: &str, st: &KeyState, policy: FreshnessPolicy) -> Result<(Follower, Option<Heartbeat>)> {
+fn follow(
+    hub: &str,
+    st: &KeyState,
+    policy: FreshnessPolicy,
+) -> Result<(Follower, Option<Heartbeat>)> {
     let (_, through) = policy_root(st).unwrap_or_default();
-    let r = check(http().get(format!("{hub}/v1/revocations/{}?after={through}", st.did)).send()?)?;
+    let r = check(
+        http()
+            .get(format!("{hub}/v1/revocations/{}?after={through}", st.did))
+            .send()?,
+    )?;
     let mut f = Follower::new(&st.did, through, policy);
     for e in r["entries"].as_array().cloned().unwrap_or_default() {
         f.apply_entry(st, &serde_json::from_value(e)?)?;
@@ -258,7 +328,10 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
     let hub = home.hub()?;
     match cmd {
         PolicyCmd::Publish { bundle, blocks_dir } => {
-            let b: Bundle = serde_json::from_str(&std::fs::read_to_string(&bundle).with_context(|| format!("reading {}", bundle.display()))?)?;
+            let b: Bundle = serde_json::from_str(
+                &std::fs::read_to_string(&bundle)
+                    .with_context(|| format!("reading {}", bundle.display()))?,
+            )?;
             let store = MemStore::new();
             let root = pdag::build(&store, &b)?;
             let blocks = store.blocks();
@@ -268,12 +341,31 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
                     std::fs::write(dir.join(cid), bytes)?;
                 }
             }
-            check(http().put(format!("{hub}/v1/blocks")).json(&blocks_to_json(&blocks)).send()?)?;
+            check(
+                http()
+                    .put(format!("{hub}/v1/blocks"))
+                    .json(&blocks_to_json(&blocks))
+                    .send()?,
+            )?;
             let st = home.state()?;
             // Revocations up to now are presumed folded into the new bundle.
-            let r = check(http().get(format!("{hub}/v1/revocations/{}", st.did)).send()?)?;
-            let through = r["entries"].as_array().and_then(|a| a.last()).and_then(|e| e["seq"].as_u64()).unwrap_or(0);
-            let mut ev = next_event(&st, EventBody::PolicyRoot { root: root.clone(), revocations_through: through });
+            let r = check(
+                http()
+                    .get(format!("{hub}/v1/revocations/{}", st.did))
+                    .send()?,
+            )?;
+            let through = r["entries"]
+                .as_array()
+                .and_then(|a| a.last())
+                .and_then(|e| e["seq"].as_u64())
+                .unwrap_or(0);
+            let mut ev = next_event(
+                &st,
+                EventBody::PolicyRoot {
+                    root: root.clone(),
+                    revocations_through: through,
+                },
+            );
             for m in home.signers("manage")? {
                 ev.sign(&m)?;
             }
@@ -282,16 +374,31 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
             println!("{root}");
             eprintln!("published {} blocks; policy root committed at kel seq {} (revocations through {through})", blocks.len(), home.state()?.seq);
         }
-        PolicyCmd::Slice { org, actions, principals, blocks } => {
+        PolicyCmd::Slice {
+            org,
+            actions,
+            principals,
+            blocks,
+        } => {
             let org = org_or_self(home, org)?;
             let st = fetch_state(&hub, &org)?;
             let (root, _) = policy_root(&st)?;
             let q = if actions.is_empty() && principals.len() == 1 {
-                Query::Principal { id: principals[0].clone() }
+                Query::Principal {
+                    id: principals[0].clone(),
+                }
             } else {
-                Query::Actions { actions, principals }
+                Query::Actions {
+                    actions,
+                    principals,
+                }
             };
-            let r = check(http().post(format!("{hub}/v1/policy/{org}/slice")).json(&q).send()?)?;
+            let r = check(
+                http()
+                    .post(format!("{hub}/v1/policy/{org}/slice"))
+                    .json(&q)
+                    .send()?,
+            )?;
             // The hub is just a block source: everything is checked against the KEL's root.
             let proof = blocks_from_json(&r["blocks"])?;
             let bytes: usize = proof.values().map(Vec::len).sum();
@@ -308,15 +415,37 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
             }
             print(&out);
         }
-        PolicyCmd::Grants { org, principal, aal } => {
+        PolicyCmd::Grants {
+            org,
+            principal,
+            aal,
+        } => {
             let org = org_or_self(home, org)?;
-            let id = principal.map(|p| super::names::principal(home, &p)).unwrap_or_else(|| home.did())?;
+            let id = principal
+                .map(|p| super::names::principal(home, &p))
+                .unwrap_or_else(|| home.did())?;
             let st = fetch_state(&hub, &org)?;
             let (root, _) = policy_root(&st)?;
             let q = Query::Principal { id: id.clone() };
-            let r = check(http().post(format!("{hub}/v1/policy/{org}/slice")).json(&q).send()?)?;
-            let slice = pdag::load(&MemStore::from_blocks(blocks_from_json(&r["blocks"])?), &root, &q)?;
-            let (f, _) = follow(&hub, &st, FreshnessPolicy { require_beacon: false, ..Default::default() })?;
+            let r = check(
+                http()
+                    .post(format!("{hub}/v1/policy/{org}/slice"))
+                    .json(&q)
+                    .send()?,
+            )?;
+            let slice = pdag::load(
+                &MemStore::from_blocks(blocks_from_json(&r["blocks"])?),
+                &root,
+                &q,
+            )?;
+            let (f, _) = follow(
+                &hub,
+                &st,
+                FreshnessPolicy {
+                    require_beacon: false,
+                    ..Default::default()
+                },
+            )?;
             let engine = slice.engine_without(&f.revoked_policies())?;
             let mut attrs = serde_json::Map::new();
             attrs.insert("aal".into(), json!(aal));
@@ -384,7 +513,10 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
         }
         PolicyCmd::AddRevoker => {
             let info = check(http().get(format!("{hub}/v1/hub")).send()?)?;
-            let key = info["revoker"].as_str().ok_or_else(|| anyhow!("hub has no revoker key"))?.to_string();
+            let key = info["revoker"]
+                .as_str()
+                .ok_or_else(|| anyhow!("hub has no revoker key"))?
+                .to_string();
             let st = home.state()?;
             if st.devices.values().any(|d| d.key == key) {
                 bail!("the hub's revoker is already a device of {}", st.did);
@@ -403,11 +535,19 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
             for m in home.signers("manage")? {
                 ev.sign(&m)?;
             }
-            let pop = check(http().post(format!("{hub}/v1/hub/revoker")).json(&ev).send()?)?;
+            let pop = check(
+                http()
+                    .post(format!("{hub}/v1/hub/revoker"))
+                    .json(&ev)
+                    .send()?,
+            )?;
             ev.add_sig(serde_json::from_value(pop)?);
             home.append(ev)?;
             publish(home)?;
-            eprintln!("the hub can now sign revocations and heartbeats for {} (and nothing else)", st.did);
+            eprintln!(
+                "the hub can now sign revocations and heartbeats for {} (and nothing else)",
+                st.did
+            );
         }
     }
     Ok(())
@@ -417,30 +557,56 @@ pub fn revoke(home: &mut Home, cmd: RevokeCmd) -> Result<()> {
     let hub = home.hub()?;
     let st = home.state()?;
     let r = match cmd {
-        RevokeCmd::Principal { id } => Revocation::Principal { id: super::names::principal(home, &id)? },
+        RevokeCmd::Principal { id } => Revocation::Principal {
+            id: super::names::principal(home, &id)?,
+        },
         RevokeCmd::Member { id, set } => {
             if !(set.starts_with("Group::") || set.starts_with("Role::")) {
                 bail!("set must be Group::<name> or Role::<name>");
             }
-            Revocation::Member { id: super::names::principal(home, &id)?, set }
+            Revocation::Member {
+                id: super::names::principal(home, &id)?,
+                set,
+            }
         }
-        RevokeCmd::Device { did, device } => Revocation::Device { did: super::names::principal(home, &did)?, device },
+        RevokeCmd::Device { did, device } => Revocation::Device {
+            did: super::names::principal(home, &did)?,
+            device,
+        },
         RevokeCmd::Policy { id } => Revocation::Policy { id },
         RevokeCmd::Token { jti } => Revocation::Token { jti },
     };
-    let chain = check(http().get(format!("{hub}/v1/revocations/{}", st.did)).send()?)?;
-    let prev: Option<Entry> = chain["entries"].as_array().and_then(|a| a.last()).map(|e| serde_json::from_value(e.clone())).transpose()?;
+    let chain = check(
+        http()
+            .get(format!("{hub}/v1/revocations/{}", st.did))
+            .send()?,
+    )?;
+    let prev: Option<Entry> = chain["entries"]
+        .as_array()
+        .and_then(|a| a.last())
+        .map(|e| serde_json::from_value(e.clone()))
+        .transpose()?;
     let mut e = Entry::new(&st.did, prev.as_ref(), vec![r])?;
     for m in home.signers("manage")? {
         e.sign(&m)?;
     }
-    check(http().post(format!("{hub}/v1/revocations/{}", st.did)).json(&e).send()?)?;
+    check(
+        http()
+            .post(format!("{hub}/v1/revocations/{}", st.did))
+            .json(&e)
+            .send()?,
+    )?;
     println!("{}", e.seq);
     eprintln!("revocation {} pushed", e.seq);
     Ok(())
 }
 
-pub fn status(home: &Home, org: Option<String>, policy: FreshnessPolicy, watch: Option<u64>) -> Result<()> {
+pub fn status(
+    home: &Home,
+    org: Option<String>,
+    policy: FreshnessPolicy,
+    watch: Option<u64>,
+) -> Result<()> {
     let hub = home.hub()?;
     let org = org_or_self(home, org)?;
     loop {

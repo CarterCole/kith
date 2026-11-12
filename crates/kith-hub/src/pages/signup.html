@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Create an account · {{BRAND}}</title>
+<style nonce="{{NONCE}}">{{STYLE}}</style>
+</head>
+<body>
+<main>
+  <div class="brand">{{BRAND}}</div>
+  <h1>Create an account</h1>
+  <div id="step-name">
+    <p id="provider-note" class="hidden"><strong>You signed in with <span id="provider-name"></span>.</strong> Make a passkey to finish. Your <span class="provider-again"></span> account will be linked to it, so either one signs you in afterwards.</p>
+    <p>Your account is a passkey on this device. There is no password to forget, and this site never holds your keys.</p>
+    <label for="name">Name for the passkey</label>
+    <input id="name" autocomplete="off" value="My account" maxlength="64">
+    <p class="meta">Only your device sees this name. It is not sent to the hub.</p>
+    <div class="stack mt">
+      <button id="start" class="primary" type="button">Continue</button>
+    </div>
+    <p class="note">Already have an account? <a id="signin-link" href="/whoami">Sign in</a></p>
+  </div>
+  <div id="step-recovery" class="hidden">
+    <p><strong>First, set up your recovery key.</strong> If you lose your passkey, this is the only thing that can replace it. Anyone who has it can take over your account. This hub only ever receives its public half.</p>
+    <fieldset>
+      <legend class="meta">Where should it come from?</legend>
+      <label class="check"><input type="radio" name="mode" value="file" checked> Make one for me and give me a file</label>
+      <label class="check"><input type="radio" name="mode" value="words"> Derive it from my own secret words</label>
+      <label class="check"><input type="radio" name="mode" value="own"> I already have a key: use its public half</label>
+    </fieldset>
+    <div id="mode-file">
+      <div class="stack">
+        <button id="download" class="secondary" type="button">Download recovery key</button>
+      </div>
+      <p class="meta">This hub cannot use the file for you yet. Keep it anyway: it cannot be recreated later.</p>
+    </div>
+    <div id="mode-words" class="hidden">
+      <label for="words">Secret words</label>
+      <input id="words" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <label for="words2">Type them again</label>
+      <input id="words2" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <p class="meta">Use at least 5 words that nobody could guess; 6 random words is a good floor. Case and spacing don't matter. The words are never sent or stored, so you must be able to write them down exactly. Anyone who guesses them can take the account over.</p>
+      <div class="stack">
+        <button id="derive" class="secondary" type="button">Derive key</button>
+      </div>
+    </div>
+    <div id="mode-own" class="hidden">
+      <label for="own">Public key</label>
+      <input id="own" autocomplete="off" spellcheck="false" placeholder="did:key:z…">
+      <p class="meta">A P-256, Ed25519 or secp256k1 key as a <code>did:key</code>. Derive it however you like; the private half never has to touch this page.</p>
+      <div class="stack">
+        <button id="check-own" class="secondary" type="button">Check key</button>
+      </div>
+    </div>
+    <p id="chosen" class="meta hidden">Recovery key<code id="chosen-key" class="block"></code></p>
+    <label class="check"><input id="saved" type="checkbox" disabled> <span id="saved-label">I saved it somewhere safe</span></label>
+    <div class="stack">
+      <button id="create" class="primary" type="button" disabled>Create passkey</button>
+    </div>
+  </div>
+  <div id="step-done" class="hidden">
+    <p>Your account is ready. Sign in with the passkey you just made.</p>
+    <p>Your identity<code id="did" class="block"></code></p>
+    <div id="work-box">
+      <p><strong>Optional: make the account count for more.</strong> Your browser can spend computing power on this identity. Apps can see how much, and treat an account that cost real effort as more trustworthy. Each extra bit of work doubles the effort, so keep it running as long as you like. It only counts for this account.</p>
+      <p id="work-stats" class="meta">Work so far: <span id="work-bits">0</span> bits · <span id="work-rate">0</span> hashes per second</p>
+      <div class="stack">
+        <button id="work-toggle" class="secondary" type="button">Start</button>
+      </div>
+    </div>
+    <div class="stack">
+      <a id="continue" class="primary" href="/whoami">Continue</a>
+    </div>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+if (!webauthnSupported() || !(window.crypto && crypto.subtle)) {
+  $("start").disabled = true;
+  status("This browser doesn't support passkeys.", "error");
+}
+
+let recovery; // { key: did:key, jwk? }: what the account will commit to
+
+// Sent here by "Continue with …" for a provider account that has no identity yet.
+const ticket = D.provider ? new URLSearchParams(location.search).get("ticket") : null;
+if (ticket) {
+  $("provider-name").textContent = D.provider;
+  document.querySelector(".provider-again").textContent = D.provider;
+  $("provider-note").classList.remove("hidden");
+}
+let mode = "file";
+
+// Where the login page sent us from, if it was ours.
+const back = new URLSearchParams(location.search).get("return");
+const returnTo = back && back.startsWith("/oauth/authorize?") ? back : null;
+
+function show(step) {
+  for (const id of ["step-name", "step-recovery", "step-done"]) $(id).classList.toggle("hidden", id !== step);
+}
+
+// --- P-256 arithmetic, only to turn a private scalar into a public key: WebCrypto
+// can't, and the key is derived from words here. Affine, not constant time; the words
+// never leave this page and nobody else is timing it.
+const P = 2n ** 256n - 2n ** 224n + 2n ** 192n + 2n ** 96n - 1n;
+const N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+const G = [0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n, 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n];
+const mod = (a, m = P) => ((a % m) + m) % m;
+function inv(a, m = P) {
+  let [r0, r1, s0, s1] = [mod(a, m), m, 1n, 0n];
+  while (r1) { const q = r0 / r1; [r0, r1, s0, s1] = [r1, r0 - q * r1, s1, s0 - q * s1]; }
+  return mod(s0, m);
+}
+function add(p, q) {
+  if (!p) return q;
+  if (!q) return p;
+  const [x1, y1] = p, [x2, y2] = q;
+  let l;
+  if (x1 === x2) {
+    if (mod(y1 + y2) === 0n) return null;
+    l = mod((3n * x1 * x1 - 3n) * inv(2n * y1));
+  } else {
+    l = mod((y2 - y1) * inv(x2 - x1));
+  }
+  const x3 = mod(l * l - x1 - x2);
+  return [x3, mod(l * (x1 - x3) - y1)];
+}
+function mul(k, p) {
+  let r = null;
+  for (; k > 0n; k >>= 1n) { if (k & 1n) r = add(r, p); p = add(p, p); }
+  return r;
+}
+const toBig = (bytes) => bytes.reduce((n, b) => (n << 8n) | BigInt(b), 0n);
+function toBytes(n, len) {
+  const out = new Uint8Array(len);
+  for (let i = len - 1; i >= 0; i--, n >>= 8n) out[i] = Number(n & 0xffn);
+  return out;
+}
+const didKeyP256 = ([x, y]) => "did:key:z" + base58(new Uint8Array([0x80, 0x24, y & 1n ? 3 : 2, ...toBytes(x, 32)]));
+
+// Secret words → recovery key (spec §7.11). Anyone can redo this in any language:
+//   phrase = NFKD(words), lower-cased, split on whitespace, joined with one space
+//   seed   = PBKDF2-HMAC-SHA-256(phrase, salt "kith/recovery/p256/v1", 600000 rounds, 64 bytes)
+//   d      = seed (big-endian) mod (n − 1) + 1       the P-256 private scalar
+//   key    = did:key of d·G
+const DERIVE_SALT = "kith/recovery/p256/v1";
+const DERIVE_ROUNDS = 600000;
+const words = (s) => s.normalize("NFKD").toLowerCase().split(/\s+/).filter(Boolean);
+async function deriveRecovery(phrase) {
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(words(phrase).join(" ")), "PBKDF2", false, ["deriveBits"]);
+  const seed = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(DERIVE_SALT), iterations: DERIVE_ROUNDS }, base, 512));
+  return didKeyP256(mul((toBig(seed) % (N - 1n)) + 1n, G));
+}
+
+function setRecovery(next, label) {
+  recovery = next;
+  $("chosen").classList.toggle("hidden", !next);
+  $("chosen-key").textContent = next ? next.key : "";
+  $("saved-label").textContent = label;
+  $("saved").checked = false;
+  $("saved").disabled = !next;
+  $("create").disabled = true;
+}
+
+const LABELS = {
+  file: "I saved it somewhere safe",
+  words: "I have these words written down somewhere safe",
+  own: "I hold the private key for this",
+};
+
+async function freshFileKey() {
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  return {
+    key: p256DidKey(await crypto.subtle.exportKey("spki", pair.publicKey)),
+    jwk: await crypto.subtle.exportKey("jwk", pair.privateKey),
+  };
+}
+
+function chooseMode(m) {
+  mode = m;
+  for (const id of ["file", "words", "own"]) $("mode-" + id).classList.toggle("hidden", id !== m);
+  status("");
+  if (m === "file") setRecovery(fileKey, LABELS.file);
+  else setRecovery(null, LABELS[m]);
+  // Only the file mode has a key before the visitor does anything.
+  $("chosen").classList.toggle("hidden", m !== "file");
+  if (m === "file") $("chosen-key").textContent = fileKey.key;
+}
+
+let fileKey;
+for (const r of document.querySelectorAll('input[name="mode"]')) r.onchange = () => r.checked && chooseMode(r.value);
+
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  try {
+    fileKey = await freshFileKey();
+    chooseMode("file");
+    show("step-recovery");
+    status("");
+  } catch (e) {
+    $("start").disabled = false;
+    status("Error: " + e.message, "error");
+  }
+};
+
+$("derive").onclick = async () => {
+  const a = $("words").value, b = $("words2").value;
+  setRecovery(null, LABELS.words);
+  if (words(a).length < 5) return status("Use at least 5 words.", "error");
+  if (words(a).join(" ") !== words(b).join(" ")) return status("The two entries don't match.", "error");
+  $("derive").disabled = true;
+  status("Deriving the key…");
+  try {
+    const key = await deriveRecovery(a);
+    setRecovery({ key }, LABELS.words);
+    status("Key derived. Write the words down, then continue.", "ok");
+  } catch (e) {
+    status("Error: " + e.message, "error");
+  } finally {
+    $("derive").disabled = false;
+  }
+};
+
+$("check-own").onclick = async () => {
+  const key = $("own").value.trim();
+  setRecovery(null, LABELS.own);
+  if (!/^did:key:z[1-9A-HJ-NP-Za-km-z]+$/.test(key)) return status("That isn't a did:key.", "error");
+  // Let the hub say whether it is a key it can use, before a passkey is made.
+  const r = await postJSON("/v1/signup/check", { recovery_key: key });
+  if (!r.ok) return status(r.body.error_description || "That key isn't usable.", "error");
+  setRecovery({ key }, LABELS.own);
+  status("Key accepted.", "ok");
+};
+
+$("download").onclick = () => {
+  const file = {
+    kith: "recovery-key",
+    version: 1,
+    created: new Date().toISOString(),
+    hub: location.origin,
+    signer: fileKey.key,
+    private_key_jwk: fileKey.jwk,
+    note: "Keep this file offline. It can replace the passkey on your {{BRAND}} if you lose it, and anyone who has it can take the account over.",
+  };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(file, null, 2)], { type: "application/json" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "kith-recovery-key.json";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+$("saved").onchange = () => { $("create").disabled = !($("saved").checked && recovery); };
+
+// --- Proof of work for the new account (spec §7.12), on this thread in short slices:
+// the page's CSP allows no workers, and a slice is a few tens of milliseconds.
+const sha = (() => {
+  const primes = [];
+  for (let n = 2; primes.length < 64; n++) if (primes.every((p) => n % p)) primes.push(n);
+  const frac = (x) => Math.floor((x - Math.floor(x)) * 4294967296) >>> 0;
+  const K = Uint32Array.from(primes, (p) => frac(Math.cbrt(p)));
+  const H0 = Uint32Array.from(primes.slice(0, 8), (p) => frac(Math.sqrt(p)));
+  const w = new Uint32Array(64);
+  const ror = (x, n) => (x >>> n) | (x << (32 - n));
+  // `dv` holds an already padded message of `len` bytes (a multiple of 64).
+  return function (dv, len, out) {
+    let h0 = H0[0], h1 = H0[1], h2 = H0[2], h3 = H0[3], h4 = H0[4], h5 = H0[5], h6 = H0[6], h7 = H0[7];
+    for (let o = 0; o < len; o += 64) {
+      for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const a = w[i - 15], b = w[i - 2];
+        w[i] = (w[i - 16] + (ror(a, 7) ^ ror(a, 18) ^ (a >>> 3)) + w[i - 7] + (ror(b, 17) ^ ror(b, 19) ^ (b >>> 10))) | 0;
+      }
+      let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+      for (let i = 0; i < 64; i++) {
+        const t1 = (h + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+        const t2 = ((ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+        h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0;
+      h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0;
+    }
+    out[0] = h0; out[1] = h1; out[2] = h2; out[3] = h3; out[4] = h4; out[5] = h5; out[6] = h6; out[7] = h7;
+  };
+})();
+
+// Leading zero bits of a hash held as big-endian words.
+function zeroBits(words) {
+  let bits = 0;
+  for (let i = 0; i < 8; i++) {
+    const x = words[i] >>> 0;
+    if (x) return bits + Math.clz32(x);
+    bits += 32;
+  }
+  return bits;
+}
+
+// SHA-256("kith/work/v1\0" ‖ did ‖ "\0" ‖ nonce as 8 bytes big-endian), padded once so
+// that trying a nonce only rewrites its 8 bytes.
+function workPreimage(did) {
+  const prefix = new TextEncoder().encode("kith/work/v1\0" + did + "\0");
+  const len = prefix.length + 8;
+  const total = ((len + 9 + 63) >> 6) << 6;
+  const buf = new Uint8Array(total);
+  buf.set(prefix);
+  buf[len] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(total - 4, len * 8);
+  return { buf, dv, total, at: prefix.length };
+}
+
+let mining = false, best = 0, tried = 0, nextNonce = Math.floor(Math.random() * 2 ** 40), sentAt = 0, sentBest = 0;
+
+async function selfTest(pre) {
+  // Don't mine with a hash that disagrees with WebCrypto.
+  const out = new Uint32Array(8);
+  pre.dv.setUint32(pre.at, 0); pre.dv.setUint32(pre.at + 4, 12345);
+  sha(pre.dv, pre.total, out);
+  const ref = new Uint8Array(await crypto.subtle.digest("SHA-256", pre.buf.slice(0, pre.at + 8)));
+  const dv = new DataView(ref.buffer);
+  for (let i = 0; i < 8; i++) if ((dv.getUint32(i * 4) | 0) !== (out[i] | 0)) throw new Error("hash self-test failed");
+}
+
+async function submitWork(did, nonce) {
+  const r = await postJSON("/v1/work", { did, nonce });
+  if (r.ok) sentBest = Math.max(sentBest, r.body.work);
+  return r.ok;
+}
+
+async function mine(did) {
+  const pre = workPreimage(did);
+  await selfTest(pre);
+  const out = new Uint32Array(8);
+  let bestNonce = null, t0 = performance.now(), n0 = tried;
+  mining = true;
+  $("work-toggle").textContent = "Stop";
+  while (mining) {
+    const until = performance.now() + 40;
+    while (performance.now() < until) {
+      for (let i = 0; i < 2000; i++) {
+        const n = nextNonce++;
+        pre.dv.setUint32(pre.at, Math.floor(n / 4294967296));
+        pre.dv.setUint32(pre.at + 4, n >>> 0);
+        sha(pre.dv, pre.total, out);
+        tried++;
+        const bits = zeroBits(out);
+        if (bits > best) { best = bits; bestNonce = n; }
+      }
+    }
+    $("work-bits").textContent = best;
+    $("work-rate").textContent = Math.round(((tried - n0) / (performance.now() - t0)) * 1000).toLocaleString();
+    if (bestNonce !== null && best >= 12 && best > sentBest && performance.now() - sentAt > 1500) {
+      sentAt = performance.now();
+      submitWork(did, bestNonce);
+    }
+    await new Promise((r) => setTimeout(r));
+  }
+  if (bestNonce !== null && best >= 12 && best > sentBest) await submitWork(did, bestNonce);
+  $("work-toggle").textContent = "Resume";
+}
+
+$("work-toggle").onclick = async () => {
+  if (mining) { mining = false; return; }
+  try { await mine($("did").textContent.trim()); } catch (e) { mining = false; $("work-toggle").textContent = "Start"; status("Error: " + e.message, "error"); }
+};
+
+$("create").onclick = async () => {
+  $("create").disabled = true;
+  $("saved").disabled = true;
+  try {
+    const begun = await postJSON("/v1/signup", { ...(ticket ? { ticket } : {}) });
+    if (!begun.ok) throw new Error(begun.body.error_description || "could not start sign-up");
+    const { id, handle, rp_id } = begun.body;
+
+    const name = $("name").value.trim() || "My account";
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        rp: { id: rp_id, name: "{{BRAND}}" },
+        user: { id: new TextEncoder().encode(handle), name, displayName: name },
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "preferred" },
+        attestation: "none",
+      },
+    });
+    const spki = cred.response.getPublicKey();
+    if (!spki) throw new Error("the authenticator did not return a public key");
+    const key = p256DidKey(spki);
+
+    status("Passkey created. Confirm with it once to finish.");
+    const proposed = await postJSON(`/v1/signup/${id}/key`, { key, recovery_key: recovery.key });
+    if (!proposed.ok) throw new Error(proposed.body.error_description || "could not register the passkey");
+
+    const a = await navigator.credentials.get({
+      publicKey: { challenge: await sha256(proposed.body.message), rpId: rp_id, allowCredentials: [{ type: "public-key", id: cred.rawId }], userVerification: "preferred" },
+    });
+    const sig = {
+      signer: key, alg: "WebAuthn", sig: b64u(a.response.signature),
+      webauthn: { authenticator_data: b64u(a.response.authenticatorData), client_data_json: b64u(a.response.clientDataJSON) },
+    };
+    const done = await postJSON(`/v1/signup/${id}/sig`, { sig });
+    if (!done.ok) throw new Error(done.body.error_description || "the passkey's signature was rejected");
+
+    $("did").textContent = done.body.did;
+    // Back to the app that sent us, or on to the account page.
+    if (returnTo) $("continue").href = returnTo;
+    show("step-done");
+    status("Account created.", "ok");
+    // The hub finished the sign-in the app started: go straight back to it.
+    if (done.body.redirect) location.href = done.body.redirect;
+  } catch (e) {
+    $("create").disabled = false;
+    $("saved").disabled = false;
+    status(e.name === "NotAllowedError" ? "Cancelled. Try again." : "Error: " + e.message, "error");
+  }
+};
+</script>
+</body>
+</html>

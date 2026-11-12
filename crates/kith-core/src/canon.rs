@@ -24,7 +24,9 @@ fn write(value: &Value, out: &mut String) -> Result<()> {
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => {
             if n.is_f64() {
-                return Err(Error::Encoding("canonical JSON forbids non-integer numbers".into()));
+                return Err(Error::Encoding(
+                    "canonical JSON forbids non-integer numbers".into(),
+                ));
             }
             out.push_str(&n.to_string());
         }
@@ -65,7 +67,10 @@ mod tests {
     #[test]
     fn sorts_keys_and_strips_whitespace() {
         let v = json!({"b": 1, "a": [true, null, "x"], "c": {"z": 1, "y": 2}});
-        assert_eq!(to_canonical(&v).unwrap(), r#"{"a":[true,null,"x"],"b":1,"c":{"y":2,"z":1}}"#);
+        assert_eq!(
+            to_canonical(&v).unwrap(),
+            r#"{"a":[true,null,"x"],"b":1,"c":{"y":2,"z":1}}"#
+        );
     }
 
     #[test]

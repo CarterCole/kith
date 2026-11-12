@@ -45,6 +45,16 @@ fi
 step "challenge login (SIWE-style) signed by a device key"
 $K --home "$D/bob" login --method challenge --aud api://invoices
 
+step "bundle file: check it, and a broken copy leaves the last good one in force"
+$K bundle check "$D/bundle.json"
+cp "$D/bundle.json" "$D/bundle.good.json"
+echo '{"version": 1, "roles": {' > "$D/bundle.json"
+if $K bundle check "$D/bundle.json" 2>/dev/null; then echo "FAIL: a broken bundle passed the check"; exit 1; fi
+out=$($K --home "$D/ada" login --aud api://invoices 2>&1)
+grep -q '"billing-reader"' <<<"$out" || { echo "FAIL: the hub dropped the last good bundle: $out"; exit 1; }
+echo "still billing-reader with a broken file on disk (good)"
+mv "$D/bundle.good.json" "$D/bundle.json"
+
 step "enroll a passkey device and use it on another machine"
 $K --home "$D/ada" device add --name phone --kind passkey --out "$D/phone.json"
 $K --home "$D/phone" device import "$D/phone.json"

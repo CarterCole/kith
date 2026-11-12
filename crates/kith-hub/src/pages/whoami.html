@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your account · {{BRAND}}</title>
+<style nonce="{{NONCE}}">{{STYLE}}</style>
+</head>
+<body>
+<main>
+  <div class="brand">{{BRAND}}</div>
+  <div id="signed-out" class="hidden">
+    <h1>Who am I?</h1>
+    <p>Sign in with your passkey to see the identity it belongs to.</p>
+    <div class="stack">
+      <button id="passkey" class="primary" type="button">Sign in with a passkey</button>
+    </div>
+    <p id="signup" class="note hidden">No account yet? <a href="/signup">Create one</a></p>
+  </div>
+  <div id="signed-in" class="hidden">
+    <h1>You're signed in</h1>
+    <p>Your identity<code id="did" class="block"></code></p>
+    <div class="stack">
+      <button id="copy" class="secondary" type="button">Copy identity</button>
+    </div>
+    <ul id="items" class="items mt"></ul>
+    <div class="stack">
+      <button id="add" class="primary" type="button">Add a device</button>
+      <button id="logout" class="secondary" type="button">Sign out</button>
+    </div>
+    <p class="note">To add a computer from its terminal, run <code>kith device join --hub <span id="hub"></span></code> there and open the link it prints.</p>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+const when = (t) => new Date(t * 1000).toLocaleString();
+const LEVEL = { 1: "level 1", 2: "level 2, multi-factor", 3: "level 3, hardware key" };
+
+function item(label, value) {
+  const li = document.createElement("li");
+  li.append(label);
+  const v = document.createElement("span");
+  v.className = "value";
+  v.textContent = value;
+  li.append(v);
+  $("items").append(li);
+}
+
+function device(d) {
+  const kind = d.kind === d.name ? "" : " (" + d.kind + ")";
+  return d.name + kind + ", " + (LEVEL[d.aal] || "level " + d.aal) + (d.current ? ", signed in here" : "");
+}
+
+if (D.signed_in) {
+  $("signed-in").classList.remove("hidden");
+  $("did").textContent = D.did;
+  try { localStorage.setItem("kith_did", D.did); } catch {}
+  const s = D.session;
+  item("This sign-in", (s.via ? "Through " + s.via : "With " + (D.devices.find((d) => d.current) || { name: "a device" }).name)
+    + ", assurance " + (LEVEL[s.aal] || "level " + s.aal) + ", at " + when(s.auth_time) + ". Ends " + when(s.expires) + ".");
+  item(D.devices.length === 1 ? "Device" : "Devices (" + D.devices.length + ")", D.devices.map(device).join("; ") || "none");
+  item("Created", when(D.created));
+  item("Email", D.email || "none");
+  if (D.linked.length) item("Linked sign-ins", D.linked.join(", "));
+  item("Work", D.work + " bits");
+  $("copy").onclick = async () => {
+    try { await navigator.clipboard.writeText(D.did); status("Copied.", "ok"); }
+    catch { status("Couldn't copy. Select the identity above instead.", "error"); }
+  };
+  $("logout").onclick = () => location.assign("/oauth/logout");
+  $("hub").textContent = location.origin;
+  // A phone (or any other browser) joins by scanning the QR code on the next page.
+  $("add").onclick = async () => {
+    $("add").disabled = true;
+    const r = await postJSON("/v1/join/invite", {});
+    $("add").disabled = false;
+    if (r.ok) return location.assign(`/join/${r.body.id}`);
+    status(r.body.error_description || "Couldn't start adding a device.", "error");
+  };
+} else {
+  $("signed-out").classList.remove("hidden");
+  if (D.signup) $("signup").classList.remove("hidden");
+  let challenge = { id: D.challenge_id, message: D.message };
+  if (!webauthnSupported()) {
+    $("passkey").disabled = true;
+    status("This browser doesn't support passkeys.", "error");
+  }
+  $("passkey").onclick = async () => {
+    $("passkey").disabled = true;
+    try {
+      const cred = await navigator.credentials.get({
+        publicKey: { challenge: await sha256(challenge.message), rpId: D.rp_id, userVerification: "preferred", allowCredentials: [] },
+      });
+      const r = cred.response;
+      if (!r.userHandle || r.userHandle.byteLength === 0) {
+        status("That passkey isn't linked to a {{BRAND}} identity.", "error");
+        return;
+      }
+      status("Checking…");
+      // The DID, or for an account made in the browser, a handle the hub maps to it.
+      const res = await postJSON("/whoami", {
+        challenge_id: challenge.id,
+        did: new TextDecoder().decode(r.userHandle),
+        factors: [{ type: "webauthn", authenticator_data: b64u(r.authenticatorData), client_data_json: b64u(r.clientDataJSON), signature: b64u(r.signature) }],
+      });
+      if (res.ok) {
+        status("Signed in.", "ok");
+        location.replace("/whoami");
+        return;
+      }
+      if (res.body.challenge_id) challenge = { id: res.body.challenge_id, message: res.body.message };
+      status(res.body.error_description || "Sign-in failed.", "error");
+    } catch (e) {
+      status(e.name === "NotAllowedError" ? "Passkey sign-in was cancelled." : "Passkey error: " + e.message, "error");
+    } finally {
+      $("passkey").disabled = false;
+    }
+  };
+}
+</script>
+</body>
+</html>

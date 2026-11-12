@@ -18,7 +18,11 @@
   `amr` claims.
 - **"Sign in with Kith" for existing apps.** The hub is a standard OpenID Connect
   provider: code flow with PKCE, username-less passkey login, SSO, step-up through
-  `acr_values`, and pairwise subjects.
+  `acr_values`, and pairwise subjects. With `--signup`, people can create an account in
+  the browser with a passkey, or by signing in with a provider first.
+- **Work as a score.** An account can show it cost compute: a nonce whose hash with the
+  DID has many leading zero bits. Tokens carry the count as `work`, which policies can
+  use (`principal.work >= 24`). `kith work` mines from a terminal.
 - **Aliases.** Public ones are proved in both directions and resolve through WebFinger,
   DNS or did:web back-links; the CLI pins them as local names. Private ones are
   unlinkable until you choose to prove the link.
@@ -77,6 +81,10 @@ kith init --hub https://hub.example          # root identity + this device + 2-o
 kith init --keystore file                    # or a plaintext identity.json (the default on Linux)
 kith keys list && kith keys migrate          # where each key lives; move a file-backed home into the keychain
 kith device add --name phone --kind passkey --out phone.json
+kith device join --hub https://hub.example   # join an identity made in the browser: approve this machine there
+                                             # (phones join by the QR code on the hub's account page)
+kith manage set 2 passkey mac phone --recovery-key kith-recovery-key.json   # who approves new devices
+kith device approve <link>                   # add this device's approval, when it is a manage signer
 kith login --aud api://invoices --totp 123456
 curl -H "authorization: Bearer $(kith token --aud api://invoices)" https://api.example/graphql …
 kith alias new gaming && kith alias prove gaming --aud https://shop.example
@@ -85,7 +93,12 @@ kith rotate --revoke-devices                 # recovery keys (or paper key + TOT
 kith hub serve --bundle bundle.json --clients clients.json   # run a hub (+ OIDC clients)
 kith hub serve --upstreams upstreams.json    # also accept "Sign in with Telegram"
 kith hub serve --registration-token "$TOKEN" # let apps register themselves (RFC 7591)
-kith hub serve --admin-token "$TOKEN"        # /v1/admin/…: sessions, consent, clients
+kith hub serve --signup                      # let anyone create an account at /signup (a passkey)
+                                             # /whoami: sign in with that passkey, see your identity
+kith work --bits 24                          # spend compute on your identity; the hub records the best proof
+kith hub serve --admin-token "$TOKEN"        # /v1/admin/…: identities, sessions, consent, clients, the bundle in force
+kith bundle check bundle.json                # before deploying: keys written twice, unknown members, missing sets
+kith bundle edit bundle.json --people people.json   # edit it in your browser, on this machine; save, commit, deploy
 kith alias link 'https://oauth.telegram.org#<your id>'   # let that Telegram account sign in as you
                                              # apps asking for scope linked_account get a signed attestation of it
 kith name add ada mailto:ada@acme.test       # follow her WebFinger (or DNS) back-link, check her KEL links it, pin it
@@ -183,9 +196,9 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 | Path | What |
 |------|------|
 | `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
-| `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
+| `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, bundle file checks, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
 | `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email and phone contacts, OpenID Connect provider with passkey login and enrollment pages, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
-| `crates/kith-cli` | `kith` binary |
+| `crates/kith-cli` | `kith` binary, including the local bundle editor (`kith bundle edit`) |
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |
 | `examples/` | Shared policy bundle, GraphQL schema and data used by every example and test |

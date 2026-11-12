@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in · Kith</title>
+<title>Sign in · {{BRAND}}</title>
 <style nonce="{{NONCE}}">{{STYLE}}</style>
 </head>
 <body>
 <main>
-  <div class="brand">Kith</div>
+  <div class="brand">{{BRAND}}</div>
   <h1>Sign in to <span id="client"></span></h1>
   <p>Use a passkey on this device or a security key.</p>
   <div class="stack">
@@ -22,9 +22,10 @@
     <button id="continue" class="primary hidden" type="button">Continue</button>
   </div>
   <div id="status" class="status" role="status" aria-live="polite"></div>
+  <p id="signup" class="hidden">No account yet? <a id="signup-link" href="/signup">Create one</a></p>
   <details id="more">
     <summary>Other ways to sign in</summary>
-    <label for="did">Your Kith identity (did:kith:…)</label>
+    <label for="did">Your {{BRAND}} identity (did:kith:…)</label>
     <input id="did" autocomplete="username" spellcheck="false">
     <div class="stack mt">
       <button id="wallet" class="secondary" type="button">Sign with an Ethereum wallet</button>
@@ -47,6 +48,11 @@ if (D.min_aal >= 3) {
 if (!webauthnSupported()) {
   $("passkey").disabled = true;
   status("This browser doesn't support passkeys. Use another way to sign in below.", "error");
+}
+if (D.signup) {
+  $("signup").classList.remove("hidden");
+  // Come back to this sign-in once the account exists.
+  $("signup-link").href = "/signup?return=" + encodeURIComponent(location.pathname + location.search);
 }
 $("show-otp").onclick = () => { $("otp-box").classList.remove("hidden"); $("otp").focus(); };
 
@@ -91,7 +97,8 @@ async function submit(did, factors, federatedToken) {
   status("Checking…");
   const r = await postJSON("/oauth/login", { request_id: D.request_id, challenge_id: challenge.id, did, factors, federated: federatedToken });
   if (r.ok) {
-    try { localStorage.setItem("kith_did", did); } catch {}
+    // A sign-up handle isn't an identity to type into the wallet box.
+    if (did.startsWith("did:kith:")) { try { localStorage.setItem("kith_did", did); } catch {} }
     status("Signed in. Returning to " + D.client_name + "…", "ok");
     location.assign(r.body.redirect);
     return;
@@ -116,9 +123,10 @@ $("passkey").onclick = async () => {
     });
     const r = cred.response;
     if (!r.userHandle || r.userHandle.byteLength === 0) {
-      status("That passkey isn't linked to a Kith identity. Enroll it with `kith passkey enroll`.", "error");
+      status("That passkey isn't linked to a {{BRAND}} identity. Create an account, or enroll it with `kith passkey enroll`.", "error");
       return;
     }
+    // The DID, or for an account made in the browser, a handle the hub maps to it.
     const did = new TextDecoder().decode(r.userHandle);
     await submit(did, [{
       type: "webauthn",
@@ -135,7 +143,7 @@ $("passkey").onclick = async () => {
 
 $("wallet").onclick = async () => {
   const did = $("did").value.trim();
-  if (!did.startsWith("did:kith:")) { status("Enter your Kith identity first.", "error"); $("did").focus(); return; }
+  if (!did.startsWith("did:kith:")) { status("Enter your {{BRAND}} identity first.", "error"); $("did").focus(); return; }
   if (!window.ethereum) { status("No Ethereum wallet found in this browser.", "error"); return; }
   busy(true);
   try {

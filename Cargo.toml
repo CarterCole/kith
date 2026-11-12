@@ -37,3 +37,8 @@ hickory-resolver = { version = "0.26", default-features = false, features = ["sy
 opt-level = 3
 [profile.dev.package.rsa]
 opt-level = 3
+# Recovery phrases take 600,000 rounds of HMAC-SHA-256.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3

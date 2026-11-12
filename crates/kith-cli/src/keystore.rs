@@ -138,11 +138,15 @@ pub mod enclave {
     use core_foundation::error::CFError;
     use core_foundation::string::CFString;
     use security_framework::access_control::{ProtectionMode, SecAccessControl};
-    use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType as SecKeyType, SecKey, Token};
-    use security_framework_sys::access_control::{kSecAccessControlPrivateKeyUsage, kSecAccessControlUserPresence};
+    use security_framework::key::{
+        Algorithm, GenerateKeyOptions, KeyType as SecKeyType, SecKey, Token,
+    };
+    use security_framework_sys::access_control::{
+        kSecAccessControlPrivateKeyUsage, kSecAccessControlUserPresence,
+    };
     use security_framework_sys::item::{
-        kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom, kSecAttrTokenID,
-        kSecAttrTokenIDSecureEnclave,
+        kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrKeyType,
+        kSecAttrKeyTypeECSECPrimeRandom, kSecAttrTokenID, kSecAttrTokenIDSecureEnclave,
     };
     use security_framework_sys::key::SecKeyCreateWithData;
 
@@ -166,12 +170,20 @@ pub mod enclave {
             if require_presence {
                 flags |= kSecAccessControlUserPresence;
             }
-            let acl = SecAccessControl::create_with_protection(Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly), flags)
-                .map_err(|e| anyhow!("secure enclave: access control: {e}"))?;
+            let acl = SecAccessControl::create_with_protection(
+                Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+                flags,
+            )
+            .map_err(|e| anyhow!("secure enclave: access control: {e}"))?;
             let mut opts = GenerateKeyOptions::default();
             // No location: the key is not a keychain item. We keep its blob ourselves.
-            opts.set_key_type(SecKeyType::ec_sec_prime_random()).set_size_in_bits(256).set_token(Token::SecureEnclave).set_access_control(acl).set_label("kith device key");
-            let key = SecKey::new(&opts).map_err(|e| anyhow!("secure enclave: {}", describe(&e)))?;
+            opts.set_key_type(SecKeyType::ec_sec_prime_random())
+                .set_size_in_bits(256)
+                .set_token(Token::SecureEnclave)
+                .set_access_control(acl)
+                .set_label("kith device key");
+            let key =
+                SecKey::new(&opts).map_err(|e| anyhow!("secure enclave: {}", describe(&e)))?;
             Self::wrap(key)
         }
 
@@ -184,28 +196,58 @@ pub mod enclave {
             let data = CFData::from_buffer(blob);
             let attrs = unsafe {
                 CFDictionary::from_CFType_pairs(&[
-                    (CFString::wrap_under_get_rule(kSecAttrKeyType), CFString::wrap_under_get_rule(kSecAttrKeyTypeECSECPrimeRandom).as_CFType()),
-                    (CFString::wrap_under_get_rule(kSecAttrKeyClass), CFString::wrap_under_get_rule(kSecAttrKeyClassPrivate).as_CFType()),
-                    (CFString::wrap_under_get_rule(kSecAttrTokenID), CFString::wrap_under_get_rule(kSecAttrTokenIDSecureEnclave).as_CFType()),
+                    (
+                        CFString::wrap_under_get_rule(kSecAttrKeyType),
+                        CFString::wrap_under_get_rule(kSecAttrKeyTypeECSECPrimeRandom).as_CFType(),
+                    ),
+                    (
+                        CFString::wrap_under_get_rule(kSecAttrKeyClass),
+                        CFString::wrap_under_get_rule(kSecAttrKeyClassPrivate).as_CFType(),
+                    ),
+                    (
+                        CFString::wrap_under_get_rule(kSecAttrTokenID),
+                        CFString::wrap_under_get_rule(kSecAttrTokenIDSecureEnclave).as_CFType(),
+                    ),
                     (CFString::from_static_string(TOKEN_OID), data.as_CFType()),
                 ])
             };
             let mut err: core_foundation::error::CFErrorRef = std::ptr::null_mut();
-            let raw = unsafe { SecKeyCreateWithData(data.as_concrete_TypeRef(), attrs.as_concrete_TypeRef(), &mut err) };
+            let raw = unsafe {
+                SecKeyCreateWithData(
+                    data.as_concrete_TypeRef(),
+                    attrs.as_concrete_TypeRef(),
+                    &mut err,
+                )
+            };
             if raw.is_null() {
-                let e = if err.is_null() { "unknown error".to_string() } else { describe(&unsafe { CFError::wrap_under_create_rule(err) }) };
+                let e = if err.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    describe(&unsafe { CFError::wrap_under_create_rule(err) })
+                };
                 bail!("secure enclave: cannot open the device key on this machine: {e}");
             }
             Self::wrap(unsafe { SecKey::wrap_under_create_rule(raw) })
         }
 
         fn wrap(key: SecKey) -> Result<Self> {
-            let pub_key = key.public_key().ok_or_else(|| anyhow!("secure enclave: key has no public half"))?;
-            let point = pub_key.external_representation().ok_or_else(|| anyhow!("secure enclave: cannot export the public key"))?;
+            let pub_key = key
+                .public_key()
+                .ok_or_else(|| anyhow!("secure enclave: key has no public half"))?;
+            let point = pub_key
+                .external_representation()
+                .ok_or_else(|| anyhow!("secure enclave: cannot export the public key"))?;
             // ANSI X9.63 uncompressed point `04 || X || Y`; Kith stores SEC1 compressed.
-            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(point.bytes()).map_err(|e| anyhow!("secure enclave: public key: {e}"))?;
-            let public = PublicKey { kty: KeyType::P256, bytes: vk.to_encoded_point(true).as_bytes().to_vec() };
-            Ok(EnclaveKey { key, id: public.to_did_key() })
+            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(point.bytes())
+                .map_err(|e| anyhow!("secure enclave: public key: {e}"))?;
+            let public = PublicKey {
+                kty: KeyType::P256,
+                bytes: vk.to_encoded_point(true).as_bytes().to_vec(),
+            };
+            Ok(EnclaveKey {
+                key,
+                id: public.to_did_key(),
+            })
         }
 
         /// The opaque blob that stands for this key. Useless on any other machine;
@@ -220,8 +262,12 @@ pub mod enclave {
 
         /// ECDSA P-256 over SHA-256(msg), as the raw 64-byte `r||s` Kith uses.
         pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
-            let der = self.key.create_signature(Algorithm::ECDSASignatureMessageX962SHA256, msg).map_err(|e| anyhow!("secure enclave: signing: {}", describe(&e)))?;
-            let sig = p256::ecdsa::Signature::from_der(&der).map_err(|e| anyhow!("secure enclave: signature encoding: {e}"))?;
+            let der = self
+                .key
+                .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, msg)
+                .map_err(|e| anyhow!("secure enclave: signing: {}", describe(&e)))?;
+            let sig = p256::ecdsa::Signature::from_der(&der)
+                .map_err(|e| anyhow!("secure enclave: signature encoding: {e}"))?;
             Ok(sig.to_bytes().to_vec())
         }
     }
@@ -251,7 +297,12 @@ pub mod enclave {
             assert_eq!(again.id, k.id);
             let raw = again.sign(b"kith identity event v1").unwrap();
             assert_eq!(raw.len(), 64);
-            let sig = Sig { signer: k.id.clone(), alg: "ES256".into(), sig: b64u(&raw), webauthn: None };
+            let sig = Sig {
+                signer: k.id.clone(),
+                alg: "ES256".into(),
+                sig: b64u(&raw),
+                webauthn: None,
+            };
             verify_sig(&sig, b"kith identity event v1", &VerifyOptions::default()).unwrap();
             assert!(verify_sig(&sig, b"tampered", &VerifyOptions::default()).is_err());
             // Another key's blob opens as that key, never as this one.

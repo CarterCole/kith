@@ -59,9 +59,13 @@ fn valid_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'));
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'));
     if !ok {
-        bail!("a name is 1-64 of a-z, 0-9, '-', '_' and '.', starting with a letter (got {name:?})");
+        bail!(
+            "a name is 1-64 of a-z, 0-9, '-', '_' and '.', starting with a letter (got {name:?})"
+        );
     }
     Ok(())
 }
@@ -75,13 +79,18 @@ fn load_book(home: &Home) -> Result<Map<String, Value>> {
     if !p.exists() {
         return Ok(Map::new());
     }
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).with_context(|| p.display().to_string())?)?;
+    let v: Value = serde_json::from_str(
+        &std::fs::read_to_string(&p).with_context(|| p.display().to_string())?,
+    )?;
     Ok(v["names"].as_object().cloned().unwrap_or_default())
 }
 
 fn save_book(home: &Home, names: Map<String, Value>) -> Result<()> {
     std::fs::create_dir_all(&home.dir)?;
-    std::fs::write(book_path(home), serde_json::to_vec_pretty(&json!({"v": 1, "names": names}))?)?;
+    std::fs::write(
+        book_path(home),
+        serde_json::to_vec_pretty(&json!({"v": 1, "names": names}))?,
+    )?;
     Ok(())
 }
 
@@ -128,21 +137,36 @@ pub fn resolve(home: &Home, alias: &str) -> Result<Resolved> {
             continue;
         };
         match fetch_state(&hub, &c.did) {
-            Ok(st) if resolve::links_back(&st, alias) => passed.push(Candidate { hub: Some(hub), ..c }),
-            Ok(_) => notes.push(format!("{} (via {}) does not link {alias} back", c.did, c.via)),
+            Ok(st) if resolve::links_back(&st, alias) => passed.push(Candidate {
+                hub: Some(hub),
+                ..c
+            }),
+            Ok(_) => notes.push(format!(
+                "{} (via {}) does not link {alias} back",
+                c.did, c.via
+            )),
             Err(e) => notes.push(format!("{} (via {}): {e:#}", c.did, c.via)),
         }
     }
     match resolve::unique(alias, passed)? {
-        Some(c) => Ok(Resolved { alias: alias.to_string(), did: c.did, via: c.via, hub: c.hub }),
+        Some(c) => Ok(Resolved {
+            alias: alias.to_string(),
+            did: c.did,
+            via: c.via,
+            hub: c.hub,
+        }),
         None => bail!("{alias} does not resolve: {}", notes.join("; ")),
     }
 }
 
 fn fetch(l: &Lookup) -> Result<Vec<Candidate>> {
     Ok(match l {
-        Lookup::WebFinger { url } => resolve::from_jrd(&get_json(url, "application/jrd+json, application/json")?),
-        Lookup::DidWeb { url } => resolve::from_did_document(&get_json(url, "application/did+json, application/json")?),
+        Lookup::WebFinger { url } => {
+            resolve::from_jrd(&get_json(url, "application/jrd+json, application/json")?)
+        }
+        Lookup::DidWeb { url } => {
+            resolve::from_did_document(&get_json(url, "application/did+json, application/json")?)
+        }
         Lookup::Dns { name } => resolve::from_txt(&txt(name)?),
     })
 }
@@ -160,7 +184,9 @@ fn get_json(url: &str, accept: &str) -> Result<Value> {
 /// are concatenated, as RFC 7208 reads them.
 fn txt(name: &str) -> Result<Vec<String>> {
     use hickory_resolver::Resolver;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async {
         let resolver = Resolver::builder_tokio()?.build()?;
         let lookup = match resolver.txt_lookup(format!("{name}.")).await {
@@ -172,7 +198,12 @@ fn txt(name: &str) -> Result<Vec<String>> {
             .answers()
             .iter()
             .filter_map(|r| match &r.data {
-                hickory_resolver::proto::rr::RData::TXT(t) => Some(t.txt_data.iter().map(|s| String::from_utf8_lossy(s)).collect::<String>()),
+                hickory_resolver::proto::rr::RData::TXT(t) => Some(
+                    t.txt_data
+                        .iter()
+                        .map(|s| String::from_utf8_lossy(s))
+                        .collect::<String>(),
+                ),
                 _ => None,
             })
             .collect())
@@ -228,9 +259,16 @@ pub fn run(home: &Home, cmd: NameCmd) -> Result<()> {
             if let Some(old) = names.get(&name) {
                 if old["did"] != entry["did"] {
                     if !replace {
-                        bail!("{name} is already {}; pass --replace to move it", old["did"].as_str().unwrap_or("?"));
+                        bail!(
+                            "{name} is already {}; pass --replace to move it",
+                            old["did"].as_str().unwrap_or("?")
+                        );
                     }
-                    eprintln!("warning: {name} moves from {} to {}", old["did"].as_str().unwrap_or("?"), entry["did"].as_str().unwrap_or("?"));
+                    eprintln!(
+                        "warning: {name} moves from {} to {}",
+                        old["did"].as_str().unwrap_or("?"),
+                        entry["did"].as_str().unwrap_or("?")
+                    );
                 } else if let Some(added) = old.get("added") {
                     entry["added"] = added.clone();
                 }
@@ -285,7 +323,9 @@ pub fn run(home: &Home, cmd: NameCmd) -> Result<()> {
         }
         NameCmd::Rm { name } => {
             let mut names = load_book(home)?;
-            names.remove(&name).ok_or_else(|| anyhow!("no name {name:?}"))?;
+            names
+                .remove(&name)
+                .ok_or_else(|| anyhow!("no name {name:?}"))?;
             save_book(home, names)?;
             eprintln!("forgot {name}");
         }

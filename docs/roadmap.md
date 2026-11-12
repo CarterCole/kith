@@ -71,6 +71,21 @@
   - ID tokens encrypted to the client (`RSA-OAEP-256`, `ECDH-ES`; checked against `jose`).
   - Browser passkey enrollment brokered by the hub (`kith passkey enroll`), on this
     computer or, with `--qr`, on a phone that scans the link from the terminal.
+  - Browser sign-up with `--signup`: a passkey and a downloaded recovery key make an
+    identity the hub holds no key for ([spec §7.11](../spec/07-oidc.md)). Verified in
+    headless Chrome (`scripts/signup-demo.sh`). The recovery key can be generated,
+    derived from the visitor's own secret words, or any public `did:key` they bring.
+  - Sign-up through a provider: a provider account no identity links gets a ticket,
+    makes a passkey and a recovery key, and is linked to the new identity and signed in
+    ([spec §7.11](../spec/07-oidc.md)). Verified in headless Chrome against a mock
+    OpenID Connect provider, not yet against Google or any real one.
+  - Joining devices ([spec §7.13](../spec/07-oidc.md)): `kith device join` from a
+    terminal, or a phone by the QR code on the account page; manage signers approve
+    in the browser or with `kith device approve` until the manage policy is met, and
+    `kith manage set` uses the recovery key (file or words) to change that policy.
+    Verified in headless Chrome with the real CLI (`scripts/join-demo.sh`).
+  - Proof of work as an account score: `POST /v1/work`, the `work` token attribute,
+    mining in the sign-up page and `kith work` ([spec §7.12](../spec/07-oidc.md)).
   - Upstream OIDC providers as a login factor, starting with Telegram Login
     ([spec §7.8](../spec/07-oidc.md)). Tested against a stand-in provider, not yet
     against Telegram itself.
@@ -100,7 +115,17 @@
     `--behind-proxy` for the address a reverse proxy appends.
   - An admin API (admin token, or any identity in the `hub-admin` role): list and end
     sessions, sign an identity out everywhere, list and delete registered clients,
-    list and withdraw consent.
+    list and withdraw consent, list identities with their standing groups and roles,
+    and see which bundle file is in force.
+  - A bundle file that fails to load leaves the last good one in force, and the stats
+    say why; at startup it still stops the hub ([spec §7.9](../spec/07-oidc.md)).
+- **Bundle files** ([spec §4.1.1](../spec/04-authorization.md)). `kith bundle check`
+  refuses what a loader would quietly misread: keys written twice, unknown members,
+  references to sets that don't exist, policies and rules that don't parse. `kith bundle
+  edit` edits a file in the browser on the operator's machine (organizations, site
+  roles, groups, people, raw JSON), shows each person's groups and roles as the draft
+  stands, and saves only a file that passes the check, by renaming it into place. Rust
+  only: the JS and Python packages load bundles but have no checker.
 
 - **Hardening pass, October 2026** (an audit of all three implementations; each item
   has a test that failed first).
@@ -187,13 +212,30 @@
     a keychain access group would avoid that.
 - **Hub operations.** The hub speaks plain HTTP (terminate TLS in front of it). There
   is no audit log, and the admin API only lists and deletes: no editing of clients,
-  no RFC 7592. Login challenges and passkey enrollments in progress are still in
-  memory (the page retries after a restart). The bundle is a hot-reloaded file, and
-  there is no rate limit on anything but login, registration and TOTP.
-- **Device linking.** The CLI that holds the manage key starts every passkey
-  enrollment; `--qr` only carries its link to a phone. Linking started from the new
-  device (it shows a QR code, an existing device approves) needs a way for something
-  other than the CLI to reach the manage key ([spec §7.11](../spec/07-oidc.md)).
+  no RFC 7592. It cannot add a client, and an app cannot ask to be admitted and wait
+  for the operator's answer; a registration always gets a random `client_id`
+  ([spec §7.2.1](../spec/07-oidc.md), draft: a request queue to approve or deny, and
+  `POST /v1/admin/clients` under a chosen id). Login challenges, passkey enrollments and join requests in progress
+  are still in memory (the page retries after a restart). The bundle is a hot-reloaded
+  file, and there is no rate limit on anything but login, registration and TOTP.
+- **Bundle files.** A removal in a file that fails to load does not take effect until a
+  good file replaces it (the stats report it; a revocation acts at once). The editor
+  cannot rename a set, and its `Apply` from raw JSON refuses keys written twice rather
+  than showing them. The §9 schemas are not checked.
+- **Browser accounts.** An identity made at `/signup` starts with one passkey as its
+  manage key. Devices join through §7.13, and the recovery key can change the manage
+  policy only from a device that has joined: there is no recovery from a browser, or
+  from a machine that isn't yet a device. Join requests live in memory and end with a
+  hub restart, and the account page can't remove a device. It has no name or email
+  attribute. Sign-up is open to anyone who reaches the
+  hub and is only rate limited per address ([spec §7.11](../spec/07-oidc.md)).
+- **Provider sign-up.** Links made at sign-up live in the hub's store, not the identity's
+  log, and can't be removed or added to from a session. Attributes (name, email) are
+  not kept after the session that brought them. GitHub and Facebook aren't OpenID
+  Connect and need adapters; Apple needs a generated client secret.
+- **Work.** `work` is a cost score, not proof of a person, and GPUs buy it cheaply.
+  There is no JS or Python helper for mining or checking yet, and no per-hub
+  difficulty policy, such as requiring N bits to sign up.
 - **Audiences.** The hub mints tokens for any `audience`. It needs a registry of
   resource servers and per-audience claim release (privacy, and smaller tokens).
 - **Signers still to do:**

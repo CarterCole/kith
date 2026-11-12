@@ -66,7 +66,10 @@ impl PublicKey {
             .map_err(|e| Error::Encoding(format!("did:key base58: {e}")))?;
         for kty in [KeyType::Ed25519, KeyType::P256, KeyType::Secp256k1] {
             if let Some(bytes) = raw.strip_prefix(kty.multicodec()) {
-                let pk = PublicKey { kty, bytes: bytes.to_vec() };
+                let pk = PublicKey {
+                    kty,
+                    bytes: bytes.to_vec(),
+                };
                 pk.validate()?;
                 return Ok(pk);
             }
@@ -77,14 +80,21 @@ impl PublicKey {
     pub(crate) fn validate(&self) -> Result<()> {
         match self.kty {
             KeyType::Ed25519 => {
-                let arr: [u8; 32] = self.bytes.as_slice().try_into().map_err(|_| Error::Encoding("ed25519 key length".into()))?;
-                ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(|e| Error::Encoding(e.to_string()))?;
+                let arr: [u8; 32] = self
+                    .bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Encoding("ed25519 key length".into()))?;
+                ed25519_dalek::VerifyingKey::from_bytes(&arr)
+                    .map_err(|e| Error::Encoding(e.to_string()))?;
             }
             KeyType::P256 => {
-                p256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes).map_err(|e| Error::Encoding(e.to_string()))?;
+                p256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes)
+                    .map_err(|e| Error::Encoding(e.to_string()))?;
             }
             KeyType::Secp256k1 => {
-                k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes).map_err(|e| Error::Encoding(e.to_string()))?;
+                k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes)
+                    .map_err(|e| Error::Encoding(e.to_string()))?;
             }
         }
         Ok(())
@@ -94,21 +104,27 @@ impl PublicKey {
     /// `AuthenticatorAttestationResponse.getPublicKey()` returns for a passkey).
     pub fn p256_from_spki_der(der: &[u8]) -> Result<Self> {
         use p256::pkcs8::DecodePublicKey;
-        let vk = p256::PublicKey::from_public_key_der(der).map_err(|e| Error::Encoding(format!("spki: {e}")))?;
+        let vk = p256::PublicKey::from_public_key_der(der)
+            .map_err(|e| Error::Encoding(format!("spki: {e}")))?;
         let point = p256::EncodedPoint::from(vk).compress();
-        Ok(PublicKey { kty: KeyType::P256, bytes: point.as_bytes().to_vec() })
+        Ok(PublicKey {
+            kty: KeyType::P256,
+            bytes: point.as_bytes().to_vec(),
+        })
     }
 
     pub fn to_jwk(&self) -> Value {
         match self.kty {
             KeyType::Ed25519 => json!({"kty": "OKP", "crv": "Ed25519", "x": b64u(&self.bytes)}),
             KeyType::P256 => {
-                let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes).expect("validated");
+                let vk =
+                    p256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes).expect("validated");
                 let p = vk.to_encoded_point(false);
                 json!({"kty": "EC", "crv": "P-256", "x": b64u(p.x().unwrap()), "y": b64u(p.y().unwrap())})
             }
             KeyType::Secp256k1 => {
-                let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes).expect("validated");
+                let vk =
+                    k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes).expect("validated");
                 let p = vk.to_encoded_point(false);
                 json!({"kty": "EC", "crv": "secp256k1", "x": b64u(p.x().unwrap()), "y": b64u(p.y().unwrap())})
             }
@@ -117,21 +133,36 @@ impl PublicKey {
 
     pub fn from_jwk(jwk: &Value) -> Result<Self> {
         let s = |k: &str| -> Result<Vec<u8>> {
-            b64u_decode(jwk.get(k).and_then(Value::as_str).ok_or_else(|| Error::Encoding(format!("jwk missing {k}")))?)
+            b64u_decode(
+                jwk.get(k)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::Encoding(format!("jwk missing {k}")))?,
+            )
         };
         let crv = jwk.get("crv").and_then(Value::as_str).unwrap_or_default();
         let pk = match crv {
-            "Ed25519" => PublicKey { kty: KeyType::Ed25519, bytes: s("x")? },
+            "Ed25519" => PublicKey {
+                kty: KeyType::Ed25519,
+                bytes: s("x")?,
+            },
             "P-256" | "secp256k1" => {
                 let mut sec1 = vec![0x04];
                 sec1.extend(s("x")?);
                 sec1.extend(s("y")?);
                 if crv == "P-256" {
-                    let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).map_err(|e| Error::Encoding(e.to_string()))?;
-                    PublicKey { kty: KeyType::P256, bytes: vk.to_encoded_point(true).as_bytes().to_vec() }
+                    let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1)
+                        .map_err(|e| Error::Encoding(e.to_string()))?;
+                    PublicKey {
+                        kty: KeyType::P256,
+                        bytes: vk.to_encoded_point(true).as_bytes().to_vec(),
+                    }
                 } else {
-                    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).map_err(|e| Error::Encoding(e.to_string()))?;
-                    PublicKey { kty: KeyType::Secp256k1, bytes: vk.to_encoded_point(true).as_bytes().to_vec() }
+                    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1)
+                        .map_err(|e| Error::Encoding(e.to_string()))?;
+                    PublicKey {
+                        kty: KeyType::Secp256k1,
+                        bytes: vk.to_encoded_point(true).as_bytes().to_vec(),
+                    }
                 }
             }
             other => return Err(Error::Unsupported(format!("jwk crv {other}"))),
@@ -147,9 +178,13 @@ impl PublicKey {
             KeyType::Ed25519 => &["crv", "kty", "x"],
             _ => &["crv", "kty", "x", "y"],
         };
-        let obj: serde_json::Map<String, Value> =
-            members.iter().map(|m| (m.to_string(), jwk[*m].clone())).collect();
-        b64u(sha256(crate::canon::to_canonical(&Value::Object(obj)).expect("jwk is canonicalizable")))
+        let obj: serde_json::Map<String, Value> = members
+            .iter()
+            .map(|m| (m.to_string(), jwk[*m].clone()))
+            .collect();
+        b64u(sha256(
+            crate::canon::to_canonical(&Value::Object(obj)).expect("jwk is canonicalizable"),
+        ))
     }
 
     /// Verify a raw signature. EC signatures may be fixed-size `r||s` or DER.
@@ -157,14 +192,21 @@ impl PublicKey {
         let bad = |e: String| Error::Signature(e);
         match self.kty {
             KeyType::Ed25519 => {
-                let vk = ed25519_dalek::VerifyingKey::from_bytes(self.bytes.as_slice().try_into().map_err(|_| bad("len".into()))?)
-                    .map_err(|e| bad(e.to_string()))?;
-                let sig = ed25519_dalek::Signature::from_slice(sig).map_err(|e| bad(e.to_string()))?;
+                let vk = ed25519_dalek::VerifyingKey::from_bytes(
+                    self.bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| bad("len".into()))?,
+                )
+                .map_err(|e| bad(e.to_string()))?;
+                let sig =
+                    ed25519_dalek::Signature::from_slice(sig).map_err(|e| bad(e.to_string()))?;
                 vk.verify_strict(msg, &sig).map_err(|e| bad(e.to_string()))
             }
             KeyType::P256 => {
                 use p256::ecdsa::signature::Verifier;
-                let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes).map_err(|e| bad(e.to_string()))?;
+                let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes)
+                    .map_err(|e| bad(e.to_string()))?;
                 let sig = p256::ecdsa::Signature::from_slice(sig)
                     .or_else(|_| p256::ecdsa::Signature::from_der(sig))
                     .map_err(|e| bad(e.to_string()))?;
@@ -172,7 +214,8 @@ impl PublicKey {
             }
             KeyType::Secp256k1 => {
                 use k256::ecdsa::signature::Verifier;
-                let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes).map_err(|e| bad(e.to_string()))?;
+                let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.bytes)
+                    .map_err(|e| bad(e.to_string()))?;
                 let sig = k256::ecdsa::Signature::from_slice(sig)
                     .or_else(|_| k256::ecdsa::Signature::from_der(sig))
                     .map_err(|e| bad(e.to_string()))?;
@@ -222,16 +265,21 @@ impl SecretKey {
             KeyType::Ed25519 => SecretKey::Ed25519(ed25519_dalek::SigningKey::from_bytes(
                 bytes.try_into().map_err(|_| err("length".into()))?,
             )),
-            KeyType::P256 => SecretKey::P256(p256::ecdsa::SigningKey::from_slice(bytes).map_err(|e| err(e.to_string()))?),
-            KeyType::Secp256k1 => {
-                SecretKey::Secp256k1(k256::ecdsa::SigningKey::from_slice(bytes).map_err(|e| err(e.to_string()))?)
-            }
+            KeyType::P256 => SecretKey::P256(
+                p256::ecdsa::SigningKey::from_slice(bytes).map_err(|e| err(e.to_string()))?,
+            ),
+            KeyType::Secp256k1 => SecretKey::Secp256k1(
+                k256::ecdsa::SigningKey::from_slice(bytes).map_err(|e| err(e.to_string()))?,
+            ),
         })
     }
 
     pub fn public(&self) -> PublicKey {
         match self {
-            SecretKey::Ed25519(k) => PublicKey { kty: KeyType::Ed25519, bytes: k.verifying_key().to_bytes().to_vec() },
+            SecretKey::Ed25519(k) => PublicKey {
+                kty: KeyType::Ed25519,
+                bytes: k.verifying_key().to_bytes().to_vec(),
+            },
             SecretKey::P256(k) => PublicKey {
                 kty: KeyType::P256,
                 bytes: k.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
@@ -262,10 +310,14 @@ impl SecretKey {
     /// EIP-191 `personal_sign`, returning the 65-byte `r||s||v` signature.
     pub fn sign_eip191(&self, msg: &[u8]) -> Result<Vec<u8>> {
         let SecretKey::Secp256k1(k) = self else {
-            return Err(Error::Unsupported("EIP-191 requires a secp256k1 key".into()));
+            return Err(Error::Unsupported(
+                "EIP-191 requires a secp256k1 key".into(),
+            ));
         };
         let hash = eip191_hash(msg);
-        let (sig, recid) = k.sign_prehash_recoverable(&hash).map_err(|e| Error::Signature(e.to_string()))?;
+        let (sig, recid) = k
+            .sign_prehash_recoverable(&hash)
+            .map_err(|e| Error::Signature(e.to_string()))?;
         let mut out = sig.to_bytes().to_vec();
         out.push(27 + recid.to_byte());
         Ok(out)
@@ -284,7 +336,8 @@ pub fn eth_address(pk: &PublicKey) -> Result<String> {
     if pk.kty != KeyType::Secp256k1 {
         return Err(Error::Unsupported("eth address requires secp256k1".into()));
     }
-    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk.bytes).map_err(|e| Error::Encoding(e.to_string()))?;
+    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk.bytes)
+        .map_err(|e| Error::Encoding(e.to_string()))?;
     let uncompressed = vk.to_encoded_point(false);
     let hash = Keccak256::digest(&uncompressed.as_bytes()[1..]);
     Ok(format!("0x{}", hex(&hash[12..])))
@@ -310,9 +363,15 @@ impl SignerRef {
         let parts: Vec<&str> = id.splitn(3, ':').collect();
         match parts.as_slice() {
             ["eip155", chain, addr] if addr.len() == 42 && addr.starts_with("0x") => {
-                Ok(SignerRef::Eip155 { chain_id: chain.to_string(), address: addr.to_ascii_lowercase() })
+                Ok(SignerRef::Eip155 {
+                    chain_id: chain.to_string(),
+                    address: addr.to_ascii_lowercase(),
+                })
             }
-            ["bip122", chain, addr] => Ok(SignerRef::Bip122 { chain: chain.to_string(), address: addr.to_string() }),
+            ["bip122", chain, addr] => Ok(SignerRef::Bip122 {
+                chain: chain.to_string(),
+                address: addr.to_string(),
+            }),
             _ => Err(Error::Unsupported(format!("signer id {id}"))),
         }
     }
@@ -334,7 +393,13 @@ pub struct Sig {
 /// calling `isValidSignature(hash, sig)` on chain. Implementations should pin the
 /// block they checked against, since contract signers can change over time.
 pub trait ChainVerifier: Send + Sync {
-    fn is_valid_signature(&self, chain_id: &str, contract: &str, hash: [u8; 32], sig: &[u8]) -> Result<bool>;
+    fn is_valid_signature(
+        &self,
+        chain_id: &str,
+        contract: &str,
+        hash: [u8; 32],
+        sig: &[u8],
+    ) -> Result<bool>;
 }
 
 #[derive(Default, Clone, Copy)]
@@ -347,8 +412,12 @@ pub fn verify_sig(sig: &Sig, message: &[u8], opts: &VerifyOptions) -> Result<()>
     let raw = b64u_decode(&sig.sig)?;
     match (SignerRef::parse(&sig.signer)?, sig.alg.as_str()) {
         (SignerRef::Key(pk), "WebAuthn") => {
-            let data = sig.webauthn.as_ref().ok_or_else(|| Error::Signature("WebAuthn sig missing data".into()))?;
-            webauthn::verify_assertion(&pk, data, &raw, &AssertionCheck::for_message(message)).map(|_| ())
+            let data = sig
+                .webauthn
+                .as_ref()
+                .ok_or_else(|| Error::Signature("WebAuthn sig missing data".into()))?;
+            webauthn::verify_assertion(&pk, data, &raw, &AssertionCheck::for_message(message))
+                .map(|_| ())
         }
         (SignerRef::Key(pk), "SSHSIG") => crate::sshsig::verify(&pk, message, &raw),
         (SignerRef::Key(pk), alg) if alg == key_sig_alg(pk.kty) => pk.verify(message, &raw),
@@ -359,19 +428,28 @@ pub fn verify_sig(sig: &Sig, message: &[u8], opts: &VerifyOptions) -> Result<()>
                 if recovered == address {
                     return Ok(());
                 }
-                return Err(Error::Signature(format!("EIP-191 signer mismatch: {recovered} != {address}")));
+                return Err(Error::Signature(format!(
+                    "EIP-191 signer mismatch: {recovered} != {address}"
+                )));
             }
-            let chain = opts
-                .chain
-                .ok_or_else(|| Error::Unsupported("EIP-1271 verification needs a ChainVerifier (RPC)".into()))?;
+            let chain = opts.chain.ok_or_else(|| {
+                Error::Unsupported("EIP-1271 verification needs a ChainVerifier (RPC)".into())
+            })?;
             if chain.is_valid_signature(&chain_id, &address, hash, &raw)? {
                 Ok(())
             } else {
-                Err(Error::Signature("EIP-1271 isValidSignature returned false".into()))
+                Err(Error::Signature(
+                    "EIP-1271 isValidSignature returned false".into(),
+                ))
             }
         }
-        (SignerRef::Bip122 { .. }, "BIP322") => Err(Error::Unsupported("BIP-322 verification not implemented yet".into())),
-        (_, alg) => Err(Error::Signature(format!("alg {alg} does not match signer {}", sig.signer))),
+        (SignerRef::Bip122 { .. }, "BIP322") => Err(Error::Unsupported(
+            "BIP-322 verification not implemented yet".into(),
+        )),
+        (_, alg) => Err(Error::Signature(format!(
+            "alg {alg} does not match signer {}",
+            sig.signer
+        ))),
     }
 }
 
@@ -385,14 +463,21 @@ pub fn key_sig_alg(kty: KeyType) -> &'static str {
 
 fn recover_eip191(hash: &[u8; 32], sig: &[u8]) -> Result<String> {
     if sig.len() != 65 {
-        return Err(Error::Signature("EIP-191 signature must be 65 bytes".into()));
+        return Err(Error::Signature(
+            "EIP-191 signature must be 65 bytes".into(),
+        ));
     }
     let v = sig[64];
     let recid = k256::ecdsa::RecoveryId::from_byte(if v >= 27 { v - 27 } else { v })
         .ok_or_else(|| Error::Signature("bad recovery id".into()))?;
-    let s = k256::ecdsa::Signature::from_slice(&sig[..64]).map_err(|e| Error::Signature(e.to_string()))?;
-    let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(hash, &s, recid).map_err(|e| Error::Signature(e.to_string()))?;
-    let pk = PublicKey { kty: KeyType::Secp256k1, bytes: vk.to_encoded_point(true).as_bytes().to_vec() };
+    let s = k256::ecdsa::Signature::from_slice(&sig[..64])
+        .map_err(|e| Error::Signature(e.to_string()))?;
+    let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(hash, &s, recid)
+        .map_err(|e| Error::Signature(e.to_string()))?;
+    let pk = PublicKey {
+        kty: KeyType::Secp256k1,
+        bytes: vk.to_encoded_point(true).as_bytes().to_vec(),
+    };
     eth_address(&pk)
 }
 
@@ -417,14 +502,22 @@ pub struct LocalSigner {
 impl LocalSigner {
     pub fn generate(kty: KeyType) -> Self {
         let secret = SecretKey::generate(kty);
-        LocalSigner { id: secret.public().to_did_key(), scheme: Scheme::Raw, secret }
+        LocalSigner {
+            id: secret.public().to_did_key(),
+            scheme: Scheme::Raw,
+            secret,
+        }
     }
 
     /// A simulated Ethereum EOA wallet (secp256k1 + EIP-191) on `chain_id`.
     pub fn generate_eth_wallet(chain_id: u64) -> Self {
         let secret = SecretKey::generate(KeyType::Secp256k1);
         let addr = eth_address(&secret.public()).expect("secp256k1");
-        LocalSigner { id: format!("eip155:{chain_id}:{addr}"), scheme: Scheme::Eip191, secret }
+        LocalSigner {
+            id: format!("eip155:{chain_id}:{addr}"),
+            scheme: Scheme::Eip191,
+            secret,
+        }
     }
 
     pub fn from_secret(secret: SecretKey, scheme: Scheme, id: Option<String>) -> Result<Self> {
@@ -438,10 +531,18 @@ impl LocalSigner {
 
     pub fn sign(&self, message: &[u8]) -> Result<Sig> {
         let (alg, raw) = match self.scheme {
-            Scheme::Raw => (key_sig_alg(self.secret.kty()).to_string(), self.secret.sign(message)),
+            Scheme::Raw => (
+                key_sig_alg(self.secret.kty()).to_string(),
+                self.secret.sign(message),
+            ),
             Scheme::Eip191 => ("EIP191".to_string(), self.secret.sign_eip191(message)?),
         };
-        Ok(Sig { signer: self.id.clone(), alg, sig: b64u(raw), webauthn: None })
+        Ok(Sig {
+            signer: self.id.clone(),
+            alg,
+            sig: b64u(raw),
+            webauthn: None,
+        })
     }
 
     /// Serialized form for a local keystore. **Plaintext** – production keys belong in
@@ -453,7 +554,8 @@ impl LocalSigner {
     pub fn from_json(v: &Value) -> Result<Self> {
         let kty: KeyType = serde_json::from_value(v["kty"].clone())?;
         let scheme: Scheme = serde_json::from_value(v["scheme"].clone())?;
-        let secret = SecretKey::from_bytes(kty, &b64u_decode(v["secret"].as_str().unwrap_or_default())?)?;
+        let secret =
+            SecretKey::from_bytes(kty, &b64u_decode(v["secret"].as_str().unwrap_or_default())?)?;
         Self::from_secret(secret, scheme, v["id"].as_str().map(String::from))
     }
 }
@@ -499,7 +601,10 @@ mod tests {
         let mut sk = [0u8; 32];
         sk[31] = 1;
         let key = SecretKey::from_bytes(KeyType::Secp256k1, &sk).unwrap();
-        assert_eq!(eth_address(&key.public()).unwrap(), "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf");
+        assert_eq!(
+            eth_address(&key.public()).unwrap(),
+            "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
     }
 
     #[test]
@@ -507,6 +612,9 @@ mod tests {
         let w = LocalSigner::generate_eth_wallet(1);
         let mut sig = w.sign(b"x").unwrap();
         sig.alg = "EIP1271".into();
-        assert!(matches!(verify_sig(&sig, b"x", &VerifyOptions::default()), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            verify_sig(&sig, b"x", &VerifyOptions::default()),
+            Err(Error::Unsupported(_))
+        ));
     }
 }

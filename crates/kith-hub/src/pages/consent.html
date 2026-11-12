@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Share with this app? · Kith</title>
+<title>Share with this app? · {{BRAND}}</title>
 <style nonce="{{NONCE}}">{{STYLE}}</style>
 </head>
 <body>
 <main>
-  <div class="brand">Kith</div>
+  <div class="brand">{{BRAND}}</div>
   <h1><span id="client"></span> wants to know who you are</h1>
   <p>If you allow it, <span id="host"></span> will receive:</p>
   <ul id="items" class="items"></ul>
@@ -16,7 +16,7 @@
     <button id="deny" class="secondary" type="button">Deny</button>
   </div>
   <div id="status" class="status" role="status" aria-live="polite"></div>
-  <p class="note">Signed in as <code id="did"></code>. Kith remembers this choice for this app.</p>
+  <p class="note">Signed in as <code id="did"></code>. {{BRAND}} remembers this choice for this app.</p>
 </main>
 <script id="kith-data" type="application/json">{{DATA}}</script>
 <script nonce="{{NONCE}}">
@@ -39,7 +39,7 @@ function item(label, value) {
 const C = D.claims || {};
 const list = (v) => (Array.isArray(v) && v.length ? v.join(", ") : "none");
 const KNOWN = {
-  openid: () => (D.pairwise ? item("An identifier made only for this app") : item("Your Kith identity", D.did)),
+  openid: () => (D.pairwise ? item("An identifier made only for this app") : item("Your {{BRAND}} identity", D.did)),
   profile: () => item("Your name", C.name || C.preferred_username || "not set"),
   email: () => item("Your email address", C.email || "not set"),
   phone: () => item("Your phone number", C.phone_number || "not set"),
