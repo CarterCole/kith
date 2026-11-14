@@ -1,3 +1,5 @@
+![KITH](.github/banner.png)
+
 # Kith: universal identity and authorization
 
 > Working name. A spec, a protocol, and implementations: Rust core, hub and CLI; JS/TS
