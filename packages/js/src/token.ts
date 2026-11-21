@@ -15,6 +15,8 @@ export interface AccessClaims {
   pol?: { root: string; rev: number };
   groups: string[];
   roles: string[];
+  /** The role this session assumed (spec §4.3.1). It is one of `roles`. */
+  assumed?: string;
   attrs: Record<string, unknown>;
   aal: number;
   amr: string[];
@@ -110,6 +112,12 @@ export function createVerifier(opts: VerifierOptions) {
           throw new Error('"pol" must be {root, rev}');
         }
       }
+      if (payload.assumed !== undefined) {
+        const roles = payload.roles;
+        if (typeof payload.assumed !== "string" || !payload.assumed || !Array.isArray(roles) || !roles.includes(payload.assumed)) {
+          throw new Error('"assumed" must be one of "roles"');
+        }
+      }
       const c = payload as unknown as Partial<AccessClaims>;
       const claims = { ...c, groups: c.groups ?? [], roles: c.roles ?? [], attrs: c.attrs ?? {}, amr: c.amr ?? [] } as AccessClaims;
       return opts.org === undefined ? claims : forOrg(claims, opts.org);
@@ -124,7 +132,9 @@ export function createVerifier(opts: VerifierOptions) {
  * `groups` and `roles` survive only if the token says `org` produced them.
  */
 export function forOrg(c: AccessClaims, org: string): AccessClaims {
-  return c.org === org ? c : { ...c, groups: [], roles: [] };
+  if (c.org === org) return c;
+  const { assumed: _, ...rest } = c;
+  return { ...rest, groups: [], roles: [] };
 }
 
 /**
@@ -175,5 +185,6 @@ export function principalFromClaims(c: AccessClaims): Principal {
     roles: c.roles,
     actor: c.act?.sub,
     caps: c.cap,
+    assumed: c.assumed,
   };
 }

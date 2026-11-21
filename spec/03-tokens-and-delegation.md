@@ -84,6 +84,7 @@ has each hop include its parent and narrow its `cap`.
 | `actor_token` | — | the delegate's session token |
 | `audience` | resource server id, e.g. `api://invoices` | same |
 | `totp` (Kith extension) | optional step-up code | — |
+| `role` (Kith extension) | optional role to assume (§4.3.1) | — (refused) |
 
 For a delegated login, `delegation.sub` must equal the actor's DID. The resulting token
 has these claims:
@@ -110,7 +111,7 @@ acts for no one.
   "iat": …, "exp": … (15 min), "jti": …,
   "org": "did:kith:acme…"?, "pol": { "root": "bagu…", "rev": 10 }?,
   "groups": ["finance", "staff", "strong-auth"],
-  "roles": ["billing-admin", "billing-reader"],
+  "roles": ["billing-admin", "billing-reader"], "assumed": "billing-admin"?,
   "attrs": { "email": "ada@acme.test", "department": "finance", "aal": 2, "aliases": [] },
   "aal": 2, "amr": ["swk", "otp", "mfa"], "dev": "dev_…",
   "act": { "sub": "did:kith:…actor" }?, "cap": [ … ]?, "cnf": { "jkt": … }?
@@ -129,6 +130,7 @@ A resource server MUST check all of these, and refuse the token if any fails:
   strings and `aal` is the integer 1, 2 or 3.
 - `org`, if present, is a non-empty string. `pol`, if present, is `{root, rev}` with a
   non-empty string `root` and an integer `rev` of 0 or more, and needs an `org`.
+- `assumed`, if present, is a non-empty string that is one of `roles` (§4.3.1).
 - The times fit the clock, with 60 s of leeway each way. `iat` is not in the future.
   A token is expired once `exp` plus the leeway is reached (RFC 7519 §4.1.4, "now must
   be before `exp`"). `nbf`, if present, is not in the future.
@@ -141,6 +143,7 @@ It then builds the principal from these fields:
 - `attrs` = `attrs` plus `aal` and `amr`;
 - `groups`, `roles`. A resource server configured with an org takes these only from a
   token whose `org` is that org (§10.8), and otherwise uses none;
+- `assumed` = `assumed`, dropped with `roles`;
 - `actor` = `act.sub`;
 - `caps` = `cap`.
 

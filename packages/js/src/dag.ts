@@ -7,7 +7,7 @@
  * needs, and fails rather than returning a slice with something missing.
  */
 import { sha256 } from "./encoding.ts";
-import { Engine, type Bundle, type SetDef } from "./authz.ts";
+import { Engine, type AssumeDef, type Bundle, type SetDef } from "./authz.ts";
 
 export const DAG_VERSION = "kith-policy-dag/1";
 export const ANY = "*";
@@ -146,6 +146,7 @@ export interface SetEntry {
   description?: string;
   members: string[];
   rule?: string;
+  assume?: AssumeDef;
   deps: string[];
   dependents: string[];
 }
@@ -179,6 +180,7 @@ export class Slice {
     for (const s of this.sets.values()) {
       const def: SetDef = { members: s.members };
       if (s.rule !== undefined) def.rule = s.rule;
+      if (s.assume !== undefined) def.assume = s.assume;
       if (s.description !== undefined) def.description = s.description;
       (s.kind === "Group" ? groups : roles)[s.name] = def;
     }

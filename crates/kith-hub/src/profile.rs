@@ -106,7 +106,7 @@ pub async fn whoami(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResult<
     let mut v = view(&st, &events);
     v["namespaces"] = json!(namespace::names_of(&h, &st, true)?);
     let totp = h.store.totp(&st.did)?;
-    v["token"] = json!({"aal": c.aal, "amr": c.amr, "dev": c.dev, "iat": c.iat, "exp": c.exp, "roles": c.roles, "groups": c.groups});
+    v["token"] = json!({"aal": c.aal, "amr": c.amr, "dev": c.dev, "iat": c.iat, "exp": c.exp, "roles": c.roles, "assumed": c.assumed, "groups": c.groups});
     v["sessions"] = json!(h.store.sessions(Some(&st.did))?.iter().map(session_json).collect::<Vec<_>>());
     v["recovery"]["totp"] = json!({
         "enrolled": totp.as_ref().is_some_and(|t| t.confirmed),

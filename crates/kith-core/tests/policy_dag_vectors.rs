@@ -159,6 +159,7 @@ fn generate() -> Value {
                 roles: vec![],
                 actor: c.actor.map(String::from),
                 caps: c.caps.clone().map(|v| serde_json::from_value(v).unwrap()),
+                assumed: None,
             };
             let mut r = Resource::new(c.resource["type"].as_str().unwrap(), c.resource["id"].as_str().unwrap());
             if let Some(a) = c.resource["attrs"].as_object() {

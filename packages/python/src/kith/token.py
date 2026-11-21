@@ -27,6 +27,8 @@ class AccessClaims:
     aal: int
     groups: list[str] = field(default_factory=list)
     roles: list[str] = field(default_factory=list)
+    #: The role this session assumed (spec §4.3.1). It is one of ``roles``.
+    assumed: str | None = None
     attrs: dict[str, Any] = field(default_factory=dict)
     amr: list[str] = field(default_factory=list)
     dev: str | None = None
@@ -43,7 +45,7 @@ class AccessClaims:
         groups and roles survive only if the token says ``org`` produced them."""
         if self.org == org:
             return self
-        return replace(self, groups=[], roles=[])
+        return replace(self, groups=[], roles=[], assumed=None)
 
     def principal(self) -> Principal:
         return Principal(
@@ -53,6 +55,7 @@ class AccessClaims:
             roles=list(self.roles),
             actor=(self.act or {}).get("sub"),
             caps=self.cap,
+            assumed=self.assumed,
         )
 
 
@@ -173,6 +176,10 @@ class Verifier:
             ok = isinstance(pol, dict) and isinstance(pol.get("root"), str) and pol["root"] and type(pol.get("rev")) is int and pol["rev"] >= 0
             if not ok:
                 raise KithAuthError('invalid token: "pol" must be {root, rev}')
+        if "assumed" in c:
+            roles = c.get("roles")
+            if not isinstance(c["assumed"], str) or not c["assumed"] or not isinstance(roles, list) or c["assumed"] not in roles:
+                raise KithAuthError('invalid token: "assumed" must be one of "roles"')
 
 
 class AttestationVerifier(Verifier):

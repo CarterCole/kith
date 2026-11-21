@@ -94,6 +94,12 @@ A **set block** holds one group or role:
 
 - `deps` are the sets its membership depends on: `group:`/`role:` members and the
   sets its `rule` mentions.
+- An assumable role (§4.3.1) carries its `assume` as the bundle gives it. Its `deps`
+  are the sets its `assume` lists or its assume rule mentions. The principals its
+  `assume.members` lists are filed under `members` for it, and a role with an assume
+  rule is in `rules`, so a principal's slice holds every role the principal may
+  assume. A set block with no `assume` is written as before, and its CID does not
+  change.
 - `dependents` is the reverse edge. Sets refer to each other by key, not by link, so
   the graph can have cycles while the blocks stay a DAG.
 
@@ -287,10 +293,13 @@ condition that errors on a missing `kith` skips the forbid, which fails *open*.
    (`dev`) that is revoked for that principal, deny with `revoked:device`.
 3. Remove revoked permit policies from the slice.
 4. Recompute memberships from the slice with the revoked `(principal, set)` pairs
-   excluded (§4.3, where an excluded set never joins).
+   excluded (§4.3, where an excluded set never joins). If the token has `assumed` and
+   the slice holds that role, assume it again (§4.3.1) with the same exclusions, and
+   deny with `assume:<refusal>` if that is refused. If the slice does not hold the role,
+   none of its policies names it: leave it out and decide on the rest.
 5. Evaluate with `context.kith` set.
 6. If step 4 excluded anything and the answer is allow, evaluate again with every
-   membership in place. Allow only if that is allowed too. Without this, excluding Ada
+   membership in place, and the assumed role if step 4 kept it. Allow only if that is allowed too. Without this, excluding Ada
    from `Group::suspended` would turn off `forbid(principal in Group::"suspended", …)`
    for her.
 

@@ -68,6 +68,13 @@ const cases = [
   { name: "pol.rev is negative", token: withProv({ org: ORG, pol: { ...POL, rev: -1 } }), valid: false },
   { name: "pol.rev is 1.5", token: withProv({ org: ORG, pol: { ...POL, rev: 1.5 } }), valid: false },
   { name: "pol is not an object", token: withProv({ org: ORG, pol: "bagu" }), valid: false },
+  // An assumed role (spec section 4.3.1) is one of the token's roles.
+  { name: "an assumed role", token: withProv({ ...provenance, roles: ["billing-reader", "break-glass"], assumed: "break-glass" }), valid: true, claims: { ...expectProv, roles: ["billing-reader", "break-glass"], assumed: "break-glass" }, resource_org: ORG, groups_kept: ["finance"] },
+  { name: "an assumed role, read by a resource server for another org", token: withProv({ ...provenance, roles: ["billing-reader", "break-glass"], assumed: "break-glass" }), valid: true, claims: { ...expectProv, roles: ["billing-reader", "break-glass"], assumed: "break-glass" }, resource_org: "did:kith:globex", groups_kept: [] },
+  { name: "assumed is not one of roles", token: withProv({ assumed: "god" }), valid: false },
+  { name: "assumed is empty", token: withProv({ roles: ["billing-reader", ""], assumed: "" }), valid: false },
+  { name: "assumed is not a string", token: withProv({ assumed: ["billing-reader"] }), valid: false },
+  { name: "assumed with no roles", token: mint({ ...without("roles"), assumed: "billing-reader" }), valid: false },
   { name: "typ application/at+jwt is the same type (RFC 7515 4.1.9)", token: mint(claims, withHeader({ typ: "application/at+jwt" })), valid: true, claims: expect },
   { name: "typ AT+JWT, media types are case-insensitive", token: mint(claims, withHeader({ typ: "AT+JWT" })), valid: true, claims: expect },
   { name: "expired 59 s ago, inside the leeway", token: mint({ ...claims, exp: NOW - 59 }), valid: true, claims: expect },

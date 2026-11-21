@@ -298,7 +298,16 @@ export function authorize(slice: Slice, follower: Follower, req: Request, now: n
   const engine = slice.engine(follower.revokedPolicies());
   const attrs = engine.attributes(req.principal.id, req.principal.attrs);
   const excluded = follower.excludedSets(req.principal.id);
-  const m = engine.memberships(req.principal.id, attrs, excluded);
+  // A session that assumed a role (spec §4.3.1) must still be able to assume it. A role
+  // the slice does not hold is named by none of its policies, and is left out.
+  const assumed = req.principal.assumed !== undefined && Object.hasOwn(engine.bundle.roles ?? {}, req.principal.assumed) ? req.principal.assumed : undefined;
+  let m: { groups: string[]; roles: string[] };
+  if (assumed === undefined) m = engine.memberships(req.principal.id, attrs, excluded);
+  else {
+    const got = engine.assume(req.principal.id, attrs, excluded, assumed);
+    if ("refused" in got) return deny(`assume:${got.refused}`);
+    m = got;
+  }
   const kith = { sync_age: f.age ?? Number.MAX_SAFE_INTEGER, degraded: f.level !== "fresh", revocation_seq: f.seq };
   const context = { ...(req.context ?? {}), kith };
   const reduced = engine.authorize({ ...req.principal, attrs, groups: m.groups, roles: m.roles }, req.action, req.resource, context);
@@ -307,6 +316,7 @@ export function authorize(slice: Slice, follower: Follower, req: Request, now: n
   // turn it off. Revocations only ever remove access (spec §8.7), so the answer must
   // also be allowed with every membership in place.
   const all = engine.memberships(req.principal.id, attrs);
+  if (assumed !== undefined) all.roles.push(assumed);
   const full = engine.authorize({ ...req.principal, attrs, groups: all.groups, roles: all.roles }, req.action, req.resource, context);
   return full.allowed ? reduced : { ...full, allowed: false };
 }

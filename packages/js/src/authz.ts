@@ -7,12 +7,29 @@
 import * as cedar from "@cedar-policy/cedar-wasm/nodejs";
 
 export const MEMBER_ACTION = "kith:member";
+/** The action an `assume` rule compiles to (spec §4.3.1). */
+export const ASSUME_ACTION = "kith:assume";
+
+/** Who may take on a role for a session, and for how long (spec §4.3.1). */
+export interface AssumeDef {
+  /** Principal ids, `group:<name>` and `role:<name>`, as in a set's `members`. */
+  members?: string[];
+  /** A Cedar expression over `principal`, as in a set's `rule`. */
+  rule?: string;
+  /** The longest an access token carrying the role may live, in seconds. */
+  max_age?: number;
+}
 
 export interface SetDef {
   description?: string;
   members?: string[];
   rule?: string;
+  /** Roles only: who may assume this role. Such a role has no `members` and no `rule`. A role without it is never assumed. */
+  assume?: AssumeDef | null;
 }
+
+/** Why a session may not assume a role (spec §4.3.1). */
+export type Refusal = "not_assumable" | "not_eligible";
 
 export interface Bundle {
   version: number;
@@ -36,12 +53,54 @@ export interface Principal {
   /** Set when an actor exercises a delegation on this principal's behalf. */
   actor?: string;
   caps?: Capability[];
+  /** The role this session assumed (spec §4.3.1). It is in `roles` as well. */
+  assumed?: string;
+}
+
+/** A reference to an entity: a parent of a resource (spec §4.2.1). */
+export interface EntityRef {
+  type: string;
+  id: string;
+}
+
+/**
+ * An entity a request describes besides its principal and resource (spec §4.2.1): an
+ * ancestor of the resource, or something one of its attributes refers to.
+ */
+export interface Entity extends EntityRef {
+  attrs?: Record<string, unknown>;
+  parents?: EntityRef[];
 }
 
 export interface Resource {
   type: string;
   id: string;
   attrs?: Record<string, unknown>;
+  /** What the resource is directly in. `resource in Folder::"x"` holds when `x` is a parent, or is reached from one through `related`. */
+  parents?: EntityRef[];
+  /** The other entities policies may walk to from this resource. */
+  related?: Entity[];
+}
+
+/**
+ * Typed values (spec §4.2.2), in the form Cedar's JSON reads. A plain string is always
+ * a `String`: an address, a time or a decimal has to say that it is one.
+ */
+const ext = (fn: string, arg: string) => ({ __extn: { fn, arg } });
+/** An IP address or CIDR range: `10.1.2.3`, `10.0.0.0/8`, `::1`. */
+export const ip = (text: string) => ext("ip", text);
+/** A decimal with at most four fractional digits: `12.50`. */
+export const decimal = (text: string) => ext("decimal", text);
+/** A date or an instant: `2030-01-01`, `2030-01-01T09:30:00Z`, or a `Date`. */
+export const datetime = (value: string | Date) => ext("datetime", typeof value === "string" ? value : value.toISOString());
+/** A length of time: `1h30m`, `-2d`. */
+export const duration = (text: string) => ext("duration", text);
+/** A reference to another entity, such as a document's owner. */
+export const entityRef = (type: string, id: string) => ({ __entity: { type, id } });
+
+/** Entity types a request may not describe: the bundle and the engine supply these. */
+function reservedType(type: string): boolean {
+  return type === "Group" || type === "Role" || type === "Action" || type.endsWith("::Action");
 }
 
 export interface Decision {
@@ -93,6 +152,7 @@ export class Engine {
   readonly bundle: Bundle;
   private readonly policySetId: string;
   private readonly membership: Record<string, string>;
+  private readonly assumeRules: Record<string, string>;
 
   constructor(bundle: Bundle) {
     this.bundle = bundle;
@@ -107,8 +167,31 @@ export class Engine {
           `permit(principal, action == Action::"${MEMBER_ACTION}", resource == ${kind}::${JSON.stringify(name)}) when { ${def.rule} };`;
       }
     }
+    this.assumeRules = {};
+    for (const [kind, sets] of [["Group", bundle.groups], ["Role", bundle.roles]] as const) {
+      for (const [name, def] of Object.entries(sets ?? {})) {
+        const a = def.assume;
+        if (a === undefined || a === null) continue;
+        if (kind === "Group") throw new Error(`group ${name}: only a role can be assumed`);
+        if ((def.members ?? []).length > 0 || def.rule !== undefined) {
+          throw new Error(`role ${name} is assumable, so it is held only by assuming it: it has no members and no rule`);
+        }
+        if (typeof a !== "object" || Array.isArray(a)) throw new Error(`role ${name}: assume is an object`);
+        if (a.members !== undefined && (!Array.isArray(a.members) || a.members.some((m) => typeof m !== "string"))) {
+          throw new Error(`role ${name}: assume.members is a list of strings`);
+        }
+        if (a.rule !== undefined && typeof a.rule !== "string") throw new Error(`role ${name}: assume.rule is a string`);
+        if (a.max_age !== undefined && !(Number.isSafeInteger(a.max_age) && a.max_age > 0)) {
+          throw new Error(`role ${name}: max_age is a positive number of seconds`);
+        }
+        if (a.rule !== undefined) {
+          this.assumeRules[`assume:${name}`] =
+            `permit(principal, action == Action::"${ASSUME_ACTION}", resource == Role::${JSON.stringify(name)}) when { ${a.rule} };`;
+        }
+      }
+    }
     // Parse each rule as exactly one policy: rejects rule text that tries to smuggle in extra policies.
-    const check = cedar.checkParsePolicySet({ staticPolicies: this.membership });
+    const check = cedar.checkParsePolicySet({ staticPolicies: { ...this.membership, ...this.assumeRules } });
     if (check.type === "failure") throw new Error(`membership rules: ${check.errors.map((e) => e.message).join("; ")}`);
   }
 
@@ -175,6 +258,41 @@ export class Engine {
   }
 
   /**
+   * Memberships for a session that assumes `role` (spec §4.3.1): the standing ones, with
+   * the sets in `excluded` revoked, plus the role. The role must have an `assume`
+   * setting that the principal meets, and must not be in `excluded`.
+   */
+  assume(id: string, attrs: Record<string, unknown>, excluded: Set<string>, role: string): { groups: string[]; roles: string[] } | { refused: Refusal } {
+    const def = Object.hasOwn(this.bundle.roles ?? {}, role) ? this.bundle.roles![role] : undefined;
+    const a = def?.assume;
+    if (a === undefined || a === null) return { refused: "not_assumable" };
+    const m = this.memberships(id, attrs, excluded);
+    if (excluded.has(`Role::${role}`)) return { refused: "not_eligible" };
+    const listed = (a.members ?? []).some(
+      (x) => x === id || (x.startsWith("group:") && m.groups.includes(x.slice(6))) || (x.startsWith("role:") && m.roles.includes(x.slice(5))),
+    );
+    let byRule = false;
+    if (!listed && a.rule !== undefined) {
+      const r = cedar.isAuthorized({
+        principal: { type: "User", id },
+        action: { type: "Action", id: ASSUME_ACTION },
+        resource: { type: "Role", id: role },
+        context: {},
+        policies: { staticPolicies: { [`assume:${role}`]: this.assumeRules[`assume:${role}`] } },
+        entities: [...this.setEntities(), this.principalEntity(id, attrs, m.groups, m.roles)],
+      });
+      byRule = r.type === "success" && r.response.decision === "allow";
+    }
+    if (!listed && !byRule) return { refused: "not_eligible" };
+    return { groups: m.groups, roles: [...m.roles, role].sort() };
+  }
+
+  /** The longest an access token may carry `role` as assumed, if the role says. */
+  assumeMaxAge(role: string): number | undefined {
+    return Object.hasOwn(this.bundle.roles ?? {}, role) ? (this.bundle.roles![role].assume?.max_age ?? undefined) : undefined;
+  }
+
+  /**
    * Evaluate `action` on `resource`. Delegated principals must also hold a matching
    * capability: delegation can only narrow what the delegator could do.
    */
@@ -184,6 +302,17 @@ export class Engine {
     }
     const ctx = cedarRecord(context);
     if (principal.actor) ctx.actor = principal.actor;
+    const refs = (ps: EntityRef[] | undefined) => (ps ?? []).map((p) => ({ type: p.type, id: p.id }));
+    // A related entity describes something new. It never restates the principal, the
+    // resource, a set or an action, whose parents decide who is in what.
+    const seen = new Set([JSON.stringify(["User", principal.id]), JSON.stringify([resource.type, resource.id])]);
+    const related: cedar.EntityJson[] = [];
+    for (const r of resource.related ?? []) {
+      const key = JSON.stringify([r.type, r.id]);
+      if (reservedType(r.type) || seen.has(key)) return { allowed: false, reasons: ["entities:conflict"], errors: [] };
+      seen.add(key);
+      related.push({ uid: { type: r.type, id: r.id }, attrs: cedarRecord(r.attrs), parents: refs(r.parents) });
+    }
     const r = cedar.statefulIsAuthorized({
       principal: { type: "User", id: principal.id },
       action: { type: "Action", id: action },
@@ -193,7 +322,8 @@ export class Engine {
       entities: [
         ...this.setEntities(),
         this.principalEntity(principal.id, principal.attrs, principal.groups, principal.roles),
-        { uid: { type: resource.type, id: resource.id }, attrs: cedarRecord(resource.attrs), parents: [] },
+        { uid: { type: resource.type, id: resource.id }, attrs: cedarRecord(resource.attrs), parents: refs(resource.parents) },
+        ...related,
       ],
     });
     if (r.type === "failure") return { allowed: false, reasons: [], errors: r.errors.map((e) => e.message) };

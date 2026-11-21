@@ -27,8 +27,11 @@
   DNS or did:web back-links; the CLI pins them as local names. Private ones are
   unlinkable until you choose to prove the link.
 - **Authorization** uses Cedar policies with explicit, nested and dynamic groups and
-  roles. Dynamic groups are defined by propositions. It plugs into GraphQL at the root,
-  field and row level in JS and Python.
+  roles. Dynamic groups are defined by propositions. Resources can sit in a hierarchy
+  (`resource in Folder::"finance"`), and values can be addresses, decimals, times and
+  references to other entities. A role can be assumable, held only by a session that
+  asks for it; one without that setting, such as `god`, never is. It plugs into
+  GraphQL at the root, field and row level in JS and Python.
 - **Crypto-enforced sharing** uses skip-ratchet group keys, WNFS style, sealed to
   device keys. It covers data that lives on untrusted storage.
 - **Policies as a content-addressed DAG.**
@@ -96,6 +99,7 @@ kith device join --hub https://hub.example   # join an identity made in the brow
 kith manage set 2 passkey mac phone --recovery-key kith-recovery-key.json   # who approves new devices
 kith device approve <link>                   # add this device's approval, when it is a manage signer
 kith login --aud api://invoices --totp 123456
+kith login --aud api://invoices --role break-glass   # an assumable role, for its max_age
 curl -H "authorization: Bearer $(kith token --aud api://invoices)" https://api.example/graphql …
 kith alias new gaming && kith alias prove gaming --aud https://shop.example
 kith delegate --to did:kith:… --action 'Query.*'
@@ -172,9 +176,14 @@ GraphQL(schema, context_value=…, http_handler=GraphQLHTTPHandler(middleware=[K
 **Rust**
 
 ```rust
-use kith_core::{token::verify_access_token, authz::{Engine, Principal, Resource}};
+use kith_core::{token::verify_access_token, authz::{typed, Engine, EntityRef, Principal, Resource}};
 let claims = verify_access_token(tok, &jwks, HUB, "api://invoices", now())?;
 let ok = engine.authorize(&principal, "Query.invoices", &Resource::new("Operation", "Query.invoices"), &ctx)?.allowed;
+
+// A resource in a hierarchy, and a typed value in the context (spec §4.2.1, §4.2.2)
+let mut doc = Resource::new("Document", "d1");
+doc.parents.push(EntityRef::new("Folder", "finance"));
+let ok = engine.authorize(&principal, "Document.read", &doc, &json!({ "sourceIp": typed::ip("10.1.2.3") }))?.allowed;
 ```
 
 **Policy slices and revocations** ([spec §8](spec/08-policy-dag.md))
@@ -207,6 +216,13 @@ permit(principal in Role::"billing-admin", action == Action::"Mutation.payInvoic
 permit(principal, action == Action::"Invoice.read", resource)
   when { principal has email && resource has ownerEmail && resource.ownerEmail == principal.email };
 forbid(principal, action, resource) when { context has actor && context.operationType == "mutation" };
+// assumable: held only by a session that asks for it ("kith login --role break-glass")
+//   "break-glass": { "assume": { "members": ["group:oncall"], "max_age": 600 } }
+// a role without "assume", such as "god", is never assumed
+permit(principal in Role::"break-glass", action == Action::"Mutation.deleteInvoice", resource);
+// a folder and everything the request says is in it, from the office network only
+permit(principal in Role::"billing-reader", action == Action::"Document.read", resource in Folder::"finance")
+  when { context has sourceIp && context.sourceIp.isInRange(ip("10.0.0.0/8")) };
 ```
 
 ## Layout

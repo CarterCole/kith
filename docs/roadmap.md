@@ -24,7 +24,13 @@
 - **Delegation.** RFC 8693 exchange producing `act` and `cap`. Attenuation is enforced
   by every resource server.
 - **Authorization.** Cedar policies with explicit, nested and dynamic groups and roles.
-  Identical results in Rust, JS and Python, checked against shared vectors.
+  Identical results in Rust, JS and Python, checked against shared vectors. A resource
+  can say what it is in and what it relates to, so `resource in Folder::"x"` and
+  `resource.folder.owner` work, and values can be addresses, decimals, times and entity
+  references ([spec §4.2.1, §4.2.2](../spec/04-authorization.md)). A role can be
+  assumable: held only by a session that asks for it (`kith login --role`), for no
+  longer than its `max_age`. A role without that setting, such as `god`, is never
+  assumed ([spec §4.3.1](../spec/04-authorization.md)).
 - **GraphQL.** Root, field and row-level enforcement for graphql-js (Yoga, Apollo) and
   graphql-core middleware (Ariadne, Graphene). Both example APIs return identical
   results. `__typename` always works and introspection is open or `authenticated`, the
@@ -342,6 +348,22 @@
     revocations (§8). The GraphQL middleware doesn't consult a revocation follower yet.
   - Cedar schemas and audience namespaces, for validation and policy analysis.
     Specified as a draft ([spec §9](../spec/09-schemas.md)), not implemented.
+  - Action groups, so one policy can cover `Invoice.*`. No action has parents today, so
+    `action in Action::"…"` matches nothing. §9 puts groups in an audience's schema; a
+    slice reader has to fetch a group's policies with its members', or a forbid on the
+    group is lost ([spec §9.6](../spec/09-schemas.md)).
+  - What AWS IAM has and a bundle cannot say: ceilings that a grant must also pass
+    (permission boundaries, organization-wide limits), policies attached to a resource
+    by its owner. Assuming a role adds it to the session; there is no IAM-style switch
+    that drops the roles a principal holds, because dropping a group could lift a
+    forbid that names it ([spec §4.3.1](../spec/04-authorization.md)).
+    Policy variables inside a pattern and case-insensitive comparison are missing in
+    Cedar itself.
+  - Assumable roles: the hub's policy-org path, and the JS follower's re-check, have
+    no test of their own; `policy-dag.json` has no assumable role yet. The hub never
+    asks the person to confirm an assumption or notifies anyone of it.
+  - The GraphQL middlewares pass no resource parents by themselves; an application adds
+    them in `toResource` / `to_resource` ([spec §4.2.1](../spec/04-authorization.md)).
   - Delegated administration. Today any change to a group or role needs the org's
     whole manage policy. Specified as a draft ([spec §10](../spec/10-delegated-administration.md)),
     not implemented.

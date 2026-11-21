@@ -392,6 +392,9 @@ pub struct Request<'a> {
 ///    (so anything that came through them goes too), whatever the token claimed. The
 ///    request must also be allowed with every membership in place, so an exclusion
 ///    can't turn off a forbid that names the set;
+///    A session that assumed a role (spec §4.3.1) must still be able to assume it,
+///    with the same exclusions; otherwise it is denied with `assume:<refusal>`. A role
+///    the slice does not hold is named by none of its policies, and is left out;
 /// 4. revoked permit policies are dropped;
 /// 5. policies see `context.kith = {sync_age, degraded, revocation_seq}`.
 pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64) -> Result<AuthzDecision> {
@@ -416,7 +419,14 @@ pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64
     let engine = slice.engine_without(&follower.revoked_policies())?;
     let attrs = engine.attributes(&principal.id, &principal.attrs);
     let excluded = follower.excluded_sets(&principal.id);
-    let m = engine.memberships_excluding(&principal.id, &attrs, &excluded)?;
+    let assumed = principal.assumed.as_ref().filter(|r| engine.bundle.roles.contains_key(*r));
+    let m = match assumed {
+        None => engine.memberships_excluding(&principal.id, &attrs, &excluded)?,
+        Some(role) => match engine.assume(&principal.id, &attrs, &excluded, role)? {
+            Ok(m) => m,
+            Err(r) => return deny(&format!("assume:{}", r.code())),
+        },
+    };
     let mut ctx = match context {
         Value::Object(o) => o.clone(),
         _ => Map::new(),
@@ -431,7 +441,8 @@ pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64
     // A forbid or an `unless` may name an excluded set, and dropping the membership
     // would turn it off. Revocations only ever remove access (spec §8.7), so the answer
     // must also be allowed with every membership in place.
-    let all = engine.memberships(&principal.id, &attrs)?;
+    let mut all = engine.memberships(&principal.id, &attrs)?;
+    all.roles.extend(assumed.cloned());
     let full = engine.authorize(&Principal { groups: all.groups, roles: all.roles, ..p }, action, resource, &ctx)?;
     Ok(if full.allowed { reduced } else { AuthzDecision { allowed: false, reasons: full.reasons, errors: full.errors } })
 }
@@ -612,10 +623,49 @@ mod tests {
         (o, slice, f)
     }
 
+    /// §4.3.1 at a follower: revoking the assumed role, or what made it assumable,
+    /// ends sessions that already hold it, whatever the token says.
+    #[test]
+    fn revocations_end_an_assumed_role() {
+        let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
+        let bundle: Bundle = serde_json::from_value(v["assume"]["bundle"].clone()).unwrap();
+        let store = MemStore::default();
+        let root = build(&store, &bundle).unwrap();
+        let slice = |action: &str| load(&store, &root, &Query::Actions { actions: vec![action.into()], principals: vec!["did:kith:ada".into()] }).unwrap();
+        let (deletes, reads) = (slice("Mutation.deleteInvoice"), slice("Query.invoices"));
+        assert!(!reads.sets.contains_key("Role::break-glass"), "no policy for reading names it");
+        let o = org();
+        let mut attrs = Map::new();
+        attrs.insert("aal".into(), json!(2));
+        let ada = Principal { id: "did:kith:ada".into(), attrs, roles: vec!["break-glass".into()], assumed: Some("break-glass".into()), ..Default::default() };
+        let ask = |s: &Slice, f: &mut Follower, p: &Principal, action: &str| {
+            authorize(s, f, &Request { principal: p, jti: None, device: None, action, resource: &Resource::new("Operation", action), context: &json!({}) }, 1000).unwrap()
+        };
+        let decide = |f: &mut Follower, p: &Principal| ask(&deletes, f, p, "Mutation.deleteInvoice");
+        let follower = |revoked: Option<&str>| {
+            let mut f = Follower::new(&o.state.did, 0, FreshnessPolicy { fresh_for: 30, max_staleness: 3600, require_beacon: true });
+            let e = revoked.map(|set| entry(&o, None, vec![Revocation::Member { id: "did:kith:ada".into(), set: set.into() }]));
+            if let Some(e) = &e {
+                f.apply_entry(&o.state, e).unwrap();
+            }
+            f.apply_heartbeat(&o.state, &heartbeat(&o, e.as_ref(), 1000), &ClockBeacon, 1000).unwrap();
+            f
+        };
+        let mut f = follower(None);
+        assert!(decide(&mut f, &ada).allowed);
+        assert!(ask(&reads, &mut f, &ada, "Query.invoices").allowed, "a slice without the role decides on the roles she holds");
+        assert!(!decide(&mut f, &Principal { assumed: None, ..ada.clone() }).allowed, "the role comes from assuming it, not from the claim");
+        let claimed = Principal { assumed: Some("god".into()), roles: vec!["god".into()], ..ada.clone() };
+        assert_eq!(decide(&mut f, &claimed).reasons, ["assume:not_assumable"], "a token's word is not enough");
+        for set in ["Role::break-glass", "Group::oncall"] {
+            assert_eq!(decide(&mut follower(Some(set)), &ada).reasons, ["assume:not_eligible"], "revoked {set}");
+        }
+    }
+
     fn ada() -> Principal {
         let mut attrs = Map::new();
         attrs.insert("aal".into(), json!(2));
-        Principal { id: "did:kith:ada".into(), attrs, groups: vec!["finance".into()], roles: vec!["billing-reader".into()], actor: None, caps: None }
+        Principal { id: "did:kith:ada".into(), attrs, groups: vec!["finance".into()], roles: vec!["billing-reader".into()], actor: None, caps: None, assumed: None }
     }
 
     #[test]

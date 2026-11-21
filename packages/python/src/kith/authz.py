@@ -14,6 +14,8 @@ from typing import Any, Iterable, Mapping
 import cedarpy
 
 MEMBER_ACTION = "kith:member"
+#: The action an ``assume`` rule compiles to (spec §4.3.1).
+ASSUME_ACTION = "kith:assume"
 
 
 @dataclass
@@ -25,6 +27,20 @@ class Principal:
     #: Set when an actor exercises a delegation on this principal's behalf.
     actor: str | None = None
     caps: list[dict[str, str]] | None = None
+    #: The role this session assumed (spec §4.3.1). It is in ``roles`` as well.
+    assumed: str | None = None
+
+
+@dataclass
+class Entity:
+    """An entity a request describes besides its principal and resource (spec §4.2.1):
+    an ancestor of the resource, or something one of its attributes refers to.
+    ``parents`` are ``{"type": ..., "id": ...}`` references."""
+
+    type: str
+    id: str
+    attrs: dict[str, Any] = field(default_factory=dict)
+    parents: list[Mapping[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -32,6 +48,13 @@ class Resource:
     type: str
     id: str
     attrs: dict[str, Any] = field(default_factory=dict)
+    #: What the resource is directly in, as ``{"type": ..., "id": ...}`` references.
+    #: ``resource in Folder::"x"`` holds when ``x`` is a parent, or is reached from one
+    #: through ``related``.
+    parents: list[Mapping[str, str]] = field(default_factory=list)
+    #: The other entities policies may walk to from this resource: :class:`Entity`
+    #: values, or mappings with the same members.
+    related: list[Any] = field(default_factory=list)
 
     @property
     def uid(self) -> str:
@@ -63,6 +86,44 @@ def cedar_value(v: Any) -> Any:
     if isinstance(v, Mapping):
         return {str(k): c for k, x in v.items() if (c := cedar_value(x)) is not None}
     return str(v)
+
+
+def _ext(fn: str, arg: str) -> dict:
+    return {"__extn": {"fn": fn, "arg": arg}}
+
+
+# Typed values (spec §4.2.2), in the form Cedar's JSON reads. A plain string is always a
+# ``String``: an address, a time or a decimal has to say that it is one.
+
+
+def ip(text: str) -> dict:
+    """An IP address or CIDR range: ``10.1.2.3``, ``10.0.0.0/8``, ``::1``."""
+    return _ext("ip", text)
+
+
+def decimal(text: str) -> dict:
+    """A decimal with at most four fractional digits: ``12.50``."""
+    return _ext("decimal", text)
+
+
+def datetime(text: str) -> dict:
+    """A date or an instant: ``2030-01-01``, ``2030-01-01T09:30:00Z``."""
+    return _ext("datetime", text)
+
+
+def duration(text: str) -> dict:
+    """A length of time: ``1h30m``, ``-2d``."""
+    return _ext("duration", text)
+
+
+def entity_ref(type: str, id: str) -> dict:
+    """A reference to another entity, such as a document's owner."""
+    return {"__entity": {"type": type, "id": id}}
+
+
+def _reserved_type(type: str) -> bool:
+    """Entity types a request may not describe: the bundle and the engine supply these."""
+    return type in ("Group", "Role", "Action") or type.endswith("::Action")
 
 
 def number_text(v: float | int) -> str:
@@ -151,6 +212,7 @@ class Engine:
         self.directory: dict[str, dict] = dict(bundle.get("directory") or {})
         self._policies = cedarpy.PolicySet.from_str(bundle.get("policies") or "")
         self._membership: dict[tuple[str, str], Any] = {}
+        self._assume: dict[str, Any] = {}
         for kind, sets in (("Group", self.groups), ("Role", self.roles)):
             for name, d in sets.items():
                 rule = d.get("rule")
@@ -164,6 +226,31 @@ class Engine:
                 if len(json.loads(cedarpy.policies_to_json_str(src))["staticPolicies"]) != 1:
                     raise ValueError(f"{kind} {name}: rule must be a single expression")
                 self._membership[(kind, name)] = cedarpy.PolicySet.from_str(src)
+        for kind, sets in (("Group", self.groups), ("Role", self.roles)):
+            for name, d in sets.items():
+                a = d.get("assume")
+                if a is None:
+                    continue
+                if kind == "Group":
+                    raise ValueError(f"group {name}: only a role can be assumed")
+                if d.get("members") or d.get("rule") is not None:
+                    raise ValueError(f"role {name} is assumable, so it is held only by assuming it: it has no members and no rule")
+                if not isinstance(a, Mapping):
+                    raise ValueError(f"role {name}: assume is an object")
+                members = a.get("members", [])
+                if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
+                    raise ValueError(f"role {name}: assume.members is a list of strings")
+                max_age = a.get("max_age")
+                if max_age is not None and not (type(max_age) is int and max_age > 0):
+                    raise ValueError(f"role {name}: max_age is a positive number of seconds")
+                rule = a.get("rule")
+                if rule is not None:
+                    if not isinstance(rule, str):
+                        raise ValueError(f"role {name}: assume.rule is a string")
+                    src = f'permit(principal, action == Action::"{ASSUME_ACTION}", resource == {_uid("Role", name)}) when {{ {rule} }};'
+                    if len(json.loads(cedarpy.policies_to_json_str(src))["staticPolicies"]) != 1:
+                        raise ValueError(f"role {name}: assume rule must be a single expression")
+                    self._assume[name] = cedarpy.PolicySet.from_str(src)
 
     @classmethod
     def from_json(cls, text: str) -> "Engine":
@@ -181,8 +268,11 @@ class Engine:
     def _principal_entity(self, p_id: str, attrs: Mapping[str, Any], groups: Iterable[str], roles: Iterable[str]) -> dict:
         return _entity("User", p_id, attrs, [("Group", g) for g in groups] + [("Role", r) for r in roles])
 
-    def memberships(self, id: str, attrs: Mapping[str, Any]) -> tuple[list[str], list[str]]:
-        """Compute explicit + nested + dynamic membership (fixpoint)."""
+    def memberships(self, id: str, attrs: Mapping[str, Any], excluded: Iterable[str] = ()) -> tuple[list[str], list[str]]:
+        """Compute explicit + nested + dynamic membership (fixpoint). Sets in ``excluded``
+        (``Group::x``, ``Role::x``, from revocations) never join, so neither do sets that
+        depended on them."""
+        excluded = set(excluded)
         groups: set[str] = set()
         roles: set[str] = set()
         for _ in range(len(self.groups) + len(self.roles) + 1):
@@ -190,7 +280,7 @@ class Engine:
             entities = self._set_entities() + [self._principal_entity(id, attrs, sorted(groups), sorted(roles))]
             for kind, sets, current in (("Group", self.groups, groups), ("Role", self.roles, roles)):
                 for name, d in sets.items():
-                    if name in current:
+                    if name in current or f"{kind}::{name}" in excluded:
                         continue
                     explicit = any(
                         m == id
@@ -213,6 +303,37 @@ class Engine:
                 break
         return sorted(groups), sorted(roles)
 
+    def assume(self, id: str, attrs: Mapping[str, Any], excluded: Iterable[str], role: str) -> tuple[list[str], list[str]] | str:
+        """Memberships for a session that assumes ``role`` (spec §4.3.1): the standing ones,
+        with the sets in ``excluded`` revoked, plus the role. Returns ``(groups, roles)``, or
+        the refusal: ``"not_assumable"`` or ``"not_eligible"``."""
+        a = (self.roles.get(role) or {}).get("assume")
+        if a is None:
+            return "not_assumable"
+        excluded = set(excluded)
+        groups, roles = self.memberships(id, attrs, excluded)
+        if f"Role::{role}" in excluded:
+            return "not_eligible"
+        listed = any(
+            m == id or (m.startswith("group:") and m[6:] in groups) or (m.startswith("role:") and m[5:] in roles)
+            for m in a.get("members") or []
+        )
+        if not listed and role in self._assume:
+            entities = self._set_entities() + [self._principal_entity(id, attrs, groups, roles)]
+            r = cedarpy.is_authorized(
+                {"principal": _ref("User", id), "action": _ref("Action", ASSUME_ACTION), "resource": _ref("Role", role), "context": {}},
+                self._assume[role],
+                entities,
+            )
+            listed = bool(r.allowed)
+        if not listed:
+            return "not_eligible"
+        return groups, sorted(roles + [role])
+
+    def assume_max_age(self, role: str) -> int | None:
+        """The longest an access token may carry ``role`` as assumed, if the role says."""
+        return ((self.roles.get(role) or {}).get("assume") or {}).get("max_age")
+
     def principal(self, id: str, attrs: Mapping[str, Any] | None = None, **kw: Any) -> Principal:
         """Build a principal from directory + ``attrs``, computing memberships."""
         a = self.attributes(id, attrs)
@@ -226,10 +347,20 @@ class Engine:
         ctx = cedar_value(dict(context or {})) or {}
         if principal.actor:
             ctx["actor"] = principal.actor
+        refs = lambda ps: [(p["type"], p["id"]) for p in ps or []]  # noqa: E731
         entities = self._set_entities() + [
             self._principal_entity(principal.id, principal.attrs, principal.groups, principal.roles),
-            _entity(resource.type, resource.id, resource.attrs, []),
+            _entity(resource.type, resource.id, resource.attrs, refs(resource.parents)),
         ]
+        # A related entity describes something new. It never restates the principal, the
+        # resource, a set or an action, whose parents decide who is in what.
+        seen = {("User", principal.id), (resource.type, resource.id)}
+        for r in resource.related or []:
+            e = r if isinstance(r, Entity) else Entity(r["type"], r["id"], r.get("attrs") or {}, r.get("parents") or [])
+            if _reserved_type(e.type) or (e.type, e.id) in seen:
+                return Decision(False, ["entities:conflict"], [])
+            seen.add((e.type, e.id))
+            entities.append(_entity(e.type, e.id, e.attrs, refs(e.parents)))
         r = cedarpy.is_authorized(
             {"principal": _ref("User", principal.id), "action": _ref("Action", action), "resource": _ref(resource.type, resource.id), "context": ctx},
             self._policies,

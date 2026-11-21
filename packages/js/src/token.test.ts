@@ -37,6 +37,7 @@ for (const c of vectors.cases as { name: string; token: string; valid: boolean; 
       // A resource server configured with an org keeps memberships only from that org (spec 10.8).
       const scoped = await createVerifier({ issuer: vectors.issuer, audience: vectors.audience, jwks: vectors.jwks, clockTolerance: vectors.leeway, now: () => vectors.now, org: c.resource_org })(c.token);
       assert.deepEqual(scoped.groups, c.groups_kept, "groups_kept");
+      if (!c.groups_kept?.length) assert.equal(scoped.assumed, undefined, "another org's assumed role");
       if (!c.groups_kept?.length) assert.deepEqual(scoped.roles, [], "roles dropped too");
       assert.equal(scoped.sub, got.sub, "still authenticates");
     }
