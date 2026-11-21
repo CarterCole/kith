@@ -51,6 +51,9 @@ pub struct AccessClaims {
     pub groups: Vec<String>,
     #[serde(default)]
     pub roles: Vec<String>,
+    /// The role this session assumed (spec §4.3.1). It is one of `roles`.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::authz::present")]
+    pub assumed: Option<String>,
     #[serde(default)]
     pub attrs: Map<String, Value>,
     /// Authenticator assurance level achieved for this session (NIST 800-63B, 1-3).
@@ -78,8 +81,25 @@ impl AccessClaims {
         if self.org.as_deref() != Some(org) {
             self.groups.clear();
             self.roles.clear();
+            self.assumed = None;
         }
         self
+    }
+
+    /// The principal these claims describe (spec §3.5).
+    pub fn principal(&self) -> crate::authz::Principal {
+        let mut attrs = self.attrs.clone();
+        attrs.insert("aal".into(), Value::from(self.aal));
+        attrs.insert("amr".into(), serde_json::json!(self.amr));
+        crate::authz::Principal {
+            id: self.sub.clone(),
+            attrs,
+            groups: self.groups.clone(),
+            roles: self.roles.clone(),
+            actor: self.act.as_ref().map(|a| a.sub.clone()),
+            caps: self.cap.clone(),
+            assumed: self.assumed.clone(),
+        }
     }
 }
 
@@ -167,6 +187,9 @@ pub fn verify_access_token(token: &str, jwks: &Value, issuer: &str, audience: &s
     if c.org.as_deref() == Some("") || (c.pol.is_some() && c.org.is_none()) || c.pol.as_ref().is_some_and(|p| p.root.is_empty()) {
         return Err(Error::Token("org must not be empty, and pol needs an org and a root".into()));
     }
+    if c.assumed.as_ref().is_some_and(|r| r.is_empty() || !c.roles.contains(r)) {
+        return Err(Error::Token("assumed must be one of roles".into()));
+    }
     check_times(c.iat, c.exp, nbf, now)?;
     Ok(c)
 }
@@ -248,6 +271,7 @@ mod tests {
             pol: None,
             groups: vec![],
             roles: vec![],
+            assumed: None,
             attrs: Map::new(),
             aal: 1,
             amr: vec!["swk".into()],
@@ -358,14 +382,19 @@ mod tests {
                     assert_eq!(claims.jti, want["jti"].as_str().unwrap(), "{name}");
                     assert_eq!(json!(claims.groups), want["groups"], "{name}");
                     let got = serde_json::to_value(&claims).unwrap();
-                    for k in ["org", "pol", "roles"] {
+                    for k in ["org", "pol", "roles", "assumed"] {
                         if want.get(k).is_some() {
                             assert_eq!(got[k], want[k], "{name}: {k}");
                         }
                     }
                     if let Some(org) = c["resource_org"].as_str() {
-                        assert_eq!(json!(claims.for_org(org).groups), c["groups_kept"], "{name}: groups_kept");
+                        let scoped = claims.clone().for_org(org);
+                        assert_eq!(json!(scoped.groups), c["groups_kept"], "{name}: groups_kept");
+                        if scoped.groups.is_empty() {
+                            assert!(scoped.roles.is_empty() && scoped.assumed.is_none(), "{name}: another org's roles");
+                        }
                     }
+                    assert_eq!(claims.principal().assumed, claims.assumed, "{name}");
                 }
                 (false, Err(_)) => {}
                 (true, Err(e)) => panic!("{name}: refused: {e}"),

@@ -54,7 +54,7 @@ def test_token_vectors(case):
         scoped = Verifier(VECTORS["issuer"], VECTORS["audience"], jwks=VECTORS["jwks"], leeway=VECTORS["leeway"], now=lambda: VECTORS["now"], org=case["resource_org"]).verify(case["token"])
         assert scoped.groups == case["groups_kept"]
         if not case["groups_kept"]:
-            assert scoped.roles == []
+            assert scoped.roles == [] and scoped.assumed is None
         assert scoped.sub == got.sub
 
 

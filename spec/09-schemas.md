@@ -346,9 +346,10 @@ policies in `examples/policy/` validate this way without changes.
 ## 9.10 Not covered, and open questions
 
 Not covered here:
-- **Object hierarchy and relationships.** A schema may declare `memberOfTypes` and
-  entity-typed attributes, but §4 has no way to supply an object's parents or
-  relationships. Until it does, `resource in Folder::"x"` validates and is never true.
+- **Object hierarchy and relationships in a schema.** §4.2.1 lets a request supply an
+  object's parents and related entities, and §4.2.2 its entity-typed attributes. This
+  chapter does not yet say how step 5 of §9.7 projects them against `memberOfTypes`
+  and the declared attribute types.
 - **Per-object grants** signed by an object's owner, for sharing across orgs.
 - **Conformance.** Planned: `test-vectors/schemas.json`, with bundles a builder must
   accept and reject, projections, decisions with their reasons, and audience slices.
@@ -361,7 +362,8 @@ Open questions:
    a decision before v1.
 2. **`Float`.** It is left out because its Cedar value depends on the number and on
    the JSON parser. `12.5` becomes a string. `12.0` stays an integer in JS and becomes
-   a string in Rust. Cedar's `decimal` type (four fractional digits) is the candidate.
+   a string in Rust. Cedar's `decimal` type (four fractional digits) is the candidate,
+   and §4.2.2 already lets a resource server send one.
 3. **Who owns a schema?** Today the admin quorum signs the whole root. An API team
    could sign the block for its own audience. That belongs with the audience registry
    (see the [roadmap](../docs/roadmap.md)).

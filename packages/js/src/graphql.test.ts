@@ -98,3 +98,14 @@ test("introspection is open by default and can require a principal", async () =>
   assert.equal((await run("{ __schema { queryType { name } } }")).errors, undefined);
 });
 
+
+test("client arguments cannot carry typed values (spec §4.2.2)", async () => {
+  const s = buildSchema("scalar JSON\ntype Query { doc(filter: JSON): String }");
+  s.getQueryType()!.getFields().doc.resolve = () => "secret";
+  const e = new Engine({ version: 1, policies: 'permit(principal, action == Action::"Query.doc", resource) when { context has filter && context.filter has owner && context.filter.owner == principal };' });
+  kithGraphQL(s, { engine: e });
+  const ada: Principal = { id: "did:kith:ada", attrs: {}, groups: [], roles: [] };
+  const filter = { owner: { __entity: { type: "User", id: "did:kith:ada" } } };
+  const r = await graphql({ schema: s, source: "query($f: JSON) { doc(filter: $f) }", variableValues: { f: filter }, contextValue: { kith: { principal: ada } } });
+  assert.equal(r.errors?.[0].extensions?.code, "FORBIDDEN", "an __entity from the client is not the principal");
+});

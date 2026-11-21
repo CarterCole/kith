@@ -210,6 +210,11 @@ impl Hub {
     /// any), from the configured policy org, if there is one. `Ok(None)`: no org
     /// configured, use the bundle file.
     pub(crate) fn org_memberships(&self, did: &str, device: Option<&str>, attrs: &serde_json::Map<String, Value>) -> ApiResult<Option<OrgMemberships>> {
+        self.org_memberships_assuming(did, device, attrs, None)
+    }
+
+    /// [`Self::org_memberships`] for a session that assumes `role` (spec §4.3.1).
+    pub(crate) fn org_memberships_assuming(&self, did: &str, device: Option<&str>, attrs: &serde_json::Map<String, Value>, role: Option<&str>) -> ApiResult<Option<OrgMemberships>> {
         let Some(org) = &self.cfg.policy_org else { return Ok(None) };
         let (_, head) = self.policy_head(org)?;
         let (slice, _) = pdag::prove(&self.orgs.blocks, &head.root, &Query::Principal { id: did.into() })?;
@@ -224,8 +229,13 @@ impl Hub {
         // The newest entry applied: the ones after `through` are in `revoked`, and the
         // chain's head is the newest of them (or `through` itself when there are none).
         let rev = self.orgs.latest(org).map_or(through, |e| e.seq.max(through));
+        let (memberships, max_age) = match role {
+            None => (engine.memberships_excluding(did, &attrs, &excluded)?, None),
+            Some(role) => (crate::assume_or_refuse(&engine, did, &attrs, &excluded, role)?, engine.assume_max_age(role)),
+        };
         Ok(Some(OrgMemberships {
-            memberships: engine.memberships_excluding(did, &attrs, &excluded)?,
+            memberships,
+            max_age,
             attrs,
             org: org.clone(),
             pol: PolicyRef { root: head.root, rev },
@@ -256,6 +266,8 @@ fn refuse_revoked(revoked: &[Revocation], did: &str, device: Option<&str>) -> Ap
 /// (the token's `org` and `pol` claims, spec §10.8).
 pub(crate) struct OrgMemberships {
     pub memberships: kith_core::authz::Memberships,
+    /// The assumed role's `max_age`, if one was assumed and it has one.
+    pub max_age: Option<u64>,
     pub attrs: serde_json::Map<String, Value>,
     pub org: String,
     pub pol: PolicyRef,

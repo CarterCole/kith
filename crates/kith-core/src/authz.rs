@@ -37,6 +37,49 @@ use crate::session::{caps_allow, Capability};
 use crate::{Error, Result};
 
 pub const MEMBER_ACTION: &str = "kith:member";
+/// The action an `assume` rule compiles to (spec §4.3.1).
+pub const ASSUME_ACTION: &str = "kith:assume";
+
+/// A member that may be left out but not written as `null`: `null` would otherwise read
+/// as "absent", and an `"assume": null` would quietly make a role not assumable while
+/// the other implementations refuse the bundle (spec §4.3.1).
+pub(crate) fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> std::result::Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
+/// Who may take on a role for a session, and for how long (spec §4.3.1). A role without
+/// this setting is never assumed, whoever asks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssumeDef {
+    /// Principal ids, `group:<name>` and `role:<name>`, as in a set's `members`.
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// A Cedar expression over `principal`, as in a set's `rule`.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub rule: Option<String>,
+    /// The longest an access token carrying the role may live, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub max_age: Option<u64>,
+}
+
+/// Why a session may not assume a role (spec §4.3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Refusal {
+    /// There is no such role, or it has no `assume` setting.
+    NotAssumable,
+    /// The role is assumable, but not by this principal now.
+    NotEligible,
+}
+
+impl Refusal {
+    pub fn code(self) -> &'static str {
+        match self {
+            Refusal::NotAssumable => "not_assumable",
+            Refusal::NotEligible => "not_eligible",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SetDef {
@@ -48,6 +91,10 @@ pub struct SetDef {
     /// Dynamic membership proposition (Cedar expression over `principal`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
+    /// Roles only: who may assume this role. A role with this setting is held only by
+    /// assuming it, so it has no `members` and no `rule`.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub assume: Option<AssumeDef>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -98,18 +145,56 @@ pub struct Principal {
     /// Present when an actor is exercising a delegation on the principal's behalf.
     pub actor: Option<String>,
     pub caps: Option<Vec<Capability>>,
+    /// The role this session assumed (spec §4.3.1). It is in `roles` as well.
+    pub assumed: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct Resource {
+/// A reference to an entity: a parent of a resource (spec §4.2.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityRef {
+    #[serde(rename = "type")]
     pub kind: String,
     pub id: String,
+}
+
+impl EntityRef {
+    pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
+        EntityRef { kind: kind.into(), id: id.into() }
+    }
+}
+
+/// An entity a request describes besides its principal and resource (spec §4.2.1): an
+/// ancestor of the resource, or something one of its attributes refers to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Entity {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
     pub attrs: Map<String, Value>,
+    #[serde(default)]
+    pub parents: Vec<EntityRef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Resource {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub attrs: Map<String, Value>,
+    /// What the resource is directly in. `resource in Folder::"x"` holds when `x` is a
+    /// parent, or is reached from one through `related`.
+    #[serde(default)]
+    pub parents: Vec<EntityRef>,
+    /// The other entities policies may walk to from this resource.
+    #[serde(default)]
+    pub related: Vec<Entity>,
 }
 
 impl Resource {
     pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
-        Resource { kind: kind.into(), id: id.into(), attrs: Map::new() }
+        Resource { kind: kind.into(), id: id.into(), attrs: Map::new(), parents: vec![], related: vec![] }
     }
     pub fn uid_string(&self) -> String {
         format!("{}::{}", self.kind, serde_json::to_string(&self.id).unwrap())
@@ -128,6 +213,7 @@ pub struct Engine {
     pub bundle: Bundle,
     policies: PolicySet,
     membership: PolicySet,
+    assume: PolicySet,
     authorizer: Authorizer,
 }
 
@@ -191,6 +277,41 @@ pub fn number_text(f: f64) -> String {
     }
 }
 
+/// A typed value (spec §4.2.2), in the form Cedar's JSON reads. A plain JSON string is
+/// always a `String`: an address, a time or a decimal has to say that it is one.
+pub mod typed {
+    use serde_json::{json, Value};
+
+    fn ext(f: &str, arg: &str) -> Value {
+        json!({"__extn": {"fn": f, "arg": arg}})
+    }
+    /// An IP address or CIDR range: `10.1.2.3`, `10.0.0.0/8`, `::1`.
+    pub fn ip(text: &str) -> Value {
+        ext("ip", text)
+    }
+    /// A decimal with at most four fractional digits: `12.50`.
+    pub fn decimal(text: &str) -> Value {
+        ext("decimal", text)
+    }
+    /// A date or an instant: `2030-01-01`, `2030-01-01T09:30:00Z`.
+    pub fn datetime(text: &str) -> Value {
+        ext("datetime", text)
+    }
+    /// A length of time: `1h30m`, `-2d`.
+    pub fn duration(text: &str) -> Value {
+        ext("duration", text)
+    }
+    /// A reference to another entity, such as a document's owner.
+    pub fn entity(kind: &str, id: &str) -> Value {
+        json!({"__entity": {"type": kind, "id": id}})
+    }
+}
+
+/// Entity types a request may not describe: the bundle and the engine supply these.
+fn reserved_type(kind: &str) -> bool {
+    matches!(kind, "Group" | "Role" | "Action") || kind.ends_with("::Action")
+}
+
 fn entity(kind: &str, id: &str, attrs: Value, parents: Vec<(&str, &str)>) -> Value {
     json!({
         "uid": {"type": kind, "id": id},
@@ -209,20 +330,33 @@ impl Engine {
     /// (`bundle.policies` is ignored). Used for policy DAG slices.
     pub fn with_policy_set(bundle: Bundle, policies: PolicySet) -> Result<Self> {
         let mut membership = PolicySet::new();
+        let mut assume = PolicySet::new();
+        let compile = |set: &mut PolicySet, id: String, action: &str, kind: &str, name: &str, rule: &str| -> Result<()> {
+            let src = format!("permit(principal, action == Action::\"{action}\", resource == {kind}::{}) when {{ {rule} }};", serde_json::to_string(name)?);
+            let p = Policy::parse(Some(PolicyId::new(&id)), src).map_err(|e| Error::Authz(format!("{kind} {name} rule: {e}")))?;
+            set.add(p).map_err(|e| Error::Authz(e.to_string()))
+        };
         for (kind, sets) in [("Group", &bundle.groups), ("Role", &bundle.roles)] {
             for (name, def) in sets {
                 if let Some(rule) = &def.rule {
-                    let id = format!("member:{kind}:{name}");
-                    let src = format!(
-                        "permit(principal, action == Action::\"{MEMBER_ACTION}\", resource == {kind}::{}) when {{ {rule} }};",
-                        serde_json::to_string(name)?
-                    );
-                    let p = Policy::parse(Some(PolicyId::new(&id)), src).map_err(|e| Error::Authz(format!("{kind} {name} rule: {e}")))?;
-                    membership.add(p).map_err(|e| Error::Authz(e.to_string()))?;
+                    compile(&mut membership, format!("member:{kind}:{name}"), MEMBER_ACTION, kind, name, rule)?;
+                }
+                let Some(a) = &def.assume else { continue };
+                if kind == "Group" {
+                    return Err(Error::Authz(format!("group {name}: only a role can be assumed")));
+                }
+                if !def.members.is_empty() || def.rule.is_some() {
+                    return Err(Error::Authz(format!("role {name} is assumable, so it is held only by assuming it: it has no members and no rule")));
+                }
+                if a.max_age == Some(0) {
+                    return Err(Error::Authz(format!("role {name}: max_age is a positive number of seconds")));
+                }
+                if let Some(rule) = &a.rule {
+                    compile(&mut assume, format!("assume:{name}"), ASSUME_ACTION, kind, name, rule)?;
                 }
             }
         }
-        Ok(Engine { bundle, policies, membership, authorizer: Authorizer::new() })
+        Ok(Engine { bundle, policies, membership, assume, authorizer: Authorizer::new() })
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
@@ -268,9 +402,15 @@ impl Engine {
     /// [`Self::memberships_excluding`], and for each set (`Group::x`, `Role::x`) the
     /// reason the principal is in it.
     pub fn explain_memberships(&self, id: &str, attrs: &Map<String, Value>, excluded: &BTreeSet<String>) -> Result<(Memberships, BTreeMap<String, Basis>)> {
+        self.fixpoint(id, attrs, excluded, None)
+    }
+
+    /// The §4.3 fixpoint. `seed` is an assumed role (§4.3.1): held from the start, so
+    /// every set that lists it or whose rule names it is computed with it.
+    fn fixpoint(&self, id: &str, attrs: &Map<String, Value>, excluded: &BTreeSet<String>, seed: Option<&str>) -> Result<(Memberships, BTreeMap<String, Basis>)> {
         let mut why = BTreeMap::new();
         let mut groups = BTreeSet::new();
-        let mut roles = BTreeSet::new();
+        let mut roles: BTreeSet<String> = seed.map(String::from).into_iter().collect();
         let limit = self.bundle.groups.len() + self.bundle.roles.len() + 1;
         for _ in 0..limit {
             let mut changed = false;
@@ -320,9 +460,47 @@ impl Engine {
         Ok((Memberships { groups: groups.into_iter().collect(), roles: roles.into_iter().collect() }, why))
     }
 
+    /// Memberships for a session that assumes `role` (spec §4.3.1): the standing ones,
+    /// with the sets in `excluded` revoked, plus the role. The role must have an
+    /// `assume` setting that the principal meets, and must not be in `excluded`.
+    pub fn assume(&self, id: &str, attrs: &Map<String, Value>, excluded: &BTreeSet<String>, role: &str) -> Result<std::result::Result<Memberships, Refusal>> {
+        let Some(a) = self.bundle.roles.get(role).and_then(|d| d.assume.as_ref()) else {
+            return Ok(Err(Refusal::NotAssumable));
+        };
+        let m = self.memberships_excluding(id, attrs, excluded)?;
+        if excluded.contains(&format!("Role::{role}")) {
+            return Ok(Err(Refusal::NotEligible));
+        }
+        let listed = a.members.iter().any(|x| {
+            x == id
+                || x.strip_prefix("group:").is_some_and(|g| m.groups.iter().any(|h| h == g))
+                || x.strip_prefix("role:").is_some_and(|r| m.roles.iter().any(|h| h == r))
+        });
+        let by_rule = !listed && a.rule.is_some() && {
+            let (groups, roles) = (m.groups.iter().cloned().collect(), m.roles.iter().cloned().collect());
+            let mut es = self.set_entities();
+            es.push(self.principal_entity(id, attrs, &groups, &roles));
+            let entities = Entities::from_json_value(Value::Array(es), None).map_err(|e| Error::Authz(format!("entities: {e}")))?;
+            let req = Request::new(uid("User", id)?, uid("Action", ASSUME_ACTION)?, uid("Role", role)?, Context::empty(), None).map_err(|e| Error::Authz(e.to_string()))?;
+            self.authorizer.is_authorized(&req, &self.assume, &entities).decision() == Decision::Allow
+        };
+        if !listed && !by_rule {
+            return Ok(Err(Refusal::NotEligible));
+        }
+        // Eligibility is decided on what the principal holds standing. What the session
+        // holds is computed again with the role in place, so a set that lists the role,
+        // and a forbid on that set, apply to it.
+        Ok(Ok(self.fixpoint(id, attrs, excluded, Some(role))?.0))
+    }
+
+    /// The longest an access token may carry `role` as assumed, if the role says.
+    pub fn assume_max_age(&self, role: &str) -> Option<u64> {
+        self.bundle.roles.get(role)?.assume.as_ref()?.max_age
+    }
+
     /// Evaluate `action` on `resource` for `principal`. Delegated principals must also
     /// hold a matching capability (attenuation): delegation can only narrow access.
-    pub fn authorize(&self, principal: &Principal, action: &str, resource: &Resource, context: &Value) -> Result<AuthzDecision> {
+    pub fn authorize<'a>(&self, principal: &'a Principal, action: &str, resource: &'a Resource, context: &Value) -> Result<AuthzDecision> {
         if let Some(caps) = &principal.caps {
             if !caps_allow(caps, action, &resource.uid_string()) {
                 return Ok(AuthzDecision { allowed: false, reasons: vec!["delegation:cap".into()], errors: vec![] });
@@ -332,7 +510,17 @@ impl Engine {
         let roles: BTreeSet<String> = principal.roles.iter().cloned().collect();
         let mut es = self.set_entities();
         es.push(self.principal_entity(&principal.id, &principal.attrs, &groups, &roles));
-        es.push(entity(&resource.kind, &resource.id, cedar_map(&resource.attrs), vec![]));
+        let refs = |ps: &'a [EntityRef]| ps.iter().map(|p| (p.kind.as_str(), p.id.as_str())).collect::<Vec<_>>();
+        es.push(entity(&resource.kind, &resource.id, cedar_map(&resource.attrs), refs(&resource.parents)));
+        // A related entity describes something new. It never restates the principal, the
+        // resource, a set or an action, whose parents decide who is in what.
+        let mut seen = BTreeSet::from([("User", principal.id.as_str()), (resource.kind.as_str(), resource.id.as_str())]);
+        for r in &resource.related {
+            if reserved_type(&r.kind) || !seen.insert((r.kind.as_str(), r.id.as_str())) {
+                return Ok(AuthzDecision { allowed: false, reasons: vec!["entities:conflict".into()], errors: vec![] });
+            }
+            es.push(entity(&r.kind, &r.id, cedar_map(&r.attrs), refs(&r.parents)));
+        }
         let entities = Entities::from_json_value(Value::Array(es), None).map_err(|e| Error::Authz(format!("entities: {e}")))?;
         let mut ctx = cedar_value(context).unwrap_or(json!({}));
         if !ctx.is_object() {
@@ -394,7 +582,7 @@ mod tests {
         let mut attrs = e.attributes(id, &Map::new());
         attrs.insert("aal".into(), json!(aal));
         let m = e.memberships(id, &attrs).unwrap();
-        Principal { id: id.into(), attrs, groups: m.groups, roles: m.roles, actor: None, caps: None }
+        Principal { id: id.into(), attrs, groups: m.groups, roles: m.roles, actor: None, caps: None, assumed: None }
     }
 
     #[test]
@@ -468,6 +656,7 @@ mod tests {
                 roles: m.roles,
                 actor: d["actor"].as_str().map(String::from),
                 caps: d.get("caps").map(|c| serde_json::from_value(c.clone()).unwrap()),
+                assumed: None,
             };
             let mut r = Resource::new(d["resource"]["type"].as_str().unwrap(), d["resource"]["id"].as_str().unwrap());
             if let Some(a) = d["resource"]["attrs"].as_object() {
@@ -476,6 +665,73 @@ mod tests {
             let got = e.authorize(&p, d["action"].as_str().unwrap(), &r, &d["context"]).unwrap();
             assert_eq!(got.allowed, d["allowed"].as_bool().unwrap(), "{}: {got:?}", d["name"]);
         }
+    }
+
+    /// §4.2.1 and §4.2.2: resource parents, related entities and typed values. A request
+    /// that cannot be built is an error here, which the vectors count as a denial.
+    #[test]
+    fn entity_vectors() {
+        let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
+        let v = &v["entities"];
+        let e = Engine::new(serde_json::from_value(v["bundle"].clone()).unwrap()).unwrap();
+        let mut failed = vec![];
+        for d in v["decisions"].as_array().unwrap() {
+            let id = d["principal"].as_str().unwrap();
+            let attrs = e.attributes(id, d["attrs"].as_object().unwrap());
+            let m = e.memberships(id, &attrs).unwrap();
+            let p = Principal { id: id.into(), attrs, groups: m.groups, roles: m.roles, actor: None, caps: None, assumed: None };
+            let got = match serde_json::from_value::<Resource>(d["resource"].clone()) {
+                Ok(r) => e.authorize(&p, d["action"].as_str().unwrap(), &r, &d["context"]).map(|d| d.allowed).unwrap_or(false),
+                Err(_) => false,
+            };
+            if got != d["allowed"].as_bool().unwrap() {
+                failed.push(d["name"].as_str().unwrap());
+            }
+        }
+        assert!(failed.is_empty(), "wrong decisions: {failed:#?}");
+    }
+
+    /// §4.3.1: who may assume which role, what the session then holds, and what it may do.
+    #[test]
+    fn assume_vectors() {
+        let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
+        let v = &v["assume"];
+        let e = Engine::new(serde_json::from_value(v["bundle"].clone()).unwrap()).unwrap();
+        for a in v["assumptions"].as_array().unwrap() {
+            let id = a["id"].as_str().unwrap();
+            let attrs = e.attributes(id, a["attrs"].as_object().unwrap());
+            let excluded: BTreeSet<String> = serde_json::from_value(a.get("excluded").cloned().unwrap_or(json!([]))).unwrap();
+            let got = e.assume(id, &attrs, &excluded, a["role"].as_str().unwrap()).unwrap();
+            let want = match a["refused"].as_str() {
+                Some(r) => json!({ "refused": r }),
+                None => json!({ "groups": a["groups"], "roles": a["roles"] }),
+            };
+            let got = match got {
+                Ok(m) => json!({ "groups": m.groups, "roles": m.roles }),
+                Err(r) => json!({ "refused": r.code() }),
+            };
+            assert_eq!(got, want, "{id} assumes {}", a["role"]);
+        }
+        for d in v["decisions"].as_array().unwrap() {
+            let id = d["principal"].as_str().unwrap();
+            let attrs = e.attributes(id, d["attrs"].as_object().unwrap());
+            let assumed = d["assume"].as_str().map(String::from);
+            let m = match &assumed {
+                Some(role) => e.assume(id, &attrs, &BTreeSet::new(), role).unwrap(),
+                None => Ok(e.memberships(id, &attrs).unwrap()),
+            };
+            let allowed = m.is_ok_and(|m| {
+                let p = Principal { id: id.into(), attrs, groups: m.groups, roles: m.roles, actor: None, caps: None, assumed };
+                let r: Resource = serde_json::from_value(d["resource"].clone()).unwrap();
+                e.authorize(&p, d["action"].as_str().unwrap(), &r, &d["context"]).unwrap().allowed
+            });
+            assert_eq!(allowed, d["allowed"].as_bool().unwrap(), "{}", d["name"]);
+        }
+        for b in v["invalid"].as_array().unwrap() {
+            let loaded = serde_json::from_value::<Bundle>(b["bundle"].clone()).map_err(Error::from).and_then(Engine::new);
+            assert!(loaded.is_err(), "loaded: {}", b["note"]);
+        }
+        assert_eq!(e.assume_max_age("break-glass"), Some(600));
     }
 
     #[test]

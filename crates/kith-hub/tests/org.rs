@@ -191,7 +191,7 @@ async fn publish_slice_issue_revoke() {
     assert_eq!(f.freshness(now()).level, Level::Fresh);
     let mut attrs = serde_json::Map::new();
     attrs.insert("aal".into(), json!(1));
-    let p = Principal { id: ada.did.clone(), attrs, groups: claims.groups.clone(), roles: claims.roles.clone(), actor: None, caps: None };
+    let p = Principal { id: ada.did.clone(), attrs, groups: claims.groups.clone(), roles: claims.roles.clone(), actor: None, caps: None, assumed: claims.assumed.clone() };
     let op = Resource::new("Operation", "Query.invoices");
     let req = revoke::Request { principal: &p, jti: None, device: None, action: "Query.invoices", resource: &op, context: &json!({}) };
     assert!(!revoke::authorize(&slice, &mut f, &req, now()).unwrap().allowed, "her old token's roles don't matter");

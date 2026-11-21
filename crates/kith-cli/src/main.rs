@@ -146,6 +146,10 @@ enum Cmd {
         /// Redeem a delegation token (you are the actor).
         #[arg(long)]
         delegation: Option<String>,
+        /// Assume a role for this token (spec §4.3.1). Only roles with an `assume`
+        /// setting can be assumed, and the token lasts no longer than its `max_age`.
+        #[arg(long, conflicts_with = "delegation")]
+        role: Option<String>,
         /// Print the access token.
         #[arg(long)]
         print: bool,
@@ -1089,8 +1093,12 @@ fn login(
     method: &str,
     totp_code: Option<String>,
     delegation: Option<String>,
+    role: Option<String>,
 ) -> Result<(String, String)> {
     let hub = home.hub()?;
+    if role.is_some() && method != "session" {
+        bail!("--role needs --method session");
+    }
     let aud = aud.unwrap_or_else(|| hub.clone());
     let resp = if let Some(dtok) = delegation {
         let sk = session(home)?;
@@ -1161,6 +1169,9 @@ fn login(
         if let Some(code) = totp_code {
             form.push(("totp", code));
         }
+        if let Some(role) = role {
+            form.push(("role", role));
+        }
         check(
             http()
                 .post(format!("{hub}/v1/oauth/token"))
@@ -1179,7 +1190,7 @@ fn cached_token(home: &mut Home, aud: Option<String>) -> Result<String> {
     if t["exp"].as_i64().unwrap_or(0) > now() + 30 {
         return Ok(t["access_token"].as_str().unwrap_or_default().into());
     }
-    Ok(login(home, Some(aud), "session", None, None)?.1)
+    Ok(login(home, Some(aud), "session", None, None, None)?.1)
 }
 
 fn bearer(home: &mut Home) -> Result<String> {
@@ -1816,9 +1827,10 @@ fn main() -> Result<()> {
             method,
             totp,
             delegation,
+            role,
             print: show,
         } => {
-            let (aud, tok) = login(&mut home, aud, &method, totp, delegation)?;
+            let (aud, tok) = login(&mut home, aud, &method, totp, delegation, role)?;
             let c = jws::decode(&tok)?.claims;
             eprintln!(
                 "logged in as {} for {aud} (aal {}, amr {}, groups {}, roles {})",
@@ -1828,6 +1840,9 @@ fn main() -> Result<()> {
                 c["groups"],
                 c["roles"]
             );
+            if let Some(r) = c["assumed"].as_str() {
+                eprintln!("assumed {r} until {}", c["exp"]);
+            }
             if show {
                 println!("{tok}");
             }

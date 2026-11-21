@@ -127,3 +127,41 @@ fn likely_mistakes_are_warnings() {
         assert!(has(&r.warnings, needle), "{needle}: {r:?}");
     }
 }
+
+/// Spec §4.3.1: an assumable role is a setting on the role, and nothing else may lean on it.
+#[test]
+fn assumable_roles_are_checked() {
+    let mut b = good();
+    b["roles"]["break-glass"] = serde_json::json!({"assume": {"members": ["role:god", ADA], "rule": "principal.aal >= 2", "max_age": 600}});
+    let r = check(&b.to_string());
+    assert!(r.ok() && r.warnings.is_empty(), "{r:?}");
+
+    let mut bad = b.clone();
+    bad["roles"]["break-glass"]["assume"]["ttl"] = serde_json::json!(60);
+    assert!(has(&errors(&bad.to_string()), "unknown member `ttl` in roles.break-glass.assume"));
+
+    let mut bad = b.clone();
+    bad["roles"]["break-glass"]["assume"]["members"] = serde_json::json!(["group:nobody"]);
+    assert!(has(&errors(&bad.to_string()), "there is no group `nobody`"));
+
+    // A set may lean on an assumable role: a session that assumes it is in the set too,
+    // so a forbid on the set applies to it.
+    let mut leaning = b.clone();
+    leaning["groups"]["audited"] = serde_json::json!({"members": ["role:break-glass"]});
+    leaning["groups"]["strong"]["rule"] = serde_json::json!("principal in Role::\"break-glass\"");
+    let r = check(&leaning.to_string());
+    assert!(r.ok() && r.warnings.is_empty(), "{r:?}");
+
+    let mut bad = b.clone();
+    bad["roles"]["break-glass"]["assume"] = serde_json::Value::Null;
+    assert!(!errors(&bad.to_string()).is_empty(), "assume: null is refused");
+
+    let mut bad = b.clone();
+    bad["roles"]["god"]["assume"] = serde_json::json!({"members": [ADA]});
+    assert!(has(&errors(&bad.to_string()), "held only by assuming it"), "god keeps its members, so it cannot also be assumable");
+
+    let mut empty = b.clone();
+    empty["roles"]["break-glass"]["assume"] = serde_json::json!({});
+    assert!(has(&check(&empty.to_string()).warnings, "role `break-glass` can be assumed by no one"));
+    assert!(!has(&check(&empty.to_string()).warnings, "`break-glass` has no members and no rule"), "an assumable role has none by design");
+}

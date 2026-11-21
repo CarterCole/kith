@@ -22,7 +22,7 @@ use cedar_policy::{ActionConstraint, Effect, EntityUid, Policy, PolicyId, Policy
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::authz::{cedar_value, Bundle, DirEntry, Engine, SetDef, MEMBER_ACTION};
+use crate::authz::{cedar_value, AssumeDef, Bundle, DirEntry, Engine, SetDef, MEMBER_ACTION};
 use crate::dag::{self, as_link, get_verified, link, map_build, map_get, put_value, BlockGet, BlockPut, Recording};
 use crate::{Error, Result};
 
@@ -53,6 +53,9 @@ pub struct SetEntry {
     pub members: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
+    /// Who may assume this role (spec §4.3.1). Absent on a set that is not assumable.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::authz::present")]
+    pub assume: Option<AssumeDef>,
     /// Sets this one's membership depends on (nested members and rule references).
     pub deps: Vec<String>,
     /// Sets whose membership depends on this one (the reverse of `deps`).
@@ -207,7 +210,16 @@ pub fn build(store: &dyn BlockPut, bundle: &Bundle) -> Result<String> {
             if let Some(rule) = &def.rule {
                 deps.extend(rule_refs(kind, name, rule)?);
             }
-            for m in def.members.iter().filter(|m| set_key(m).is_none()) {
+            // An assumable role depends on what decides who may assume it, and is a
+            // candidate for every principal its `assume` lists (spec §4.3.1, §8.3).
+            let assume_members = def.assume.iter().flat_map(|a| a.members.iter());
+            if let Some(a) = &def.assume {
+                deps.extend(a.members.iter().filter_map(|m| set_key(m)));
+                if let Some(rule) = &a.rule {
+                    deps.extend(rule_refs(kind, name, rule)?);
+                }
+            }
+            for m in def.members.iter().chain(assume_members).filter(|m| set_key(m).is_none()) {
                 members.entry(m.clone()).or_default().insert(key.clone());
             }
             sets.insert(
@@ -218,6 +230,7 @@ pub fn build(store: &dyn BlockPut, bundle: &Bundle) -> Result<String> {
                     description: def.description.clone(),
                     members: def.members.clone(),
                     rule: def.rule.clone(),
+                    assume: def.assume.clone(),
                     deps: deps.into_iter().collect(),
                     dependents: vec![],
                 },
@@ -242,7 +255,7 @@ pub fn build(store: &dyn BlockPut, bundle: &Bundle) -> Result<String> {
         .iter()
         .map(|(id, d)| (id.clone(), json!({ "attrs": cedar_value(&Value::Object(d.attrs.clone())).unwrap_or(json!({})) })))
         .collect();
-    let rules: Vec<String> = sets.values().filter(|s| s.rule.is_some()).map(SetEntry::key).collect();
+    let rules: Vec<String> = sets.values().filter(|s| s.rule.is_some() || s.assume.as_ref().is_some_and(|a| a.rule.is_some())).map(SetEntry::key).collect();
 
     let root = json!({
         "kith": DAG_VERSION,
@@ -376,7 +389,7 @@ impl Slice {
     pub fn bundle(&self) -> Bundle {
         let mut b = Bundle { version: self.version, directory: self.directory.clone(), ..Default::default() };
         for s in self.sets.values() {
-            let def = SetDef { description: s.description.clone(), members: s.members.clone(), rule: s.rule.clone() };
+            let def = SetDef { description: s.description.clone(), members: s.members.clone(), rule: s.rule.clone(), assume: s.assume.clone() };
             if s.kind == "Group" {
                 b.groups.insert(s.name.clone(), def);
             } else {
@@ -441,6 +454,7 @@ mod tests {
             roles: m.roles,
             actor: d["actor"].as_str().map(String::from),
             caps: d.get("caps").map(|c| serde_json::from_value(c.clone()).unwrap()),
+            assumed: None,
         };
         let mut r = Resource::new(d["resource"]["type"].as_str().unwrap(), d["resource"]["id"].as_str().unwrap());
         if let Some(a) = d["resource"]["attrs"].as_object() {
@@ -477,6 +491,37 @@ mod tests {
             assert_eq!(json!(got.groups), m["groups"], "{id}");
             assert_eq!(json!(got.roles), m["roles"], "{id}");
         }
+    }
+
+    /// §4.3.1 and §8.5: a principal's slice holds every role it may assume and decides
+    /// it as the full bundle does. A role the slice leaves out is one the full bundle
+    /// refuses too.
+    #[test]
+    fn slices_assume_like_the_full_bundle() {
+        let v = &vectors()["assume"];
+        let bundle: Bundle = serde_json::from_value(v["bundle"].clone()).unwrap();
+        let full = Engine::new(bundle.clone()).unwrap();
+        let store = MemStore::default();
+        let root = build(&store, &bundle).unwrap();
+        for a in v["assumptions"].as_array().unwrap() {
+            let id = a["id"].as_str().unwrap();
+            let role = a["role"].as_str().unwrap();
+            let excluded: BTreeSet<String> = serde_json::from_value(a.get("excluded").cloned().unwrap_or(json!([]))).unwrap();
+            let slice = load(&store, &root, &Query::Principal { id: id.into() }).unwrap();
+            let e = slice.engine().unwrap();
+            let attrs = |e: &Engine| e.attributes(id, a["attrs"].as_object().unwrap());
+            let want = full.assume(id, &attrs(&full), &excluded, role).unwrap();
+            if slice.sets.contains_key(&format!("Role::{role}")) {
+                assert_eq!(e.assume(id, &attrs(&e), &excluded, role).unwrap(), want, "{id} assumes {role}");
+            } else {
+                assert!(want.is_err(), "{id}'s slice leaves out {role}, which {id} may assume");
+            }
+        }
+        let eve = load(&store, &root, &Query::Principal { id: "did:kith:eve".into() }).unwrap();
+        assert!(eve.sets.contains_key("Role::break-glass"), "a rule can let anyone assume it");
+        assert!(!eve.sets.contains_key("Role::auditor"), "eve is listed nowhere in auditor's assume");
+        let bob = load(&store, &root, &Query::Principal { id: "did:kith:bob".into() }).unwrap();
+        assert!(bob.policy_ids().contains(&"audit"), "bob's slice has the policies of a role he may assume");
     }
 
     #[test]

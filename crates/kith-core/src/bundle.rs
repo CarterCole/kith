@@ -45,7 +45,8 @@ const BUNDLE_KEYS: &[&str] = &[
     "attributes",
     "schemas",
 ];
-const SET_KEYS: &[&str] = &["description", "members", "rule"];
+const SET_KEYS: &[&str] = &["description", "members", "rule", "assume"];
+const ASSUME_KEYS: &[&str] = &["members", "rule", "max_age"];
 const DIRECTORY_KEYS: &[&str] = &["attrs"];
 
 /// Check the text of a bundle file.
@@ -77,6 +78,9 @@ pub fn check(text: &str) -> Report {
         {
             if let Some(def) = def.as_object() {
                 unknown_keys(&mut r, def, SET_KEYS, &format!("{kind}.{name}"));
+                if let Some(a) = def.get("assume").and_then(Value::as_object) {
+                    unknown_keys(&mut r, a, ASSUME_KEYS, &format!("{kind}.{name}.assume"));
+                }
             }
         }
     }
@@ -109,8 +113,18 @@ pub fn check(text: &str) -> Report {
     for (singular, sets) in [("group", &bundle.groups), ("role", &bundle.roles)] {
         for (name, def) in sets {
             let at = format!("{singular} `{name}`");
+            if let Some(a) = &def.assume {
+                if a.members.is_empty() && a.rule.is_none() {
+                    r.warnings.push(format!("{at} can be assumed by no one: its `assume` has no members and no rule"));
+                }
+                if let Some(rule) = &a.rule {
+                    for missing in undefined_sets(rule, &bundle) {
+                        r.warnings.push(format!("{at}'s assume rule names {missing}, which is not defined"));
+                    }
+                }
+            }
             let mut seen = BTreeSet::new();
-            for m in &def.members {
+            for m in def.members.iter().chain(def.assume.iter().flat_map(|a| a.members.iter())) {
                 if !seen.insert(m) {
                     r.warnings.push(format!("{at} lists `{m}` twice"));
                 }
@@ -131,7 +145,7 @@ pub fn check(text: &str) -> Report {
                 }
             }
             match &def.rule {
-                None if def.members.is_empty() => {
+                None if def.members.is_empty() && def.assume.is_none() => {
                     r.warnings.push(format!("{at} has no members and no rule"))
                 }
                 Some(rule) => {
@@ -167,6 +181,17 @@ fn unknown_keys(r: &mut Report, obj: &serde_json::Map<String, Value>, known: &[&
 fn undefined_sets(src: &str, bundle: &Bundle) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for (kind, sets) in [("Group", &bundle.groups), ("Role", &bundle.roles)] {
+        for name in named_sets(src, kind).into_iter().filter(|n| !sets.contains_key(n)) {
+            out.insert(format!("{kind}::{}", serde_json::to_string(&name).unwrap_or_default()));
+        }
+    }
+    out
+}
+
+/// The names in every `<kind>::"name"` in Cedar source.
+fn named_sets(src: &str, kind: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    {
         let opener = format!("{kind}::\"");
         let mut rest = src;
         while let Some(at) = rest.find(&opener) {
@@ -189,12 +214,7 @@ fn undefined_sets(src: &str, bundle: &Bundle) -> BTreeSet<String> {
                 }
             }
             rest = &rest[end..];
-            if !sets.contains_key(&name) {
-                out.insert(format!(
-                    "{kind}::{}",
-                    serde_json::to_string(&name).unwrap_or_default()
-                ));
-            }
+            out.insert(name);
         }
     }
     out

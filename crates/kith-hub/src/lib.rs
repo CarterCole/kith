@@ -77,7 +77,7 @@ use axum::{Form, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use kith_core::authz::{Bundle, Engine, Memberships};
+use kith_core::authz::{Bundle, Engine, Memberships, Refusal};
 use kith_core::kel::{extends, verify_log, DeviceKind, Event, KeyState};
 use kith_core::keys::{verify_sig, PublicKey, Sig, VerifyOptions};
 use kith_core::session::{self, Capability, KelResolver};
@@ -911,6 +911,19 @@ impl Hub {
         audience: &str,
         delegation: Option<(String, Vec<Capability>)>,
     ) -> ApiResult<AccessClaims> {
+        self.access_claims_assuming(a, audience, delegation, None)
+    }
+
+    /// [`Self::access_claims`] for a session that assumes `role` (spec §4.3.1). The
+    /// token carries the role in `roles` and in `assumed`, and lives no longer than the
+    /// role's `max_age`.
+    pub fn access_claims_assuming(
+        &self,
+        a: &Authn,
+        audience: &str,
+        delegation: Option<(String, Vec<Capability>)>,
+        role: Option<&str>,
+    ) -> ApiResult<AccessClaims> {
         let mut kel_attrs = Map::new();
         kel_attrs.insert("aliases".into(), json!(a.st.aliases));
         kel_attrs.insert("aal".into(), json!(a.aal));
@@ -922,16 +935,22 @@ impl Hub {
         // Memberships from an org carry its name and the root they came from (spec §10.8).
         // Memberships from the bundle file carry nothing: they have no provenance.
         let resolve = |kel_attrs: &Map<String, Value>| -> ApiResult<_> {
-            Ok(match self.org_memberships(&a.st.did, a.dev.as_deref(), kel_attrs)? {
-                Some(found) => (found.memberships, found.attrs, Some((found.org, found.pol))),
+            Ok(match self.org_memberships_assuming(&a.st.did, a.dev.as_deref(), kel_attrs, role)? {
+                Some(found) => (found.memberships, found.attrs, Some((found.org, found.pol)), found.max_age),
                 None => {
                     let engine = self.engine()?;
                     let attrs = engine.attributes(&a.st.did, kel_attrs);
-                    (engine.memberships(&a.st.did, &attrs)?, attrs, None)
+                    match role {
+                        None => (engine.memberships(&a.st.did, &attrs)?, attrs, None, None),
+                        Some(role) => {
+                            let m = assume_or_refuse(&engine, &a.st.did, &attrs, &Default::default(), role)?;
+                            (m, attrs, None, engine.assume_max_age(role))
+                        }
+                    }
                 }
             })
         };
-        let (mut m, mut attrs, mut provenance) = resolve(&kel_attrs)?;
+        let (mut m, mut attrs, mut provenance, mut max_age) = resolve(&kel_attrs)?;
         // Upstream attributes only fill gaps: they never replace what the directory
         // or the KEL says. Group rules see them, so memberships are worked out again.
         let extra: Vec<_> = a
@@ -941,7 +960,7 @@ impl Hub {
             .collect();
         if !extra.is_empty() {
             kel_attrs.extend(extra.into_iter().map(|(k, v)| (k.clone(), v.clone())));
-            (m, attrs, provenance) = resolve(&kel_attrs)?;
+            (m, attrs, provenance, max_age) = resolve(&kel_attrs)?;
         }
         let iat = now();
         let (act, cap) = match delegation {
@@ -959,7 +978,7 @@ impl Hub {
             sub: a.st.did.clone(),
             aud: audience.into(),
             iat,
-            exp: iat + TOKEN_TTL,
+            exp: iat + max_age.map_or(TOKEN_TTL, |s| TOKEN_TTL.min(i64::try_from(s).unwrap_or(i64::MAX))),
             jti: random_id(),
             client_id: None,
             scope: None,
@@ -967,6 +986,7 @@ impl Hub {
             pol: provenance.map(|(_, pol)| pol),
             groups: m.groups,
             roles: m.roles,
+            assumed: role.map(String::from),
             attrs,
             aal: a.aal,
             amr: a.amr.clone(),
@@ -982,7 +1002,7 @@ impl Hub {
             "access_token": self.signer.issue(claims)?,
             "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "token_type": "Bearer",
-            "expires_in": TOKEN_TTL,
+            "expires_in": claims.exp.saturating_sub(claims.iat),
         }))
     }
 
@@ -994,6 +1014,11 @@ impl Hub {
         delegation: Option<(String, Vec<Capability>)>,
     ) -> ApiResult<Value> {
         self.token_response(&self.access_claims(a, audience, delegation)?)
+    }
+
+    /// Mint an access token for a session that assumes `role` (spec §4.3.1).
+    pub fn issue_assuming(&self, a: &Authn, audience: &str, role: &str) -> ApiResult<Value> {
+        self.token_response(&self.access_claims_assuming(a, audience, None, Some(role))?)
     }
 
     pub(crate) fn bearer_any(&self, headers: &HeaderMap) -> ApiResult<AccessClaims> {
@@ -1151,6 +1176,8 @@ pub struct TokenReq {
     pub audience: Option<String>,
     /// Kith extension: TOTP step-up alongside a session chain.
     pub totp: Option<String>,
+    /// Kith extension: a role to assume for this session (spec §4.3.1).
+    pub role: Option<String>,
     // authorization_code / refresh_token
     pub code: Option<String>,
     pub redirect_uri: Option<String>,
@@ -1180,6 +1207,24 @@ async fn token(
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(r)
+}
+
+/// Memberships for a session that assumes `role` (spec §4.3.1), or a 403 that says why
+/// it may not.
+pub(crate) fn assume_or_refuse(
+    engine: &kith_core::authz::Engine,
+    did: &str,
+    attrs: &Map<String, Value>,
+    excluded: &std::collections::BTreeSet<String>,
+    role: &str,
+) -> ApiResult<Memberships> {
+    engine.assume(did, attrs, excluded, role)?.map_err(|r| {
+        let msg = match r {
+            Refusal::NotAssumable => format!("role {role} cannot be assumed"),
+            Refusal::NotEligible => format!("you may not assume role {role}"),
+        };
+        ApiError(StatusCode::FORBIDDEN, "access_denied".into(), msg, Some(json!({ "refusal": r.code() })))
+    })
 }
 
 fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
@@ -1216,9 +1261,15 @@ fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
                 a.amr.push("mfa".into());
                 a.aal = a.aal.max(2);
             }
-            h.issue(&a, &audience, None)
+            match req.role.as_deref() {
+                None => h.issue(&a, &audience, None),
+                Some(role) => h.issue_assuming(&a, &audience, role),
+            }
         }
         TT_DELEGATION => {
+            if req.role.is_some() {
+                return Err(ApiError::bad("invalid_request", "a delegated session cannot assume a role"));
+            }
             let actor_token = req.actor_token.as_deref().ok_or_else(|| ApiError::bad("invalid_request", "delegation requires actor_token"))?;
             let actor = session::verify_session_token(actor_token, &h.cfg.issuer, h, t).map_err(ApiError::unauthorized)?;
             h.check_jti(actor.claims["jti"].as_str().unwrap_or_default(), actor.claims["exp"].as_i64().unwrap_or(t))?;
