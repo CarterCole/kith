@@ -299,8 +299,11 @@ export function authorize(slice: Slice, follower: Follower, req: Request, now: n
   const attrs = engine.attributes(req.principal.id, req.principal.attrs);
   const excluded = follower.excludedSets(req.principal.id);
   // A session that assumed a role (spec §4.3.1) must still be able to assume it. A role
-  // the slice does not hold is named by none of its policies, and is left out.
-  const assumed = req.principal.assumed !== undefined && Object.hasOwn(engine.bundle.roles ?? {}, req.principal.assumed) ? req.principal.assumed : undefined;
+  // the slice does not hold cannot be checked: it is left out here and added for the
+  // check below, where it can only take access away.
+  const claimed = req.principal.assumed;
+  const assumed = claimed !== undefined && Object.hasOwn(engine.bundle.roles ?? {}, claimed) ? claimed : undefined;
+  const unchecked = claimed !== undefined && assumed === undefined;
   let m: { groups: string[]; roles: string[] };
   if (assumed === undefined) m = engine.memberships(req.principal.id, attrs, excluded);
   else {
@@ -311,12 +314,17 @@ export function authorize(slice: Slice, follower: Follower, req: Request, now: n
   const kith = { sync_age: f.age ?? Number.MAX_SAFE_INTEGER, degraded: f.level !== "fresh", revocation_seq: f.seq };
   const context = { ...(req.context ?? {}), kith };
   const reduced = engine.authorize({ ...req.principal, attrs, groups: m.groups, roles: m.roles }, req.action, req.resource, context);
-  if (excluded.size === 0 || !reduced.allowed) return reduced;
+  if ((excluded.size === 0 && !unchecked) || !reduced.allowed) return reduced;
   // A forbid or an `unless` may name an excluded set, and dropping the membership would
   // turn it off. Revocations only ever remove access (spec §8.7), so the answer must
-  // also be allowed with every membership in place.
-  const all = engine.memberships(req.principal.id, attrs);
-  if (assumed !== undefined) all.roles.push(assumed);
+  // also be allowed with every membership in place, and with the claimed role: a forbid
+  // may reach it through an entity reference, which a slice's filing cannot see (§8.4).
+  let all = engine.memberships(req.principal.id, attrs);
+  if (assumed !== undefined) {
+    const got = engine.assume(req.principal.id, attrs, new Set(), assumed);
+    if (!("refused" in got)) all = got;
+  }
+  if (claimed !== undefined && !all.roles.includes(claimed)) all = { ...all, roles: [...all.roles, claimed].sort() };
   const full = engine.authorize({ ...req.principal, attrs, groups: all.groups, roles: all.roles }, req.action, req.resource, context);
   return full.allowed ? reduced : { ...full, allowed: false };
 }

@@ -228,23 +228,22 @@ class Engine:
                 self._membership[(kind, name)] = cedarpy.PolicySet.from_str(src)
         for kind, sets in (("Group", self.groups), ("Role", self.roles)):
             for name, d in sets.items():
-                a = d.get("assume")
-                if a is None:
+                if "assume" not in d:
                     continue
+                a = d["assume"]
                 if kind == "Group":
                     raise ValueError(f"group {name}: only a role can be assumed")
                 if d.get("members") or d.get("rule") is not None:
                     raise ValueError(f"role {name} is assumable, so it is held only by assuming it: it has no members and no rule")
                 if not isinstance(a, Mapping):
-                    raise ValueError(f"role {name}: assume is an object")
+                    raise ValueError(f"role {name}: assume is an object, not {a!r}")
                 members = a.get("members", [])
                 if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
                     raise ValueError(f"role {name}: assume.members is a list of strings")
-                max_age = a.get("max_age")
-                if max_age is not None and not (type(max_age) is int and max_age > 0):
+                if "max_age" in a and not (type(a["max_age"]) is int and a["max_age"] > 0):
                     raise ValueError(f"role {name}: max_age is a positive number of seconds")
-                rule = a.get("rule")
-                if rule is not None:
+                if "rule" in a:
+                    rule = a["rule"]
                     if not isinstance(rule, str):
                         raise ValueError(f"role {name}: assume.rule is a string")
                     src = f'permit(principal, action == Action::"{ASSUME_ACTION}", resource == {_uid("Role", name)}) when {{ {rule} }};'
@@ -272,9 +271,12 @@ class Engine:
         """Compute explicit + nested + dynamic membership (fixpoint). Sets in ``excluded``
         (``Group::x``, ``Role::x``, from revocations) never join, so neither do sets that
         depended on them."""
-        excluded = set(excluded)
+        return self._fixpoint(id, attrs, set(excluded), None)
+
+    def _fixpoint(self, id: str, attrs: Mapping[str, Any], excluded: set[str], seed: str | None) -> tuple[list[str], list[str]]:
+        """The §4.3 fixpoint. ``seed`` is an assumed role (§4.3.1), held from the start."""
         groups: set[str] = set()
-        roles: set[str] = set()
+        roles: set[str] = {seed} if seed is not None else set()
         for _ in range(len(self.groups) + len(self.roles) + 1):
             changed = False
             entities = self._set_entities() + [self._principal_entity(id, attrs, sorted(groups), sorted(roles))]
@@ -328,7 +330,9 @@ class Engine:
             listed = bool(r.allowed)
         if not listed:
             return "not_eligible"
-        return groups, sorted(roles + [role])
+        # Eligibility is decided on what the principal holds standing; the session is then
+        # computed with the role in place, so a forbid on a set that lists it applies.
+        return self._fixpoint(id, attrs, excluded, role)
 
     def assume_max_age(self, role: str) -> int | None:
         """The longest an access token may carry ``role`` as assumed, if the role says."""

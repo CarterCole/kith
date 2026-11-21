@@ -110,18 +110,9 @@ pub fn check(text: &str) -> Report {
     if let Err(e) = Engine::new(bundle.clone()) {
         r.errors.push(e.to_string());
     }
-    let assumable: BTreeSet<&String> = bundle.roles.iter().filter(|(_, d)| d.assume.is_some()).map(|(n, _)| n).collect();
     for (singular, sets) in [("group", &bundle.groups), ("role", &bundle.roles)] {
         for (name, def) in sets {
             let at = format!("{singular} `{name}`");
-            for m in &def.members {
-                if m.strip_prefix("role:").is_some_and(|x| assumable.contains(&x.to_string())) {
-                    r.errors.push(format!("{at} lists `{m}`, which is held only by assuming it"));
-                }
-            }
-            for x in def.rule.iter().flat_map(|rule| named_sets(rule, "Role")).filter(|x| assumable.contains(x)) {
-                r.errors.push(format!("{at}'s rule names Role::{}, which is held only by assuming it", serde_json::to_string(&x).unwrap_or_default()));
-            }
             if let Some(a) = &def.assume {
                 if a.members.is_empty() && a.rule.is_none() {
                     r.warnings.push(format!("{at} can be assumed by no one: its `assume` has no members and no rule"));

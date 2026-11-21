@@ -144,13 +144,17 @@ fn assumable_roles_are_checked() {
     bad["roles"]["break-glass"]["assume"]["members"] = serde_json::json!(["group:nobody"]);
     assert!(has(&errors(&bad.to_string()), "there is no group `nobody`"));
 
-    let mut bad = b.clone();
-    bad["roles"]["hub-admin"]["members"] = serde_json::json!(["role:break-glass"]);
-    assert!(has(&errors(&bad.to_string()), "role `hub-admin` lists `role:break-glass`, which is held only by assuming it"));
+    // A set may lean on an assumable role: a session that assumes it is in the set too,
+    // so a forbid on the set applies to it.
+    let mut leaning = b.clone();
+    leaning["groups"]["audited"] = serde_json::json!({"members": ["role:break-glass"]});
+    leaning["groups"]["strong"]["rule"] = serde_json::json!("principal in Role::\"break-glass\"");
+    let r = check(&leaning.to_string());
+    assert!(r.ok() && r.warnings.is_empty(), "{r:?}");
 
     let mut bad = b.clone();
-    bad["groups"]["strong"]["rule"] = serde_json::json!("principal in Role::\"break-glass\"");
-    assert!(has(&errors(&bad.to_string()), "group `strong`'s rule names Role::\"break-glass\", which is held only by assuming it"));
+    bad["roles"]["break-glass"]["assume"] = serde_json::Value::Null;
+    assert!(!errors(&bad.to_string()).is_empty(), "assume: null is refused");
 
     let mut bad = b.clone();
     bad["roles"]["god"]["assume"] = serde_json::json!({"members": [ADA]});

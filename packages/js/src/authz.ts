@@ -171,7 +171,8 @@ export class Engine {
     for (const [kind, sets] of [["Group", bundle.groups], ["Role", bundle.roles]] as const) {
       for (const [name, def] of Object.entries(sets ?? {})) {
         const a = def.assume;
-        if (a === undefined || a === null) continue;
+        if (a === undefined) continue;
+        if (a === null) throw new Error(`${kind.toLowerCase()} ${name}: assume is an object, not null`);
         if (kind === "Group") throw new Error(`group ${name}: only a role can be assumed`);
         if ((def.members ?? []).length > 0 || def.rule !== undefined) {
           throw new Error(`role ${name} is assumable, so it is held only by assuming it: it has no members and no rule`);
@@ -221,8 +222,13 @@ export class Engine {
    * sets that depended on them.
    */
   memberships(id: string, attrs: Record<string, unknown>, excluded: Set<string> = new Set()): { groups: string[]; roles: string[] } {
+    return this.fixpoint(id, attrs, excluded);
+  }
+
+  /** The §4.3 fixpoint. `seed` is an assumed role (§4.3.1), held from the start. */
+  private fixpoint(id: string, attrs: Record<string, unknown>, excluded: Set<string>, seed?: string): { groups: string[]; roles: string[] } {
     const groups = new Set<string>();
-    const roles = new Set<string>();
+    const roles = new Set<string>(seed === undefined ? [] : [seed]);
     const defs = [["Group", this.bundle.groups ?? {}, groups], ["Role", this.bundle.roles ?? {}, roles]] as const;
     const limit = Object.keys(this.bundle.groups ?? {}).length + Object.keys(this.bundle.roles ?? {}).length + 1;
     for (let i = 0; i < limit; i++) {
@@ -284,7 +290,9 @@ export class Engine {
       byRule = r.type === "success" && r.response.decision === "allow";
     }
     if (!listed && !byRule) return { refused: "not_eligible" };
-    return { groups: m.groups, roles: [...m.roles, role].sort() };
+    // Eligibility is decided on what the principal holds standing; the session is then
+    // computed with the role in place, so a forbid on a set that lists it applies.
+    return this.fixpoint(id, attrs, excluded, role);
   }
 
   /** The longest an access token may carry `role` as assumed, if the role says. */

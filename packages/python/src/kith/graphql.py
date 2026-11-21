@@ -47,6 +47,17 @@ def default_to_resource(type_name: str, obj: Any) -> Resource:
     return Resource(type_name, str(src.get("id", "?")), attrs)
 
 
+def client_args(v: Any) -> Any:
+    """Client arguments with every key that starts with ``__`` removed, at any depth. Those
+    keys spell typed values (``__entity``, ``__extn``, spec §4.2.2), which only the server
+    may make."""
+    if isinstance(v, (list, tuple)):
+        return [client_args(x) for x in v]
+    if isinstance(v, dict):
+        return {k: client_args(x) for k, x in v.items() if not str(k).startswith("__")}
+    return v
+
+
 def _forbidden(action: str) -> GraphQLError:
     return GraphQLError(f"Not authorized: {action}", extensions={"code": "FORBIDDEN", "action": action})
 
@@ -111,7 +122,7 @@ class KithMiddleware:
         if check_field:
             action = (directive or {}).get("action") or key
             resource = Resource("Operation", key) if is_root else self.to_resource(parent.name, root)
-            if not self._check(principal, action, resource, {**args, "operationType": op, "field": key}):
+            if not self._check(principal, action, resource, {**client_args(args), "operationType": op, "field": key}):
                 return self._deny(action)
 
         result = next_(root, info, **args)

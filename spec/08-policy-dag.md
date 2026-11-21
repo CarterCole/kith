@@ -296,10 +296,12 @@ condition that errors on a missing `kith` skips the forbid, which fails *open*.
    excluded (§4.3, where an excluded set never joins). If the token has `assumed` and
    the slice holds that role, assume it again (§4.3.1) with the same exclusions, and
    deny with `assume:<refusal>` if that is refused. If the slice does not hold the role,
-   none of its policies names it: leave it out and decide on the rest.
+   it cannot be checked: leave it out, and add it back for step 6. A policy can reach a
+   role through an entity reference (`principal in resource.blockedRole`), which
+   filing (§8.4) cannot see, so leaving it out alone could turn off a forbid.
 5. Evaluate with `context.kith` set.
-6. If step 4 excluded anything and the answer is allow, evaluate again with every
-   membership in place, and the assumed role if step 4 kept it. Allow only if that is allowed too. Without this, excluding Ada
+6. If step 4 excluded anything or left out an assumed role, and the answer is allow,
+   evaluate again with every membership in place and the token's assumed role added. Allow only if that is allowed too. Without this, excluding Ada
    from `Group::suspended` would turn off `forbid(principal in Group::"suspended", …)`
    for her.
 

@@ -40,6 +40,13 @@ pub const MEMBER_ACTION: &str = "kith:member";
 /// The action an `assume` rule compiles to (spec §4.3.1).
 pub const ASSUME_ACTION: &str = "kith:assume";
 
+/// A member that may be left out but not written as `null`: `null` would otherwise read
+/// as "absent", and an `"assume": null` would quietly make a role not assumable while
+/// the other implementations refuse the bundle (spec §4.3.1).
+pub(crate) fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> std::result::Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
 /// Who may take on a role for a session, and for how long (spec §4.3.1). A role without
 /// this setting is never assumed, whoever asks.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,10 +55,10 @@ pub struct AssumeDef {
     #[serde(default)]
     pub members: Vec<String>,
     /// A Cedar expression over `principal`, as in a set's `rule`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub rule: Option<String>,
     /// The longest an access token carrying the role may live, in seconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub max_age: Option<u64>,
 }
 
@@ -86,7 +93,7 @@ pub struct SetDef {
     pub rule: Option<String>,
     /// Roles only: who may assume this role. A role with this setting is held only by
     /// assuming it, so it has no `members` and no `rule`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub assume: Option<AssumeDef>,
 }
 
@@ -395,9 +402,15 @@ impl Engine {
     /// [`Self::memberships_excluding`], and for each set (`Group::x`, `Role::x`) the
     /// reason the principal is in it.
     pub fn explain_memberships(&self, id: &str, attrs: &Map<String, Value>, excluded: &BTreeSet<String>) -> Result<(Memberships, BTreeMap<String, Basis>)> {
+        self.fixpoint(id, attrs, excluded, None)
+    }
+
+    /// The §4.3 fixpoint. `seed` is an assumed role (§4.3.1): held from the start, so
+    /// every set that lists it or whose rule names it is computed with it.
+    fn fixpoint(&self, id: &str, attrs: &Map<String, Value>, excluded: &BTreeSet<String>, seed: Option<&str>) -> Result<(Memberships, BTreeMap<String, Basis>)> {
         let mut why = BTreeMap::new();
         let mut groups = BTreeSet::new();
-        let mut roles = BTreeSet::new();
+        let mut roles: BTreeSet<String> = seed.map(String::from).into_iter().collect();
         let limit = self.bundle.groups.len() + self.bundle.roles.len() + 1;
         for _ in 0..limit {
             let mut changed = false;
@@ -454,7 +467,7 @@ impl Engine {
         let Some(a) = self.bundle.roles.get(role).and_then(|d| d.assume.as_ref()) else {
             return Ok(Err(Refusal::NotAssumable));
         };
-        let mut m = self.memberships_excluding(id, attrs, excluded)?;
+        let m = self.memberships_excluding(id, attrs, excluded)?;
         if excluded.contains(&format!("Role::{role}")) {
             return Ok(Err(Refusal::NotEligible));
         }
@@ -474,9 +487,10 @@ impl Engine {
         if !listed && !by_rule {
             return Ok(Err(Refusal::NotEligible));
         }
-        m.roles.push(role.to_string());
-        m.roles.sort();
-        Ok(Ok(m))
+        // Eligibility is decided on what the principal holds standing. What the session
+        // holds is computed again with the role in place, so a set that lists the role,
+        // and a forbid on that set, apply to it.
+        Ok(Ok(self.fixpoint(id, attrs, excluded, Some(role))?.0))
     }
 
     /// The longest an access token may carry `role` as assumed, if the role says.

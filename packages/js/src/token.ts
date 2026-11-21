@@ -112,7 +112,7 @@ export function createVerifier(opts: VerifierOptions) {
           throw new Error('"pol" must be {root, rev}');
         }
       }
-      if (payload.assumed !== undefined) {
+      if ("assumed" in payload) {
         const roles = payload.roles;
         if (typeof payload.assumed !== "string" || !payload.assumed || !Array.isArray(roles) || !roles.includes(payload.assumed)) {
           throw new Error('"assumed" must be one of "roles"');

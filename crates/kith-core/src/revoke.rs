@@ -394,9 +394,12 @@ pub struct Request<'a> {
 ///    can't turn off a forbid that names the set;
 ///    A session that assumed a role (spec §4.3.1) must still be able to assume it,
 ///    with the same exclusions; otherwise it is denied with `assume:<refusal>`. A role
-///    the slice does not hold is named by none of its policies, and is left out;
+///    the slice does not hold cannot be checked, so it is left out of the decision and
+///    added for the check in step 6, where it can only take access away;
 /// 4. revoked permit policies are dropped;
-/// 5. policies see `context.kith = {sync_age, degraded, revocation_seq}`.
+/// 5. policies see `context.kith = {sync_age, degraded, revocation_seq}`;
+/// 6. if anything was excluded, or an assumed role was left out, the request must also
+///    be allowed with every membership and the claimed role in place.
 pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64) -> Result<AuthzDecision> {
     let Request { principal, jti, device, action, resource, context } = *req;
     let deny = |why: &str| Ok(AuthzDecision { allowed: false, reasons: vec![why.to_string()], errors: vec![] });
@@ -419,8 +422,9 @@ pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64
     let engine = slice.engine_without(&follower.revoked_policies())?;
     let attrs = engine.attributes(&principal.id, &principal.attrs);
     let excluded = follower.excluded_sets(&principal.id);
-    let assumed = principal.assumed.as_ref().filter(|r| engine.bundle.roles.contains_key(*r));
-    let m = match assumed {
+    let held = principal.assumed.as_ref().filter(|r| engine.bundle.roles.contains_key(*r));
+    let unchecked = principal.assumed.is_some() && held.is_none();
+    let m = match held {
         None => engine.memberships_excluding(&principal.id, &attrs, &excluded)?,
         Some(role) => match engine.assume(&principal.id, &attrs, &excluded, role)? {
             Ok(m) => m,
@@ -435,14 +439,21 @@ pub fn authorize(slice: &Slice, follower: &mut Follower, req: &Request, now: i64
     let ctx = Value::Object(ctx);
     let p = Principal { attrs: attrs.clone(), groups: m.groups, roles: m.roles, ..principal.clone() };
     let reduced = engine.authorize(&p, action, resource, &ctx)?;
-    if excluded.is_empty() || !reduced.allowed {
+    if (excluded.is_empty() && !unchecked) || !reduced.allowed {
         return Ok(reduced);
     }
     // A forbid or an `unless` may name an excluded set, and dropping the membership
     // would turn it off. Revocations only ever remove access (spec §8.7), so the answer
-    // must also be allowed with every membership in place.
-    let mut all = engine.memberships(&principal.id, &attrs)?;
-    all.roles.extend(assumed.cloned());
+    // must also be allowed with every membership in place. An assumed role the slice
+    // cannot check is added here too: a forbid may reach it through an entity
+    // reference, which the slice's filing cannot see (§8.4).
+    let mut all = match held {
+        Some(role) => engine.assume(&principal.id, &attrs, &BTreeSet::new(), role)?.unwrap_or(engine.memberships(&principal.id, &attrs)?),
+        None => engine.memberships(&principal.id, &attrs)?,
+    };
+    all.roles.extend(principal.assumed.iter().cloned());
+    all.roles.sort();
+    all.roles.dedup();
     let full = engine.authorize(&Principal { groups: all.groups, roles: all.roles, ..p }, action, resource, &ctx)?;
     Ok(if full.allowed { reduced } else { AuthzDecision { allowed: false, reasons: full.reasons, errors: full.errors } })
 }
@@ -660,6 +671,33 @@ mod tests {
         for set in ["Role::break-glass", "Group::oncall"] {
             assert_eq!(decide(&mut follower(Some(set)), &ada).reasons, ["assume:not_eligible"], "revoked {set}");
         }
+    }
+
+    /// §8.9 step 4: a slice that does not hold the assumed role still applies a forbid
+    /// that reaches the role through an entity reference rather than by name.
+    #[test]
+    fn an_assumed_role_the_slice_lacks_can_only_take_access_away() {
+        let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
+        let mut bundle: Bundle = serde_json::from_value(v["assume"]["bundle"].clone()).unwrap();
+        bundle.policies.push_str("\n@id(\"blocked-role\")\nforbid(principal, action == Action::\"Query.invoices\", resource) when { resource has blockedRole && principal in resource.blockedRole };");
+        let store = MemStore::default();
+        let root = build(&store, &bundle).unwrap();
+        let slice = load(&store, &root, &Query::Actions { actions: vec!["Query.invoices".into()], principals: vec!["did:kith:ada".into()] }).unwrap();
+        assert!(!slice.sets.contains_key("Role::break-glass"), "no policy names the role");
+        let o = org();
+        let mut f = Follower::new(&o.state.did, 0, FreshnessPolicy { fresh_for: 30, max_staleness: 3600, require_beacon: true });
+        f.apply_heartbeat(&o.state, &heartbeat(&o, None, 1000), &ClockBeacon, 1000).unwrap();
+        let mut attrs = Map::new();
+        attrs.insert("aal".into(), json!(2));
+        let ada = Principal { id: "did:kith:ada".into(), attrs, roles: vec!["break-glass".into(), "reader".into()], assumed: Some("break-glass".into()), ..Default::default() };
+        let mut blocked = Resource::new("Operation", "Query.invoices");
+        blocked.attrs.insert("blockedRole".into(), crate::authz::typed::entity("Role", "break-glass"));
+        let ask = |f: &mut Follower, p: &Principal, r: &Resource| authorize(&slice, f, &Request { principal: p, jti: None, device: None, action: "Query.invoices", resource: r, context: &json!({}) }, 1000).unwrap();
+        assert!(ask(&mut f, &ada, &Resource::new("Operation", "Query.invoices")).allowed, "reads still work while break-glass is assumed");
+        assert!(!ask(&mut f, &ada, &blocked).allowed, "a forbid on the assumed role applies");
+        assert!(ask(&mut f, &Principal { assumed: None, ..ada.clone() }, &blocked).allowed, "without the role it does not");
+        let god = Principal { assumed: Some("god".into()), ..ada.clone() };
+        assert_eq!(ask(&mut f, &god, &blocked).reasons, ["assume:not_assumable"], "god's `*` policy puts it in this slice, so the claim is checked");
     }
 
     fn ada() -> Principal {

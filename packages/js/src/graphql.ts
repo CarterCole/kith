@@ -94,6 +94,18 @@ function guardIntrospection(schema: GraphQLSchema, guard: (ctx: any) => void) {
   }
 }
 
+/**
+ * Client arguments with every key that starts with `__` removed, at any depth. Those keys
+ * spell typed values (`__entity`, `__extn`, spec §4.2.2), which only the server may make.
+ */
+export function clientArgs(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(clientArgs);
+  if (v === null || typeof v !== "object") return v;
+  const out: Record<string, unknown> = {};
+  for (const [k, x] of Object.entries(v as Record<string, unknown>)) if (!k.startsWith("__")) out[k] = clientArgs(x);
+  return out;
+}
+
 function forbidden(action: string) {
   return new GraphQLError(`Not authorized: ${action}`, { extensions: { code: "FORBIDDEN", action } });
 }
@@ -141,7 +153,7 @@ export function kithGraphQL(schema: GraphQLSchema, opts: KithGraphQLOptions): Gr
         if (!principal) {
           throw new GraphQLError("Authentication required", { extensions: { code: "UNAUTHENTICATED" } });
         }
-        const context = { ...args, operationType: info.operation.operation, field: key };
+        const context = { ...(clientArgs(args) as Record<string, unknown>), operationType: info.operation.operation, field: key };
         if (checkField) {
           const resource = isRoot ? { type: "Operation", id: key } : toResource(type.name, source);
           if (!check(principal, action, resource, context)) {

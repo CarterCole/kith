@@ -88,3 +88,21 @@ def test_introspection_can_require_a_principal():
         assert guarded(q).errors[0].extensions["code"] == "UNAUTHENTICATED", q
         assert guarded(q, ENGINE.principal("did:kith:bob", {"aal": 1})).errors is None, q
     assert guarded("{ __typename }").data == {"__typename": "Query"}, "__typename reveals nothing"
+
+
+def test_client_arguments_cannot_carry_typed_values():
+    """Spec §4.2.2: keys starting with ``__`` are not for clients."""
+    from kith import Principal
+
+    schema = build_schema("scalar JSON\ntype Query { doc(filter: JSON): String }")
+    engine = Engine({"version": 1, "policies": 'permit(principal, action == Action::"Query.doc", resource) when { context has filter && context.filter has owner && context.filter.owner == principal };'})
+    ada = Principal("did:kith:ada")
+    r = graphql_sync(
+        schema,
+        "query($f: JSON) { doc(filter: $f) }",
+        root_value={"doc": lambda info, filter=None: "secret"},
+        variable_values={"f": {"owner": {"__entity": {"type": "User", "id": "did:kith:ada"}}}},
+        context_value={"kith": ada},
+        middleware=[KithMiddleware(engine)],
+    )
+    assert r.errors and r.errors[0].extensions["code"] == "FORBIDDEN", r

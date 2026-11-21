@@ -360,7 +360,9 @@
     Policy variables inside a pattern and case-insensitive comparison are missing in
     Cedar itself.
   - Assumable roles: the hub's policy-org path, and the JS follower's re-check, have
-    no test of their own; `policy-dag.json` has no assumable role yet. The hub never
+    no test of their own; `policy-dag.json` has no assumable role yet. A slice holds
+    only the sets its policies name literally, so a forbid that reaches a *held* role
+    or group through an entity reference can still be missing from a slice. The hub never
     asks the person to confirm an assumption or notifies anyone of it.
   - The GraphQL middlewares pass no resource parents by themselves; an application adds
     them in `toResource` / `to_resource` ([spec §4.2.1](../spec/04-authorization.md)).
@@ -472,8 +474,11 @@ repeated here.
   arguments; `device add --out` writes an exported key with the default mode.
   `main()` is 400 lines, so none of it is unit-tested.
 - **Smaller protocol points.**
-  - one key can have several signer ids (an `eip155` address in any case, an uncompressed
-    SEC1 point, a `#fragment`), and policies compare strings;
+  - one key can have several signer ids (an `eip155` address in any case or on any
+    chain, an uncompressed SEC1 point, a `#fragment`), and policies compare strings, so
+    one wallet can fill two seats of a threshold;
+  - a `member` revocation at the hub drops the set from new tokens without the forbid
+    re-check that followers do (§8.9 step 6);
   - KEL timestamps have no upper bound; the `policy_root` CID check is a prefix test;
   - revoking a device that is also a manage signer leaves its L1 authority;
   - the vault's `SealedBox` has no sender authentication;
@@ -481,7 +486,9 @@ repeated here.
   - the WebAuthn sign counter is read and ignored;
   - a login challenge is not bound to the request that asked for it.
 - **GraphQL.** The row check looks only at the named return type, so interfaces and
-  unions skip it; `subscribe` is not wrapped (only `resolve`); code-first schemas with no
+  unions skip it: a Relay `node(id)` field returns a row-level object unfiltered;
+  an argument named `actor` or `kith` fills `context.actor` or `context.kith` for a
+  caller that is not delegated; Python ignores `@auth` on `extend type`; `subscribe` is not wrapped (only `resolve`); code-first schemas with no
   `astNode` carry no `@auth`.
 - **Packaging.** `@kith/auth` exports raw `.ts` (there is no build, so it cannot be
   installed and imported by plain Node), its root entry is Node-only because of the

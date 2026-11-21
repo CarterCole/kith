@@ -74,6 +74,7 @@ const cases = [
   { name: "assumed is not one of roles", token: withProv({ assumed: "god" }), valid: false },
   { name: "assumed is empty", token: withProv({ roles: ["billing-reader", ""], assumed: "" }), valid: false },
   { name: "assumed is not a string", token: withProv({ assumed: ["billing-reader"] }), valid: false },
+  { name: "assumed is null", token: withProv({ assumed: null }), valid: false },
   { name: "assumed with no roles", token: mint({ ...without("roles"), assumed: "billing-reader" }), valid: false },
   { name: "typ application/at+jwt is the same type (RFC 7515 4.1.9)", token: mint(claims, withHeader({ typ: "application/at+jwt" })), valid: true, claims: expect },
   { name: "typ AT+JWT, media types are case-insensitive", token: mint(claims, withHeader({ typ: "AT+JWT" })), valid: true, claims: expect },

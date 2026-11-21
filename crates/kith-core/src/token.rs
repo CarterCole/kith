@@ -52,7 +52,7 @@ pub struct AccessClaims {
     #[serde(default)]
     pub roles: Vec<String>,
     /// The role this session assumed (spec §4.3.1). It is one of `roles`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::authz::present")]
     pub assumed: Option<String>,
     #[serde(default)]
     pub attrs: Map<String, Value>,

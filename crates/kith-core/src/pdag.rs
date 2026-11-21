@@ -54,7 +54,7 @@ pub struct SetEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
     /// Who may assume this role (spec §4.3.1). Absent on a set that is not assumable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::authz::present")]
     pub assume: Option<AssumeDef>,
     /// Sets this one's membership depends on (nested members and rule references).
     pub deps: Vec<String>,

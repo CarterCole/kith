@@ -68,8 +68,6 @@ does, and the reference implementation is `kith_core::bundle::check`):
 - a policy or rule does not parse;
 - a `group:x` or `role:x` member names a set the bundle does not define, in `members`
   or in an `assume`;
-- a set lists `role:x`, or its rule names `Role::"x"`, where `x` is assumable. Such a
-  reference would never hold, because nobody has `x` standing.
 
 They SHOULD warn about a member that is not a DID, `group:` or `role:`; a set with no
 members and no rule (an assumable role aside); an `assume` with no members and no rule; a member listed twice in one set; a directory entry for something
@@ -161,8 +159,10 @@ another type says so, in the form Cedar's own JSON uses:
   `forbid(…) unless { context has sourceIp && context.sourceIp.isInRange(ip("10.0.0.0/8")) }`.
 - **Keys starting with `__` are not for clients.** A context built from client input
   (GraphQL arguments through a JSON scalar, for instance) can otherwise hand a policy a
-  typed value the server never made. GraphQL reserves such names in its own schemas, so
-  ordinary input types cannot carry them.
+  typed value the server never made. The GraphQL middlewares (§4.5) MUST drop every
+  such key, at any depth, from the arguments they put in the context (`clientArgs` in
+  JS, `client_args` in Python). GraphQL reserves such names in its own schemas, so
+  ordinary input types cannot carry them; a JSON scalar can.
 
 ## 4.3 Membership semantics (normative)
 
@@ -224,7 +224,9 @@ implementation MUST refuse to load a bundle where:
 - a group has `assume`. Only a role can be assumed;
 - `assume` is not an object, its `members` is not a list of strings, its `rule` is not a
   string or does not compile to exactly one policy, or its `max_age` is not a positive
-  integer.
+  integer. A member written as `null` is one of these, not an absent member: read as
+  absent, `"assume": null` would make a role quietly unassumable in one implementation
+  and a refused bundle in another.
 
 **Assuming.** For principal `p` asking for role `x`, with the sets `E` excluded by
 revocations (§8.7):
@@ -234,14 +236,18 @@ revocations (§8.7):
 4. If `p` is not listed in `assume.members`, directly or through a set in `G` or `R`,
    and `assume.rule` does not hold for `User(p)` with parents `G ∪ R`, refuse with
    `not_eligible`.
-5. The session holds `G` and `R ∪ {x}`.
+5. Compute memberships again as in §4.3, with `E` excluded and `x` in `R` from the
+   start. The session holds the result, which includes `x`.
 
 - Assuming adds a role. It removes nothing, so a forbid that names one of the
   principal's groups or roles still applies. A session cannot shed a forbid by
   assuming its way around it.
-- Nothing else depends on an assumable role. Its membership is not computed at all
-  in step 2, so a `role:x` member or a `Role::"x"` in a rule never holds (§4.1.1 makes
-  them errors).
+- Step 5 puts the session in every set that lists `role:x` or whose rule names
+  `Role::"x"`. So `"audited": {"members": ["role:break-glass"]}` with a forbid on
+  `Group::"audited"` binds every break-glass session. Without step 5 the forbid would
+  never apply, because nobody holds `x` standing.
+- Eligibility (step 4) is decided on standing memberships only. Sets that depend on
+  `x` cannot make the principal eligible for `x`.
 - Policies name an assumed role like any other: `permit(principal in Role::"break-glass", …)`.
 
 **Issuing.** A session asks with the token exchange's `role` parameter (§3.4). The
