@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IAM Explorer</title>
+<style nonce="{{NONCE}}">
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1c1d1f; --muted: #6a6d73; --line: #e3e3df;
+  --accent: #2f5bd3; --accent-soft: #e8eefc; --allow: #1d7a46; --allow-soft: #e3f3e9;
+  --deny: #b3261e; --deny-soft: #fbe7e5; --warn: #8a5a00; --warn-soft: #fbf0d9; --code: #f1f1ee;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141517; --panel: #1c1d20; --ink: #e8e8e6; --muted: #9a9ca1; --line: #2e3034;
+    --accent: #7c9cf5; --accent-soft: #232c45; --allow: #5cc48a; --allow-soft: #1b2e23;
+    --deny: #f08a80; --deny-soft: #3a2220; --warn: #e5b45a; --warn-soft: #352a15; --code: #232428;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; gap: 16px; align-items: baseline; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+header .sub { color: var(--muted); font-size: 13px; }
+.layout { display: grid; grid-template-columns: 300px 1fr; min-height: calc(100vh - 52px); }
+nav { border-right: 1px solid var(--line); background: var(--panel); padding: 12px; overflow-y: auto; max-height: calc(100vh - 52px); position: sticky; top: 0; }
+nav input { width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; margin-bottom: 10px; }
+nav h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 6px 4px; font-weight: 600; }
+nav button { display: flex; width: 100%; justify-content: space-between; gap: 8px; text-align: left; padding: 5px 8px; border: 0; border-radius: 5px; background: none; color: var(--ink); font: inherit; cursor: pointer; }
+nav button:hover { background: var(--bg); }
+nav button[aria-current="true"] { background: var(--accent-soft); color: var(--accent); }
+nav button span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+nav .count { color: var(--muted); font-size: 12px; flex: none; }
+main { padding: 20px 24px 60px; max-width: 1100px; min-width: 0; }
+main h2 { font-size: 20px; margin: 0 0 2px; word-break: break-all; }
+main h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 26px 0 8px; }
+.kind { color: var(--muted); font-size: 13px; margin-bottom: 14px; word-break: break-all; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pill { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 99px; background: var(--code); color: var(--muted); }
+.pill.allow { background: var(--allow-soft); color: var(--allow); }
+.pill.deny { background: var(--deny-soft); color: var(--deny); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.accent { background: var(--accent-soft); color: var(--accent); }
+code, pre { font: 12.5px/1.45 ui-monospace, "SF Mono", Menlo, monospace; }
+pre { background: var(--code); padding: 10px 12px; border-radius: 6px; overflow-x: auto; margin: 8px 0 0; white-space: pre-wrap; word-break: break-all; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.chips code { background: var(--code); padding: 1px 6px; border-radius: 4px; word-break: break-all; }
+.src { color: var(--muted); font-size: 12px; margin-left: auto; }
+a, .link { color: var(--accent); cursor: pointer; text-decoration: none; background: none; border: 0; padding: 0; font: inherit; }
+a:hover, .link:hover { text-decoration: underline; }
+table { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; }
+tr:last-child td { border-bottom: 0; }
+.muted { color: var(--muted); }
+.note { color: var(--muted); font-size: 13px; margin: 6px 0 12px; }
+form { display: grid; grid-template-columns: 140px 1fr; gap: 10px 14px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+form label { color: var(--muted); font-size: 13px; }
+form select, form input, form textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: 13px ui-monospace, Menlo, monospace; }
+form textarea { min-height: 54px; resize: vertical; }
+button.primary { grid-column: 2; justify-self: start; padding: 7px 16px; border-radius: 6px; border: 0; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+.verdict { font-size: 18px; font-weight: 650; margin: 16px 0 6px; }
+.verdict.allow { color: var(--allow); } .verdict.deny { color: var(--deny); }
+details summary { cursor: pointer; color: var(--accent); font-size: 12.5px; margin-top: 8px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 760px) {
+  .layout { grid-template-columns: 1fr; }
+  nav { position: static; max-height: 260px; border-right: 0; border-bottom: 1px solid var(--line); }
+  main { padding: 16px; }
+  form { grid-template-columns: 1fr; }
+  button.primary { grid-column: 1; }
+  .grid2 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>IAM Explorer</h1>
+  <span class="sub" id="sub">Loading…</span>
+</header>
+<div class="layout">
+  <nav id="nav"><input id="q" type="search" placeholder="Filter users, roles, policies…" aria-label="Filter"><div id="list"></div></nav>
+  <main id="view"></main>
+</div>
+<script nonce="{{NONCE}}">
+const TOKEN = new URLSearchParams(location.hash.slice(1)).get("t") ?? "";
+let M = null;          // the model from /api/model
+let sel = { kind: "overview" };
+let sim = { principal: "", assume: "", attrs: "{}", action: "s3:GetObject", resource: "", context: "{}" };
+
+function el(tag, props = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k !== null && k !== undefined && k !== false) e.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return e;
+}
+const api = (path, body) => fetch(path, { method: body ? "POST" : "GET", headers: { "x-explorer-token": TOKEN, ...(body ? { "content-type": "application/json" } : {}) }, body: body && JSON.stringify(body) }).then(async (r) => { const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; });
+const go = (s) => { sel = s; render(); window.scrollTo(0, 0); };
+
+const short = (id) => id.replace(/^arn:aws:iam::\d+:user\//, "");
+const principalOf = (id) => M.analysis.find((p) => p.id === id);
+const roleMeta = (name) => M.meta.roles.find((r) => r.name === name);
+const roleKind = (r) => r.path.startsWith("/aws-service-role/") ? "service-linked" : JSON.stringify(r.trust).includes("Federated") ? "deploy (web identity)" : "workload";
+const assumers = (role) => M.analysis.filter((p) => p.assumable[role] === "ok");
+
+// ---- navigation ---------------------------------------------------------------------
+
+function navList() {
+  const q = document.getElementById("q").value.toLowerCase();
+  const item = (label, count, s) => (label.toLowerCase().includes(q) ? el("button", { "aria-current": String(JSON.stringify(sel) === JSON.stringify(s)), onclick: () => go(s) }, el("span", { text: label }), count !== undefined ? el("span", { class: "count", text: count }) : null) : null);
+  const users = M.meta.users.map((u) => item(u.name, principalOf(u.id).policies.length, { kind: "principal", id: u.id }));
+  const roles = [...M.meta.roles].sort((a, b) => roleKind(a).localeCompare(roleKind(b)) || a.name.localeCompare(b.name)).map((r) => item(r.name, M.roleSessions[r.name].policies.length, { kind: "role", name: r.name }));
+  const trusted = M.meta.trusted.map((t) => item(t.label, Object.values(principalOf(t.id).assumable).filter((x) => x === "ok").length, { kind: "principal", id: t.id }));
+  const pols = M.meta.managed.map((m) => item(m.name.slice(7), m.members.length, { kind: "policy", name: m.name }));
+  document.getElementById("list").replaceChildren(...[
+    item("Overview", undefined, { kind: "overview" }), item("Simulator", undefined, { kind: "sim" }), item("What did not map", M.meta.notes.length, { kind: "notes" }),
+    el("h2", { text: "Users" }), users,
+    el("h2", { text: "Roles" }), roles,
+    el("h2", { text: "Trusted principals" }), trusted,
+    el("h2", { text: "Managed policies" }), pols,
+  ].flat().filter(Boolean));
+}
+
+// ---- statements ---------------------------------------------------------------------
+
+function statementCard(pid, opts = {}) {
+  const src = M.meta.sources[pid];
+  const s = src.statement;
+  const acts = [].concat(s.Action ?? s.NotAction ?? []);
+  const res = [].concat(s.Resource ?? s.NotResource ?? []);
+  return el("div", { class: "card" },
+    el("div", { class: "row" },
+      el("span", { class: `pill ${s.Effect === "Allow" ? "allow" : "deny"}`, text: s.Effect }),
+      opts.matched ? el("span", { class: "pill accent", text: "matched" }) : null,
+      s.Sid ? el("strong", { text: s.Sid }) : null,
+      el("span", { class: "src" }, opts.via ? `via ${opts.via} · ` : "", el("button", { class: "link", text: pid.split("#")[0], onclick: () => sourceLink(src) }))),
+    el("div", { class: "chips" }, s.NotAction ? el("span", { class: "pill warn", text: "NotAction" }) : null, acts.slice(0, 40).map((a) => el("code", { text: a })), acts.length > 40 ? el("span", { class: "muted", text: `+${acts.length - 40} more` }) : null),
+    el("div", { class: "chips" }, s.NotResource ? el("span", { class: "pill warn", text: "NotResource" }) : null, res.map((r) => el("code", { text: r }))),
+    s.Condition ? el("pre", { text: JSON.stringify(s.Condition, null, 2) }) : null,
+    el("details", {}, el("summary", { text: "Kith policy (Cedar)" }), el("pre", { text: M.policyText[pid] ?? "(left out: see What did not map)" })),
+  );
+}
+function sourceLink(src) {
+  if (src.scope.kind === "group" && src.scope.name.startsWith("policy/")) go({ kind: "policy", name: src.scope.name });
+  else if (src.scope.kind === "role") go({ kind: "role", name: src.scope.name });
+  else if (src.scope.kind === "user") go({ kind: "principal", id: src.scope.name });
+}
+function viaFor(pid) {
+  const sc = M.meta.sources[pid].scope;
+  return sc.kind === "group" ? sc.name : sc.kind === "role" ? `role ${sc.name}` : "inline";
+}
+function permissions(pids, note) {
+  if (!pids.length) return [el("p", { class: "note", text: note ?? "No statements: this principal may do nothing on its own." })];
+  const allow = pids.filter((p) => M.meta.sources[p].effect === "Allow").length;
+  return [el("p", { class: "note", text: `${pids.length} statements (${allow} allow, ${pids.length - allow} deny). Anything not allowed is denied; a deny wins.` }), pids.map((p) => statementCard(p, { via: viaFor(p) }))];
+}
+
+// ---- views --------------------------------------------------------------------------
+
+function overview() {
+  const m = M.meta;
+  const admins = M.analysis.filter((p) => p.policies.some((pid) => { const s = M.meta.sources[pid].statement; return s.Effect === "Allow" && [].concat(s.Action ?? []).includes("*") && [].concat(s.Resource ?? []).includes("*"); }));
+  return [
+    el("h2", { text: `Account ${m.account}` }),
+    el("div", { class: "kind", text: `Imported ${new Date(m.imported).toLocaleString()} · ${m.users.length} users · ${m.roles.length} roles · ${m.managed.length} managed policies · ${Object.keys(m.sources).length} statements` }),
+    el("p", { class: "note" }, "Each IAM identity is a Kith principal; each managed policy is a group; each role is an ", el("em", { text: "assumable" }), " role whose trust policy is its assume rule. Every answer here comes from Kith's engine (packages/js) evaluating the converted bundle."),
+    el("h3", { text: "Full administrators" }),
+    admins.length ? el("div", { class: "card" }, admins.map((p) => el("div", {}, el("button", { class: "link", text: p.label, onclick: () => go({ kind: "principal", id: p.id }) }), el("span", { class: "muted", text: " — Allow * on *" })))) : el("p", { class: "note", text: "None." }),
+    el("h3", { text: "Users" }),
+    el("table", {}, el("tr", {}, el("th", { text: "User" }), el("th", { text: "Policies" }), el("th", { text: "Statements" }), el("th", { text: "Can assume" })),
+      m.users.map((u) => { const p = principalOf(u.id); const can = Object.entries(p.assumable).filter(([, v]) => v === "ok").map(([r]) => r);
+        return el("tr", {}, el("td", {}, el("button", { class: "link", text: u.name, onclick: () => go({ kind: "principal", id: u.id }) })), el("td", { text: p.standing.groups.map((g) => g.replace(/^policy\//, "")).join(", ") || "inline only" }), el("td", { text: p.policies.length }), el("td", { text: can.join(", ") || "—" })); })),
+    el("h3", { text: "Roles" }),
+    el("table", {}, el("tr", {}, el("th", { text: "Role" }), el("th", { text: "Kind" }), el("th", { text: "Assumed by" }), el("th", { text: "Statements" }), el("th", { text: "Max session" })),
+      [...m.roles].sort((a, b) => roleKind(a).localeCompare(roleKind(b))).map((r) => el("tr", {},
+        el("td", {}, el("button", { class: "link", text: r.name, onclick: () => go({ kind: "role", name: r.name }) })),
+        el("td", { text: roleKind(r) }),
+        el("td", { text: trustSummary(r) }),
+        el("td", { text: M.roleSessions[r.name].policies.length }),
+        el("td", { text: `${(M.bundle.roles[r.name].assume.max_age / 3600).toFixed(1).replace(/\.0$/, "")} h` })))),
+  ];
+}
+function trustSummary(r) {
+  return [].concat(r.trust.Statement).flatMap((s) => Object.entries(s.Principal ?? {}).flatMap(([k, v]) => [].concat(v).map((x) => k === "Federated" ? x.split("/").pop() + (s.Condition ? ` (${Object.values(s.Condition).flatMap((c) => Object.entries(c)).filter(([k]) => k.endsWith(":sub")).map(([, v]) => v).join(", ")})` : "") : x))).join("; ");
+}
+
+function principalView(id) {
+  const p = principalOf(id);
+  const u = M.meta.users.find((x) => x.id === id);
+  const can = Object.entries(p.assumable).filter(([, v]) => v === "ok").map(([r]) => r);
+  return [
+    el("h2", { text: p.label }),
+    el("div", { class: "kind", text: `${p.kind === "user" ? "IAM user" : p.kind === "service" ? "AWS service principal" : p.kind === "federated" ? "Web identity provider" : "IAM principal"} · Kith principal id ${id}` }),
+    el("div", { class: "row" }, el("button", { class: "link", text: "Simulate as this principal →", onclick: () => { sim.principal = id; sim.assume = ""; go({ kind: "sim" }); } })),
+    el("h3", { text: "Holds (standing)" }),
+    p.standing.groups.length || p.standing.roles.length ? el("div", { class: "chips" }, p.standing.groups.map((g) => g.startsWith("policy/") ? el("button", { class: "pill accent", text: g, onclick: () => go({ kind: "policy", name: g }) }) : el("span", { class: "pill", text: g })), p.standing.roles.map((r) => el("span", { class: "pill", text: `role ${r}` }))) : el("p", { class: "note", text: "Nothing standing." }),
+    el("h3", { text: "Can assume" }),
+    can.length ? el("table", {}, el("tr", {}, el("th", { text: "Role" }), el("th", { text: "Gives" }), el("th", {})), can.map((r) => el("tr", {}, el("td", {}, el("button", { class: "link", text: r, onclick: () => go({ kind: "role", name: r }) })), el("td", { text: `${M.roleSessions[r].policies.length} statements` }), el("td", {}, el("button", { class: "link", text: "simulate", onclick: () => { sim.principal = id; sim.assume = r; go({ kind: "sim" }); } }))))) :
+      el("p", { class: "note", text: p.kind === "federated" ? "Nothing without claims: these roles check the token's sub and aud. Try them in the simulator with claims." : "No role trusts this principal." }),
+    p.kind === "federated" ? el("p", { class: "note", text: "Roles that trust this provider: " + M.meta.roles.filter((r) => JSON.stringify(r.trust).includes(p.label)).map((r) => r.name).join(", ") }) : null,
+    el("h3", { text: "May do (standing)" }),
+    permissions(p.policies, p.kind === "user" ? undefined : "Nothing standing: a service or web identity acts only through the roles it assumes."),
+    u?.tags?.length ? [el("h3", { text: "Tags" }), el("pre", { text: JSON.stringify(u.tags, null, 2) })] : null,
+  ];
+}
+
+function roleView(name) {
+  const r = roleMeta(name);
+  const def = M.bundle.roles[name];
+  const sess = M.roleSessions[name];
+  const who = assumers(name);
+  return [
+    el("h2", { text: name }),
+    el("div", { class: "kind", text: `${roleKind(r)} role · ${r.arn}` }),
+    r.description ? el("p", { class: "note", text: r.description }) : null,
+    r.lastUsed?.LastUsedDate ? el("p", { class: "note", text: `Last used ${new Date(r.lastUsed.LastUsedDate).toLocaleString()}${r.lastUsed.Region ? ` in ${r.lastUsed.Region}` : ""}` }) : null,
+    el("h3", { text: "Who can assume it" }),
+    el("div", { class: "grid2" },
+      el("div", { class: "card" }, el("strong", { text: "IAM trust policy" }), el("pre", { text: JSON.stringify(r.trust, null, 2) })),
+      el("div", { class: "card" }, el("strong", { text: "Kith assume setting" }),
+        el("pre", { text: def.assume.rule ? `rule:\n  ${def.assume.rule.replaceAll(" || ", "\n  || ").replaceAll(" && ", "\n    && ")}` : `members: ${JSON.stringify(def.assume.members)}` }),
+        el("p", { class: "note", text: `Held for at most ${def.assume.max_age} s (MaxSessionDuration). Assuming adds the role; it never drops what the holder has, so a forbid still applies.` }))),
+    who.length ? el("p", { class: "note" }, "Eligible now: ", who.map((p, i) => [i ? ", " : "", el("button", { class: "link", text: p.label, onclick: () => go({ kind: "principal", id: p.id }) })])) : el("p", { class: "note", text: "No principal is eligible without claims (web identity roles check sub and aud)." }),
+    el("div", { class: "row" }, el("button", { class: "link", text: "Simulate a session in this role →", onclick: () => { sim.assume = name; const t = trustedFor(r); sim.principal = t.id; sim.attrs = JSON.stringify(t.claims); go({ kind: "sim" }); } })),
+    el("h3", { text: "A session in this role may do" }),
+    sess.groups.length ? el("p", { class: "note", text: `Joins ${sess.groups.join(", ")} while held.` }) : null,
+    permissions(sess.policies, "This role grants nothing."),
+  ];
+}
+/** A principal and claims that satisfy a role's first trust statement, to prefill the simulator. */
+function trustedFor(r) {
+  const s = [].concat(r.trust.Statement)[0] ?? {};
+  const [k, v] = Object.entries(s.Principal ?? {})[0] ?? [];
+  const x = [].concat(v ?? [])[0] ?? "";
+  if (k === "Service") return { id: `service:${x}`, claims: {} };
+  if (k === "Federated") {
+    const provider = x.replace(/^arn:aws:iam::\d+:oidc-provider\//, "");
+    const claims = {};
+    for (const kv of Object.values(s.Condition ?? {})) for (const [ck, cv] of Object.entries(kv)) if (ck.startsWith(provider + ":")) claims[ck.slice(provider.length + 1)] = [].concat(cv)[0];
+    return { id: `federated:${provider}`, claims };
+  }
+  return { id: x, claims: {} };
+}
+
+function policyView(name) {
+  const m = M.meta.managed.find((x) => x.name === name);
+  const pids = Object.keys(M.meta.sources).filter((p) => M.meta.sources[p].scope.kind === "group" && M.meta.sources[p].scope.name === name);
+  return [
+    el("h2", { text: name.slice(7) }),
+    el("div", { class: "kind", text: `${m.aws ? "AWS managed" : "Customer managed"} policy · ${m.arn} · Kith group ${name}` }),
+    el("h3", { text: "Attached to" }),
+    el("div", { class: "chips" }, m.members.map((x) => x.startsWith("role:") ? el("button", { class: "pill accent", text: `role ${x.slice(5)}`, onclick: () => go({ kind: "role", name: x.slice(5) }) }) : el("button", { class: "pill accent", text: short(x), onclick: () => go({ kind: "principal", id: x }) }))),
+    el("h3", { text: "Statements" }),
+    permissions(pids, "No statements."),
+  ];
+}
+
+function notesView() {
+  return [
+    el("h2", { text: "What did not map" }),
+    el("p", { class: "note", text: "Parts of IAM that Kith has no form for yet. An Allow that cannot be expressed is left out, so it never grants; a Deny keeps its expressible part, so it denies more, never less." }),
+    M.meta.notes.map((n) => el("div", { class: "card" }, el("div", { class: "row" }, el("span", { class: "pill warn", text: n.where })), el("p", { text: n.what }))),
+    el("h3", { text: "And by design" }),
+    el("div", { class: "card" },
+      el("p", {}, el("strong", { text: "Assuming adds, it does not replace. " }), "In IAM a role session has only the role's permissions. In Kith a session that assumes a role keeps what the principal holds, so a forbid on the principal still applies. Services and web identities hold nothing standing, so their sessions match IAM exactly; for a user who assumes a role, Kith's answer can be wider than IAM's."),
+      el("p", {}, el("strong", { text: "Actions are matched in context. " }), "Cedar has no wildcard actions (action groups are a known gap), so each statement matches ", el("code", { text: "context.iamAction" }), " with ", el("code", { text: "like" }), ", lower-cased, and ", el("code", { text: "resource.arn" }), " likewise.")),
+  ];
+}
+
+function simView() {
+  const opts = (xs, cur) => xs.map(([v, l]) => el("option", { value: v, selected: v === cur, text: l }));
+  const principalsOpts = M.analysis.map((p) => [p.id, `${p.label} (${p.kind})`]);
+  const out = el("div", { id: "out" });
+  const f = el("form", { onsubmit: async (e) => {
+    e.preventDefault();
+    const fd = new FormData(f);
+    sim = Object.fromEntries(fd);
+    let attrs, context;
+    try { attrs = JSON.parse(sim.attrs || "{}"); context = JSON.parse(sim.context || "{}"); } catch (err) { return out.replaceChildren(el("p", { class: "verdict deny", text: `Bad JSON: ${err.message}` })); }
+    try {
+      const r = await api("/api/check", { principal: sim.principal, assume: sim.assume || undefined, attrs, action: sim.action, resource: sim.resource || "*", context });
+      out.replaceChildren(...result(r).flat().filter(Boolean));
+    } catch (err) { out.replaceChildren(el("p", { class: "verdict deny", text: err.message })); }
+  } },
+    el("label", { for: "p", text: "Principal" }), el("select", { id: "p", name: "principal" }, opts(principalsOpts, sim.principal)),
+    el("label", { for: "a", text: "Assume role" }), el("select", { id: "a", name: "assume" }, el("option", { value: "", text: "— none (standing) —" }), opts(M.meta.roles.map((r) => [r.name, r.name]), sim.assume)),
+    el("label", { for: "c", text: "Claims / attrs" }), el("textarea", { id: "c", name: "attrs", text: sim.attrs }),
+    el("label", { for: "x", text: "Action" }), el("input", { id: "x", name: "action", value: sim.action, placeholder: "s3:PutObject" }),
+    el("label", { for: "r", text: "Resource ARN" }), el("input", { id: "r", name: "resource", value: sim.resource, placeholder: "arn:aws:s3:::bucket/key (empty means *)" }),
+    el("label", { for: "k", text: "Context" }), el("textarea", { id: "k", name: "context", text: sim.context, placeholder: '{"aws:RequestedRegion": "us-east-1"}' }),
+    el("button", { class: "primary", type: "submit", text: "Check" }),
+  );
+  return [
+    el("h2", { text: "Simulator" }),
+    el("p", { class: "note", text: "Kith's engine decides: it computes the principal's memberships (or the session's, if it assumes a role) and evaluates the converted policies." }),
+    f, out,
+  ];
+}
+function result(r) {
+  if (r.refused) return [el("p", { class: "verdict deny", text: `Cannot assume: ${r.refused.replace("_", " ")}` }), el("p", { class: "note", text: r.refused === "not_eligible" ? "The role's trust policy does not admit this principal with these claims." : "That role has no assume setting." })];
+  const d = r.decision;
+  return [
+    el("p", { class: `verdict ${d.allowed ? "allow" : "deny"}`, text: d.allowed ? "Allowed" : "Denied" }),
+    el("p", { class: "note", text: `Holding ${[...r.memberships.groups, ...r.memberships.roles.map((x) => `role ${x}`)].join(", ") || "nothing"}. ${d.allowed ? "" : d.reasons.length ? "A forbid matched." : "No statement allows it (implicit deny)."}` }),
+    d.errors.length ? el("pre", { text: d.errors.join("\n") }) : null,
+    d.reasons.map((pid) => M.meta.sources[pid] ? statementCard(pid, { matched: true, via: viaFor(pid) }) : el("code", { text: pid })),
+  ];
+}
+
+function render() {
+  navList();
+  const v = document.getElementById("view");
+  const k = sel.kind;
+  v.replaceChildren(...[].concat(k === "principal" ? principalView(sel.id) : k === "role" ? roleView(sel.name) : k === "policy" ? policyView(sel.name) : k === "notes" ? notesView() : k === "sim" ? simView() : overview()).flat(3).filter(Boolean));
+}
+
+document.getElementById("q").addEventListener("input", navList);
+api("/api/model").then((m) => {
+  M = m;
+  document.getElementById("sub").textContent = `AWS account ${m.meta.account} · as a Kith bundle`;
+  sim.principal = m.meta.users[0]?.id ?? "";
+  render();
+}).catch((e) => { document.getElementById("view").replaceChildren(el("p", { class: "verdict deny", text: `Could not load: ${e.message}. Open the address the explorer printed, with its #t= token.` })); });
+</script>
+</body>
+</html>
