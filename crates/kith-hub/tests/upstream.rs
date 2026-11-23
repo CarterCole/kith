@@ -476,7 +476,9 @@ async fn step_up_with_totp() {
     let tok = redeem(&w, ok.json()["redirect"].as_str().unwrap(), &verifier).await;
     let id = jws::decode(tok["id_token"].as_str().unwrap()).unwrap().claims;
     assert_eq!(id["acr"], "urn:kith:acr:aal2");
-    assert_eq!(id["amr"], json!(["otp", "fed", "mfa"]));
+    // The code was listed first, and is still checked last: only once Telegram's factor
+    // has verified (spec §2.3).
+    assert_eq!(id["amr"], json!(["fed", "otp", "mfa"]));
 }
 
 #[test]

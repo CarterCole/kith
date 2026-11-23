@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in on another device · {{BRAND}}</title>
+<style nonce="{{NONCE}}">{{STYLE}}
+p.warn { margin: 0 0 18px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="brand">{{BRAND}}</div>
+  <h1 id="title">Sign in on another device?</h1>
+  <p id="lead"></p>
+  <ul id="items" class="items"></ul>
+  <p id="warn" class="note warn">Only go on if you just scanned this from a screen in front of you. If a website, a message or a person asked you to scan it, stop: approving signs them in as you.</p>
+  <div class="stack">
+    <button id="approve" class="primary" type="button">Sign in with your passkey</button>
+    <button id="deny" class="secondary" type="button">Don't sign in</button>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+let challenge = { id: D.challenge_id, message: D.message };
+const app = D.client_name || "your {{BRAND}} account page";
+
+function item(label, value) {
+  const li = document.createElement("li");
+  li.append(label);
+  const v = document.createElement("span");
+  v.className = "value";
+  v.textContent = value;
+  li.append(v);
+  $("items").append(li);
+}
+function ago(t) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+  return s < 60 ? "just now" : Math.round(s / 60) + " min ago";
+}
+function finished(title, lead) {
+  $("title").textContent = title;
+  $("lead").textContent = lead;
+  for (const id of ["items", "warn", "approve", "deny"]) $(id).classList.add("hidden");
+}
+function busy(on) {
+  $("approve").disabled = on;
+  $("deny").disabled = on;
+}
+
+$("lead").textContent = `Signing in to ${app} on the screen that showed this code. Your passkey stays on this phone.`;
+item("App", D.client_name || "{{BRAND}} account page");
+item("The other device", D.browser);
+item("Its address", D.ip === D.phone_ip ? D.ip + " (the same as this phone)" : D.ip);
+item("Code made", ago(D.created));
+
+if (D.state === "approved" || D.state === "denied") {
+  finished("Code already used", "Show a new code on the other screen to sign in again.");
+} else if (D.min_aal > D.max_aal) {
+  finished("Use a security key there", `${app} needs a security key on the computer itself. A phone can't sign it in.`);
+} else if (!webauthnSupported()) {
+  $("approve").disabled = true;
+  status("This browser doesn't support passkeys.", "error");
+}
+
+$("approve").onclick = async () => {
+  busy(true);
+  try {
+    const cred = await navigator.credentials.get({
+      publicKey: { challenge: await sha256(challenge.message), rpId: D.rp_id, userVerification: "preferred", allowCredentials: [] },
+    });
+    const r = cred.response;
+    if (!r.userHandle || r.userHandle.byteLength === 0) {
+      status("That passkey isn't linked to a {{BRAND}} identity.", "error");
+      return;
+    }
+    status("Checking…");
+    const res = await postJSON(`/v1/handoff/${D.id}/approve`, {
+      challenge_id: challenge.id,
+      did: new TextDecoder().decode(r.userHandle),
+      factors: [{ type: "webauthn", authenticator_data: b64u(r.authenticatorData), client_data_json: b64u(r.clientDataJSON), signature: b64u(r.signature) }],
+    });
+    if (res.ok) {
+      finished("Approved", "Go back to the other screen: it's signing in now. You can close this page.");
+      status("");
+      return;
+    }
+    if (res.body.challenge_id) challenge = { id: res.body.challenge_id, message: res.body.message };
+    if (res.status === 404 || res.status === 409) {
+      finished("Code expired", "Show a new code on the other screen and scan it again.");
+      status("");
+      return;
+    }
+    status(res.body.error_description || "Sign-in failed.", "error");
+  } catch (e) {
+    status(e.name === "NotAllowedError" ? "Passkey sign-in was cancelled." : "Passkey error: " + e.message, "error");
+  } finally {
+    busy(false);
+  }
+};
+
+$("deny").onclick = async () => {
+  busy(true);
+  await postJSON(`/v1/handoff/${D.id}/deny`, {});
+  finished("Not signed in", "The other screen won't be signed in. You can close this page.");
+  busy(false);
+};
+</script>
+</body>
+</html>

@@ -14,6 +14,15 @@
     <div class="stack">
       <button id="passkey" class="primary" type="button">Sign in with a passkey</button>
     </div>
+    <div id="phone-box" class="phone hidden">
+      <div class="or">or use your phone</div>
+      <img id="phone-qr" class="phone-qr hidden" alt="A QR code: scan it with your phone to sign in here">
+      <p id="phone-note" class="meta center"></p>
+      <button id="phone-again" class="secondary hidden" type="button">Show a new code</button>
+    </div>
+    <div class="stack mt">
+      <button id="phone" class="secondary hidden" type="button">Sign in with your phone</button>
+    </div>
     <p id="signup" class="note hidden">No account yet? <a href="/signup">Create one</a></p>
   </div>
   <div id="signed-in" class="hidden">
@@ -34,6 +43,7 @@
 <script id="kith-data" type="application/json">{{DATA}}</script>
 <script nonce="{{NONCE}}">
 {{COMMON_JS}}
+{{PHONE_JS}}
 const when = (t) => new Date(t * 1000).toLocaleString();
 const LEVEL = { 1: "level 1", 2: "level 2, multi-factor", 3: "level 3, hardware key" };
 
@@ -81,6 +91,14 @@ if (D.signed_in) {
 } else {
   $("signed-out").classList.remove("hidden");
   if (D.signup) $("signup").classList.remove("hidden");
+  // A phone that holds the passkey can sign this browser in by scanning a QR code.
+  const phoneDone = (redirect) => { status("Signed in.", "ok"); location.replace(redirect); };
+  if (D.phone && phoneByDefault) {
+    phoneStart(null, phoneDone);
+  } else if (D.phone) {
+    $("phone").classList.remove("hidden");
+    $("phone").onclick = () => { $("phone").classList.add("hidden"); phoneStart(null, phoneDone); };
+  }
   let challenge = { id: D.challenge_id, message: D.message };
   if (!webauthnSupported()) {
     $("passkey").disabled = true;

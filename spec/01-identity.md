@@ -185,6 +185,13 @@ enrollment.
 | `passkey` | a WebAuthn credential; signatures are assertions (`alg: WebAuthn`) | 2 with user verification, else 1 |
 | `hardware` | non-exportable: Secure Enclave, TPM, YubiKey PIV, HSM. The process holds a handle; the chip signs | 1 without a per-use activation factor; up to 3 when every signature needs one (Touch ID, a PIN) |
 | `wallet` | a crypto wallet acting as a device | 1 |
+| `agent` | a non-human actor (an AI agent, a service, a CI job) holding its own key | 1, always |
+
+An `agent` device is a software key for something that is not a person. No one is
+present when it signs, so enrollment is refused unless `aal` is 1 and `caps` is
+`[]` or `["session"]`: an agent cannot commit aliases or sign revocations. It signs in
+like a software key (§2.3), and its logins carry `amr: agent` besides `swk` (§2.5), so
+a policy can require or exclude agents. Revoke one like any device.
 
 A key that cannot be exported still proves only possession. NIST SP 800-63B counts a
 single-factor cryptographic device as AAL1; what lifts a `hardware` device to AAL3 is an

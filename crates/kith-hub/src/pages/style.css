@@ -45,3 +45,11 @@ ul.items li { padding: 10px 12px; font-size: 14px; }
 ul.items li + li { border-top: 1px solid var(--line); }
 ul.items .value { display: block; color: var(--muted); font-size: 13px; word-break: break-all; }
 p.note { margin: 14px 0 0; font-size: 13px; }
+.phone { margin-top: 18px; }
+.or { display: flex; align-items: center; gap: 10px; margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+.or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+img.phone-qr { display: block; width: 200px; height: 200px; margin: 0 auto 8px; border-radius: 8px; background: #fff; transition: opacity .2s; }
+img.phone-qr.faded { opacity: .15; }
+p.center { text-align: center; margin-bottom: 0; }
+p.center.error { color: var(--danger); }
+.phone .secondary { margin-top: 12px; }

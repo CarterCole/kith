@@ -43,7 +43,7 @@ async function fingerprint(k) {
   const hex = Array.from((await sha256(k)).slice(0, 6), (b) => b.toString(16).padStart(2, "0")).join("");
   return hex.match(/.{4}/g).join("-");
 }
-const KIND = { software: "software key", hardware: "hardware key", passkey: "passkey", wallet: "wallet" };
+const KIND = { software: "software key", hardware: "hardware key", passkey: "passkey", wallet: "wallet", agent: "agent" };
 const LEVEL = { 1: "level 1", 2: "level 2", 3: "level 3" };
 const BUTTONS = ["signin", "claim", "create", "confirm", "approve", "here", "qr-box", "name-box"];
 

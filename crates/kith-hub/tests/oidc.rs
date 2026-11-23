@@ -1776,6 +1776,154 @@ async fn login_and_registration_are_rate_limited() {
 }
 
 #[tokio::test]
+async fn behind_cloudfront_the_address_is_the_viewers() {
+    // Visitor → CloudFront → a proxy that appends its own peer to X-Forwarded-For → hub
+    // (spec §7.9). CloudFront adds the shared secret and the viewer's address. Anyone
+    // can also reach that proxy directly and send both headers themselves.
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const NEXT: &str = "fedcba9876543210fedcba9876543210";
+    let w = world_with(|cfg| {
+        cfg.behind_proxy = true;
+        cfg.cloudfront_secrets = vec![SECRET.into(), NEXT.into()];
+        cfg.register_limit = RateLimit {
+            max: 1,
+            window_secs: 3600,
+        };
+        cfg.registration_token = Some("let-me-in".into());
+    });
+    let meta = json!({"redirect_uris": [APP_CB]});
+    let register = |secret: Option<&'static str>, viewer: &'static str, xff: &'static str| {
+        let app = w.app.clone();
+        let meta = meta.clone();
+        async move {
+            let mut headers = vec![
+                (header::AUTHORIZATION, "Bearer let-me-in"),
+                (
+                    header::HeaderName::from_static("cloudfront-viewer-address"),
+                    viewer,
+                ),
+                (header::HeaderName::from_static("x-forwarded-for"), xff),
+            ];
+            if let Some(s) = secret {
+                headers.push((header::HeaderName::from_static("kith-origin-secret"), s));
+            }
+            call(
+                &app,
+                "POST",
+                "/oauth/register",
+                &headers,
+                Some("127.0.0.1"),
+                Some(meta),
+            )
+            .await
+            .status
+        }
+    };
+    let s = Some(SECRET);
+    assert_eq!(
+        register(s, "203.0.113.9:46532", "203.0.113.9, 15.158.0.1").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        register(s, "203.0.113.9:51234", "203.0.113.9, 15.158.0.2").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the same visitor through another edge, from another port"
+    );
+    assert_eq!(
+        register(s, "203.0.113.10:46532", "203.0.113.10, 15.158.0.1").await,
+        StatusCode::CREATED,
+        "another visitor through the same edge"
+    );
+    assert_eq!(
+        register(Some(NEXT), "203.0.113.9:40000", "203.0.113.9, 15.158.0.3").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the next secret, while it is rotated in"
+    );
+    // IPv6: CloudFront writes the address and then ":port", with no brackets.
+    assert_eq!(
+        register(s, "2001:db8::7:46532", "2001:db8::7, 15.158.0.1").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        register(s, "[2001:0db8:0:0::7]:40000", "2001:db8::7, 15.158.0.1").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the same address, written another way"
+    );
+
+    // Straight to the proxy, without the secret: the viewer address and the
+    // X-Forwarded-For entries the client wrote are ignored, and the address is the one
+    // the proxy appended.
+    assert_eq!(
+        register(None, "198.51.100.1:1", "198.51.100.1, 192.0.2.66").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        register(None, "198.51.100.2:1", "198.51.100.2, 192.0.2.66").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a forged viewer address"
+    );
+    assert_eq!(
+        register(
+            Some("0123456789abcdef0123456789abcdee"),
+            "198.51.100.3:1",
+            "198.51.100.3, 192.0.2.66"
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a wrong secret"
+    );
+}
+
+#[tokio::test]
+async fn ipv6_rate_limits_count_a_64() {
+    // One subscriber usually holds a whole IPv6 /64 and can pick any address in it, so
+    // the limit counts the prefix (spec §7.9). IPv4 still counts each address.
+    let w = world_with(|cfg| {
+        cfg.register_limit = RateLimit {
+            max: 1,
+            window_secs: 3600,
+        };
+        cfg.registration_token = Some("let-me-in".into());
+    });
+    let meta = json!({"redirect_uris": [APP_CB]});
+    let register = |peer: &'static str| {
+        let app = w.app.clone();
+        let meta = meta.clone();
+        async move {
+            let auth = [(header::AUTHORIZATION, "Bearer let-me-in")];
+            call(
+                &app,
+                "POST",
+                "/oauth/register",
+                &auth,
+                Some(peer),
+                Some(meta),
+            )
+            .await
+            .status
+        }
+    };
+    assert_eq!(register("2001:db8:1:2::1").await, StatusCode::CREATED);
+    assert_eq!(
+        register("2001:db8:1:2:ffff:ffff:ffff:fffe").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "another address in the same /64"
+    );
+    assert_eq!(
+        register("2001:db8:1:3::1").await,
+        StatusCode::CREATED,
+        "the next /64"
+    );
+    assert_eq!(register("203.0.113.7").await, StatusCode::CREATED);
+    assert_eq!(
+        register("::ffff:203.0.113.7").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the same IPv4 address, mapped into IPv6"
+    );
+    assert_eq!(register("203.0.113.8").await, StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn admin_api() {
     let w = world_with(|cfg| {
         cfg.admin_token = Some("ops-secret".into());
@@ -2204,6 +2352,46 @@ async fn devices_without_the_session_cap_cannot_log_in() {
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "a delegation signed through a revoke-only device was honoured: {}", r.text());
 }
 
+/// An agent device is a non-human key: it signs in with a signature like a software key,
+/// stays at AAL 1, and says so in `amr`, so a policy can tell it from a person's laptop.
+#[tokio::test]
+async fn an_agent_device_signs_in_and_is_labelled() {
+    let w = world();
+    let bot = LocalSigner::generate(KeyType::Ed25519);
+    let bot_dev = device("bot", &bot, DeviceKind::Agent, 1);
+    let mut log = w.log.clone();
+    let mut ev = next_event(&w.st, EventBody::AddDevice { device: bot_dev.clone() });
+    ev.sign(&w.root).unwrap();
+    ev.sign(&bot).unwrap();
+    log.push(ev);
+    w.hub.put_kel(&w.st.did, log).unwrap();
+
+    let amr_of = |token: &str| jws::decode(token).unwrap().claims["amr"].clone();
+    let has = |amr: &Value, v: &str| amr.as_array().unwrap().contains(&json!(v));
+
+    // Challenge login.
+    let ch = post_json(&w.app, "/v1/auth/challenge", json!({"did": w.st.did})).await.json();
+    let sig = bot.sign(ch["message"].as_str().unwrap().as_bytes()).unwrap();
+    let r = post_json(&w.app, "/v1/auth/verify", json!({"challenge_id": ch["challenge_id"], "audience": ISSUER, "factors": [{"type": "signature", "sig": sig}]})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let claims = jws::decode(r.json()["access_token"].as_str().unwrap()).unwrap().claims;
+    assert_eq!(claims["aal"], 1);
+    assert!(has(&claims["amr"], "swk") && has(&claims["amr"], "agent"), "{}", claims["amr"]);
+
+    // Session chain, exchanged for a token.
+    let tok = SessionKey::create(&w.st.did, &bot_dev, DeviceSigner::Key(&bot.secret), 3600).unwrap().session_token(ISSUER, json!({})).unwrap();
+    let r = post_form(&w.app, "/oauth/token", &[("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"), ("subject_token", &tok), ("subject_token_type", TT_SESSION)], None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let amr = amr_of(r.json()["access_token"].as_str().unwrap());
+    assert!(has(&amr, "agent"), "{amr}");
+
+    // A person's laptop is not labelled.
+    let ch = post_json(&w.app, "/v1/auth/challenge", json!({"did": w.st.did})).await.json();
+    let sig = w.laptop.sign(ch["message"].as_str().unwrap().as_bytes()).unwrap();
+    let r = post_json(&w.app, "/v1/auth/verify", json!({"challenge_id": ch["challenge_id"], "audience": ISSUER, "factors": [{"type": "signature", "sig": sig}]})).await;
+    assert!(!has(&amr_of(r.json()["access_token"].as_str().unwrap()), "agent"));
+}
+
 /// Redeem the code behind a login response and return the tokens.
 async fn tokens_from_login(w: &World, login: &Resp, verifier: &str) -> Value {
     redeem(w, "app", login.json()["redirect"].as_str().unwrap(), verifier, None).await
@@ -2215,11 +2403,12 @@ async fn password_free_hub_token(w: &World) -> String {
     format!("Bearer {}", r["access_token"].as_str().unwrap())
 }
 
-/// A session that rests on the authenticator code alone has no device to revoke, so
-/// resetting the authenticator is what ends it. Sessions that rest on anything else
-/// are untouched.
+/// A one-time code is a second factor. Alone it signs nobody in, on the sign-in page or
+/// on the API: the hub looks at a code only once another factor of the same request has
+/// verified (spec §2.3). So a guess costs the guesser nothing and gains them nothing,
+/// and a stranger can't lock the authenticator by sending wrong codes.
 #[tokio::test]
-async fn totp_only_sessions_end_when_totp_is_reset() {
+async fn a_one_time_code_alone_does_not_sign_in() {
     let w = world_with(|cfg| cfg.admin_token = Some("ops-secret".into()));
     let bearer = hub_bearer(&w, "laptop", &w.laptop).await;
     let auth = [(header::AUTHORIZATION, bearer.as_str())];
@@ -2231,38 +2420,70 @@ async fn totp_only_sessions_end_when_totp_is_reset() {
     let denied = call(&w.app, "DELETE", "/v1/totp", &auth, None, None).await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.text());
 
-    // Sign in with the authenticator code alone, and, separately, with the passkey.
+    // The right code, alone: refused on the sign-in page and on the API, with no session.
+    let code = || totp::code_at(&secret, now() + 30);
     let (verifier, challenge) = pkce();
     let page = get(&w.app, &authorize_url("app", APP_CB, &challenge, ""), None).await;
     let d = page_data(&page.text());
-    let totp_login = post_json(&w.app, "/oauth/login", json!({"request_id": d["request_id"], "challenge_id": d["challenge_id"], "did": w.st.did, "factors": [{"type": "totp", "code": totp::code_at(&secret, now() + 30)}]})).await;
-    assert_eq!(totp_login.status, StatusCode::OK, "{}", totp_login.text());
-    let totp_cookie = totp_login.cookie().unwrap();
-    let refresh = tokens_from_login(&w, &totp_login, &verifier).await["refresh_token"].as_str().unwrap().to_string();
+    let alone = post_json(&w.app, "/oauth/login", json!({"request_id": d["request_id"], "challenge_id": d["challenge_id"], "did": w.st.did, "factors": [{"type": "totp", "code": code()}]})).await;
+    assert_eq!(alone.status, StatusCode::UNAUTHORIZED, "{}", alone.text());
+    assert!(alone.json()["error_description"].as_str().unwrap().contains("alone"), "{}", alone.text());
+    assert!(alone.cookie().is_none(), "a code alone started a session");
+    let ch = post_json(&w.app, "/v1/auth/challenge", json!({"did": w.st.did})).await.json();
+    let api = post_json(&w.app, "/v1/auth/verify", json!({"challenge_id": ch["challenge_id"], "audience": ISSUER, "factors": [{"type": "totp", "code": code()}]})).await;
+    assert_eq!(api.status, StatusCode::UNAUTHORIZED, "{}", api.text());
+    assert!(api.json()["access_token"].is_null(), "{}", api.text());
+
+    // Wrong codes sent alone are not looked at, so they can't lock the authenticator...
+    for _ in 0..=kith_hub::TOTP_MAX_FAILURES {
+        let ch = post_json(&w.app, "/v1/auth/challenge", json!({"did": w.st.did})).await.json();
+        let r = post_json(&w.app, "/v1/auth/verify", json!({"challenge_id": ch["challenge_id"], "audience": ISSUER, "factors": [{"type": "totp", "code": "000000"}]})).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+    }
+    // ...and the code refused above was not spent. Next to the passkey it still counts,
+    // wherever it sits in the list.
     let page = get(&w.app, &authorize_url("app", APP_CB, &challenge, ""), None).await;
-    let passkey_cookie = login_with_passkey(&w, &page, &w.passkey).await.cookie().unwrap();
+    let d = page_data(&page.text());
+    let both = post_json(&w.app, "/oauth/login", json!({"request_id": d["request_id"], "challenge_id": d["challenge_id"], "did": w.st.did, "factors": [{"type": "totp", "code": code()}, passkey_factor(&w.passkey, d["message"].as_str().unwrap(), ORIGIN)]})).await;
+    assert_eq!(both.status, StatusCode::OK, "{}", both.text());
+    let tokens = tokens_from_login(&w, &both, &verifier).await;
+    let amr = jws::decode(tokens["access_token"].as_str().unwrap()).unwrap().claims["amr"].clone();
+    assert!(amr.as_array().unwrap().contains(&json!("otp")), "the code was not counted: {amr}");
 
-    let sso = |cookie: String| {
-        let (app, url) = (w.app.clone(), authorize_url("app", APP_CB, &challenge, ""));
-        async move { get(&app, &url, Some(&cookie)).await }
-    };
-    assert!(sso(totp_cookie.clone()).await.location().starts_with(APP_CB), "SSO works while the authenticator is enrolled");
-
-    // The operator resets it.
+    // The operator can still forget the authenticator.
     let wrong = call(&w.app, "DELETE", "/v1/admin/identities/x/totp", &[(header::AUTHORIZATION, "Bearer nope")], None, None).await;
     assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
     let reset = call(&w.app, "DELETE", &format!("/v1/admin/identities/{}/totp", w.st.did), &[(header::AUTHORIZATION, "Bearer ops-secret")], None, None).await;
     assert_eq!(reset.status, StatusCode::OK, "{}", reset.text());
     assert_eq!(reset.json()["reset"], true);
 
-    assert_eq!(sso(totp_cookie).await.status, StatusCode::OK, "the TOTP-only session is gone: back to the login page");
-    let r = post_form(&w.app, "/oauth/token", &[("grant_type", "refresh_token"), ("refresh_token", &refresh), ("client_id", "app")], None).await;
-    assert_eq!(r.json()["error"], "invalid_grant", "{}", r.text());
-    assert!(sso(passkey_cookie).await.location().starts_with(APP_CB), "the passkey session is untouched");
-
     // The authenticator can be enrolled again.
     let again = call(&w.app, "POST", "/v1/totp/enroll", &auth, None, Some(json!({}))).await;
     assert_eq!(again.status, StatusCode::OK, "{}", again.text());
+}
+
+/// Holding the admin role is not enough for the admin API: the sign-in has to be strong
+/// too (spec §7.10), whatever level the bundle hands the role out at.
+#[tokio::test]
+async fn the_admin_role_needs_a_strong_sign_in() {
+    let w = world_with(|cfg| {
+        // A role that everyone holds, at any assurance level.
+        let bundle = cfg.data_dir.with_file_name("everyone-is-ops.json");
+        std::fs::write(&bundle, json!({"version": 1, "groups": {}, "roles": {"ops": {"rule": "true"}}, "directory": {}, "policies": ""}).to_string()).unwrap();
+        cfg.bundle_path = Some(bundle);
+        cfg.admin_role = Some("ops".into());
+    });
+    let stats = |bearer: String| {
+        let app = w.app.clone();
+        async move { call(&app, "GET", "/v1/admin/stats", &[(header::AUTHORIZATION, bearer.as_str())], None, None).await }
+    };
+    // The laptop's key signs in at AAL 1 and holds the role.
+    let weak = stats(hub_bearer(&w, "laptop", &w.laptop).await).await;
+    assert_eq!(weak.status, StatusCode::FORBIDDEN, "{}", weak.text());
+    assert!(weak.json()["error_description"].as_str().unwrap().contains("strong sign-in"), "{}", weak.text());
+    // The passkey, with user verification, signs in at AAL 2.
+    let strong = stats(password_free_hub_token(&w).await).await;
+    assert_eq!(strong.status, StatusCode::OK, "{}", strong.text());
 }
 
 /// Whoever holds the authenticator, or a strong sign-in, may reset it.
@@ -2369,3 +2590,179 @@ async fn rp_initiated_logout_also_ends_offline_access() {
     assert_eq!(r.json()["error"], "invalid_grant", "a refresh token outlived the sign-out: {}", r.text());
 }
 
+
+async fn preflight(app: &Router, path: &str, origin: &str, method: &str, headers: &str) -> Resp {
+    call(
+        app,
+        "OPTIONS",
+        path,
+        &[
+            (header::ORIGIN, origin),
+            (header::ACCESS_CONTROL_REQUEST_METHOD, method),
+            (header::ACCESS_CONTROL_REQUEST_HEADERS, headers),
+        ],
+        None,
+        None,
+    )
+    .await
+}
+
+fn allow_origin(r: &Resp) -> Option<&str> {
+    r.headers
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .map(|v| v.to_str().unwrap())
+}
+
+fn varies_by_origin(r: &Resp) -> bool {
+    r.headers
+        .get_all(header::VARY)
+        .iter()
+        .any(|v| v.to_str().unwrap().to_ascii_lowercase().contains("origin"))
+}
+
+/// A single-page app redeems its code with `fetch` from its own origin (spec §7.1.1).
+#[tokio::test]
+async fn browser_apps_may_call_the_token_endpoint_from_their_redirect_origin() {
+    let w = world_with(|cfg| cfg.registration_token = Some("let-me-in".into()));
+    let app_origin = "http://localhost:3000"; // APP_CB's origin
+    let redeem_from = |origin: &'static str| {
+        let app = w.app.clone();
+        async move {
+            let req = Request::post("/oauth/token")
+                .header(header::ORIGIN, origin)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "grant_type=authorization_code&client_id=app&code=nope&code_verifier=x",
+                ))
+                .unwrap();
+            send(&app, req).await
+        }
+    };
+
+    // The preflight, and the request itself, from a registered redirect origin.
+    let p = preflight(&w.app, "/oauth/token", app_origin, "POST", "content-type").await;
+    assert_eq!(p.status, StatusCode::NO_CONTENT);
+    assert_eq!(allow_origin(&p), Some(app_origin));
+    let methods = p.headers[header::ACCESS_CONTROL_ALLOW_METHODS]
+        .to_str()
+        .unwrap();
+    assert!(methods.contains("POST"), "{methods}");
+    let allowed = p.headers[header::ACCESS_CONTROL_ALLOW_HEADERS]
+        .to_str()
+        .unwrap();
+    assert!(allowed.contains("content-type"), "{allowed}");
+    assert!(varies_by_origin(&p));
+    assert!(p
+        .headers
+        .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        .is_none());
+    let r = redeem_from(app_origin).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        allow_origin(&r),
+        Some(app_origin),
+        "errors are readable too"
+    );
+    assert!(r.json()["error"].is_string());
+    assert!(varies_by_origin(&r));
+
+    // Any other origin gets nothing it could read.
+    let p = preflight(&w.app, "/oauth/token", "https://evil.example", "POST", "").await;
+    assert_eq!(p.status, StatusCode::FORBIDDEN);
+    assert_eq!(allow_origin(&p), None);
+    let r = redeem_from("https://evil.example").await;
+    assert_eq!(allow_origin(&r), None);
+    assert!(varies_by_origin(&r));
+    // A look-alike of a registered origin is another origin.
+    let p = preflight(&w.app, "/oauth/token", "http://localhost:30000", "POST", "").await;
+    assert_eq!(allow_origin(&p), None);
+
+    // A registered client's origin is allowed once it is registered; the default port
+    // in its redirect URI is not part of the origin a browser sends.
+    let spa = "https://spa.example";
+    assert_eq!(
+        allow_origin(&preflight(&w.app, "/oauth/token", spa, "POST", "").await),
+        None
+    );
+    let reg = post_json_with(
+        &w.app,
+        "/oauth/register",
+        json!({"redirect_uris": ["https://SPA.example:443/callback"], "token_endpoint_auth_method": "none"}),
+        &[(header::AUTHORIZATION, "Bearer let-me-in")],
+    )
+    .await;
+    assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.text());
+    assert_eq!(
+        allow_origin(&preflight(&w.app, "/oauth/token", spa, "POST", "").await),
+        Some(spa)
+    );
+
+    // Userinfo takes a bearer, so its preflight allows the authorization header, and a
+    // 401 shows why.
+    let p = preflight(
+        &w.app,
+        "/oauth/userinfo",
+        app_origin,
+        "GET",
+        "authorization",
+    )
+    .await;
+    assert_eq!(allow_origin(&p), Some(app_origin));
+    let allowed = p.headers[header::ACCESS_CONTROL_ALLOW_HEADERS]
+        .to_str()
+        .unwrap();
+    assert!(allowed.contains("authorization"), "{allowed}");
+    let r = call(
+        &w.app,
+        "GET",
+        "/oauth/userinfo",
+        &[(header::ORIGIN, app_origin)],
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(allow_origin(&r), Some(app_origin));
+    let exposed = r.headers[header::ACCESS_CONTROL_EXPOSE_HEADERS]
+        .to_str()
+        .unwrap();
+    assert!(exposed.contains("www-authenticate"), "{exposed}");
+
+    // Discovery and keys are public: any origin, with or without an Origin header.
+    for path in [
+        "/.well-known/openid-configuration",
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/jwks.json",
+    ] {
+        let r = call(
+            &w.app,
+            "GET",
+            path,
+            &[(header::ORIGIN, "https://evil.example")],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{path}");
+        assert_eq!(allow_origin(&r), Some("*"), "{path}");
+        assert_eq!(
+            allow_origin(&get(&w.app, path, None).await),
+            Some("*"),
+            "{path}"
+        );
+        let p = preflight(&w.app, path, "https://evil.example", "GET", "").await;
+        assert_eq!(p.status, StatusCode::NO_CONTENT, "{path}");
+        assert_eq!(allow_origin(&p), Some("*"), "{path}");
+    }
+
+    // The pages a browser is sent to are not opened to scripts on other origins.
+    for path in [
+        "/oauth/login",
+        "/oauth/consent",
+        "/v1/auth/verify",
+        "/oauth/register",
+    ] {
+        let p = preflight(&w.app, path, app_origin, "POST", "content-type").await;
+        assert_eq!(allow_origin(&p), None, "{path}");
+    }
+}

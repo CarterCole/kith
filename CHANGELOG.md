@@ -4,6 +4,51 @@ Kith is a draft. The format will change until v1, so entries record what changed
 behaviour, not a promise about compatibility. Versions follow the workspace version in
 `Cargo.toml`.
 
+## Unreleased
+
+### Added
+
+- **Agent devices** (spec §1.3.3, §2.5). A new device kind, `agent`, for a key held by an
+  AI agent, a service or a CI job. It is always AAL1 and may hold only the `session`
+  capability, which the key log enforces at enrollment. Its logins carry `amr: agent`
+  next to `swk`, so a policy can require or exclude agents. `kith device add --kind
+  agent` enrolls one.
+- **Sign in with your phone** (spec §7.14). The login page and the signed-out account
+  page show a QR code. A phone that scans it signs in there with its passkey, after
+  being shown the app and the computer's browser and address; the computer finishes the
+  sign-in with a secret only it holds. The session is the phone's device, capped at
+  AAL2, so an app that asks for AAL3 isn't offered it.
+- **The visitor's address behind CloudFront** (spec §7.9). With `--cloudfront-secret`
+  (`KITH_CLOUDFRONT_SECRET`), a request that carries that secret in the
+  `Kith-Origin-Secret` origin header takes its address from `CloudFront-Viewer-Address`.
+  Rate limits then count visitors rather than CloudFront edges, and the phone sign-in
+  page shows the computer's own address. A request without the secret, such as one
+  sent straight to the origin, can't choose its address.
+
+### Changed
+
+- **A one-time code alone no longer signs in** (spec §2.3). `/oauth/login` and
+  `/v1/auth/verify` used to start a session for a `totp` factor by itself, which made a
+  six-digit code and a public DID enough to get in, given time to guess. A code is now
+  checked only after another factor of the same request has verified; sent alone it is
+  refused without being checked or spent. Sessions and refresh tokens an earlier hub
+  issued for a code alone are refused. In a token that used a code, `otp` now follows
+  the other methods in `amr`.
+- **The admin role needs a strong sign-in** (spec §7.10). A hub token in the admin role
+  opens `/v1/admin/…` only at `aal` 2 or more, whatever level the bundle gives the role
+  at. The admin token is unchanged.
+- **Rate limits count an IPv6 client by its /64** (spec §7.9), not by each address: one
+  subscriber usually holds a whole /64 and could otherwise get a fresh budget from every
+  address in it. An IPv4 address mapped into IPv6 counts as the IPv4 address. The phone
+  sign-in page still shows the full address.
+
+### Fixed
+
+- **Browser apps can redeem their code** (spec §7.1.1). The token and userinfo endpoints
+  answer CORS, and its preflight, for the origin of any registered redirect URI, so a
+  single-page app's `fetch` to `/oauth/token` is no longer blocked. Discovery and JWKS
+  allow any origin. Other paths still answer no CORS.
+
 ## 0.3.0 (2026-11-11)
 
 ### Added

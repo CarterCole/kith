@@ -37,6 +37,10 @@ pub enum DeviceKind {
     Hardware,
     /// A crypto wallet acting as a device.
     Wallet,
+    /// A non-human actor (an AI agent, a service, a CI job) holding its own key. No
+    /// person is present when it signs, so it is capped at aal 1 and holds only the
+    /// `session` capability.
+    Agent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +317,14 @@ fn validate_device(d: &Device) -> Result<()> {
     if !(1..=3).contains(&d.aal) {
         return Err(Error::Kel("device aal must be 1-3".into()));
     }
+    if d.kind == DeviceKind::Agent {
+        if d.aal != 1 {
+            return Err(Error::Kel("an agent device is aal 1".into()));
+        }
+        if d.caps.iter().any(|c| c != "session") {
+            return Err(Error::Kel("an agent device may hold only the session capability".into()));
+        }
+    }
     Ok(())
 }
 
@@ -554,6 +566,39 @@ pub(crate) mod tests {
         let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
         assert!(st.device("phone").is_none());
         assert!(st.revoked.contains("phone"));
+    }
+
+    #[test]
+    fn agent_device_is_aal1_and_session_only() {
+        let f = fixture();
+        let st = verify_log(&f.log, &VerifyOptions::default()).unwrap();
+        let agent = LocalSigner::generate(KeyType::Ed25519);
+        let mk = |aal: u8, caps: &[&str]| Device {
+            id: "bot".into(),
+            key: agent.id.clone(),
+            name: "build agent".into(),
+            kind: DeviceKind::Agent,
+            aal,
+            caps: caps.iter().map(|c| c.to_string()).collect(),
+            rp_id: None,
+            xkey: None,
+        };
+        let add = |dev: Device| {
+            let mut ev = next_event(&st, EventBody::AddDevice { device: dev });
+            ev.sign(&f.root).unwrap();
+            ev.sign(&agent).unwrap();
+            let mut log = f.log.clone();
+            log.push(ev);
+            verify_log(&log, &VerifyOptions::default())
+        };
+        let ok = add(mk(1, &["session"])).unwrap();
+        assert_eq!(ok.device("bot").unwrap().kind, DeviceKind::Agent);
+        // No human is present, so an agent never claims more than aal 1, and it holds
+        // neither the alias nor the revoke capability.
+        assert!(add(mk(2, &["session"])).is_err());
+        assert!(add(mk(1, &["alias"])).is_err());
+        assert!(add(mk(1, &["session", "revoke"])).is_err());
+        assert_eq!(serde_json::to_value(DeviceKind::Agent).unwrap(), "agent");
     }
 
     #[test]

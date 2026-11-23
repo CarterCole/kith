@@ -5,6 +5,9 @@
 - **Identity.** A `did:kith` identity from a KEL: nested threshold signer policies,
   pre-rotation, device add and revoke with proof of possession, public and private
   aliases, fork (duplicity) rejection, DID documents.
+- **Agent devices** ([spec §1.3.3](../spec/01-identity.md)). `kith device add --kind agent`
+  enrolls a non-human key: AAL1 and the `session` cap only, enforced by the key log. Its
+  logins carry `amr: agent`, so a policy can require or exclude agents.
 - **Names for roots** ([spec §5.1.1–5.1.2](../spec/05-aliases.md)). `kith resolve`
   follows a public alias's WebFinger, DNS TXT or did:web back-link to a root and
   accepts it only if the root's KEL links the alias back and no other root passes
@@ -18,7 +21,8 @@
   SSH keys (`SSHSIG`, Ed25519 and P-256) in the Rust core, checked against vectors that
   real `ssh-keygen` signed (`scripts/sshsig-vectors.mjs`).
 - **Login.** Session-chain login, SIWE-style challenge login (device key or passkey),
-  TOTP enrollment and step-up, AAL/AMR computation.
+  TOTP enrollment and step-up, AAL/AMR computation. A one-time code is a second factor
+  only: alone it signs nobody in and is not even checked ([spec §2.3](../spec/02-authentication.md)).
 - **Recovery.** The TOTP-gated hub co-signer as a rotation signer. The demo recovers an
   identity with one paper key plus TOTP after losing the other keys.
 - **Delegation.** RFC 8693 exchange producing `act` and `cap`. Attenuation is enforced
@@ -67,6 +71,8 @@
     pairwise subjects, logout.
   - A consent page with remembered grants, `prompt=consent`.
   - Dynamic client registration behind a registration token.
+  - CORS for browser apps on discovery, JWKS, token and userinfo, limited to the
+    origins of registered redirect URIs for token and userinfo ([spec §7.1.1](../spec/07-oidc.md)).
   - Back- and front-channel logout notices.
   - ID tokens encrypted to the client (`RSA-OAEP-256`, `ECDH-ES`; checked against `jose`).
   - Browser passkey enrollment brokered by the hub (`kith passkey enroll`), on this
@@ -84,6 +90,11 @@
     in the browser or with `kith device approve` until the manage policy is met, and
     `kith manage set` uses the recovery key (file or words) to change that policy.
     Verified in headless Chrome with the real CLI (`scripts/join-demo.sh`).
+  - Signing in with a phone ([spec §7.14](../spec/07-oidc.md)): the login page and the
+    signed-out account page show a QR code; a phone signs in there with its passkey,
+    and the page that showed the code finishes the sign-in with a secret only it holds.
+    The session is capped at AAL2. Tested with software passkeys (`tests/handoff.rs`),
+    not yet in headless Chrome.
   - Proof of work as an account score: `POST /v1/work`, the `work` token attribute,
     mining in the sign-up page and `kith work` ([spec §7.12](../spec/07-oidc.md)).
   - Upstream OIDC providers as a login factor, starting with Telegram Login
@@ -112,7 +123,10 @@
     replay cache and rate-limit counters. A restart signs nobody out. Bearer secrets
     are stored hashed.
   - Rate limits on `/oauth/login` and `/oauth/register` per client address, with
-    `--behind-proxy` for the address a reverse proxy appends.
+    `--behind-proxy` for the address a reverse proxy appends, and `--cloudfront-secret`
+    for the visitor's address behind CloudFront, trusted only on requests that carry a
+    secret CloudFront adds, so a client that goes around CloudFront can't choose it.
+    An IPv6 client counts by its /64.
   - An admin API (admin token, or any identity in the `hub-admin` role): list and end
     sessions, sign an identity out everywhere, list and delete registered clients,
     list and withdraw consent, list identities with their standing groups and roles,
@@ -218,6 +232,7 @@
   `POST /v1/admin/clients` under a chosen id). Login challenges, passkey enrollments and join requests in progress
   are still in memory (the page retries after a restart). The bundle is a hot-reloaded
   file, and there is no rate limit on anything but login, registration and TOTP.
+  The only CDN whose client address the hub understands is CloudFront.
 - **Bundle files.** A removal in a file that fails to load does not take effect until a
   good file replaces it (the stats report it; a revocation acts at once). The editor
   cannot rename a set, and its `Apply` from raw JSON refuses keys written twice rather
@@ -380,8 +395,10 @@ repeated here.
   are plaintext in SQLite; cookies, codes and refresh tokens are hashed. The hub's key
   files use the default umask. Encrypt the recoverable ones with a hub key and hash
   `client_secret`.
-- **TOTP lockout is a lever.** Five wrong codes lock an identity's TOTP for 15 minutes,
-  and anyone can send them using only public KEL data.
+- **TOTP lockout is a lever.** Five wrong codes lock an identity's TOTP for 15 minutes.
+  The sign-in endpoints no longer look at a code until another factor has verified, so
+  a stranger can't send them there; `POST /v1/cosign` still takes a code from anyone
+  who knows the DID of an identity with a co-signer.
 - **Refresh tokens.** No reuse detection or token-family revocation, and a 30-day life
   that rolls forward with no absolute cap.
 - **Hub exposure.** `PUT /v1/kel`, `PUT /v1/blocks` and `GET /v1/hub` re-verify whole

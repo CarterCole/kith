@@ -45,6 +45,7 @@ pub async fn page(State(h): State<Arc<Hub>>, headers: HeaderMap) -> Response {
             "message": message,
             "rp_id": h.cfg.rp_id,
             "signup": h.cfg.signup,
+            "phone": true,
         }));
     };
     let a = &s.authn;

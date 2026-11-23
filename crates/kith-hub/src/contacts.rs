@@ -352,7 +352,7 @@ pub async fn request_code(State(h): State<Arc<Hub>>, ip: ClientIp, headers: Head
     }
     let t = now();
     let limit = h.cfg.contacts.send_limit;
-    for bucket in [format!("contact-did|{}", c.sub), format!("contact-addr|{address}"), format!("contact-ip|{}", ip.0)] {
+    for bucket in [format!("contact-did|{}", c.sub), format!("contact-addr|{address}"), format!("contact-ip|{}", ip.limit_key())] {
         if let Some(retry) = h.store.hit(&bucket, limit, t)? {
             return Err(too_many(retry));
         }

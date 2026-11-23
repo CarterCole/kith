@@ -14,6 +14,7 @@ const CONSENT: &str = include_str!("pages/consent.html");
 const LOGOUT: &str = include_str!("pages/logout.html");
 const WHOAMI: &str = include_str!("pages/whoami.html");
 const JOIN: &str = include_str!("pages/join.html");
+const HANDOFF: &str = include_str!("pages/handoff.html");
 static BRAND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The name pages show to people. Letters, digits and spaces only, so it can sit in HTML
@@ -32,6 +33,8 @@ pub(crate) fn brand() -> &'static str {
 }
 
 const COMMON_JS: &str = include_str!("pages/common.js");
+/// The QR code for signing in with a phone, on the pages that sign in (spec §7.14).
+const PHONE_JS: &str = include_str!("pages/phone.js");
 
 fn render(status: StatusCode, template: &str, data: &Value) -> Response {
     render_framing(status, template, data, &[])
@@ -46,6 +49,7 @@ fn render_framing(status: StatusCode, template: &str, data: &Value, frames: &[St
     let html = template
         .replace("{{STYLE}}", STYLE)
         .replace("{{COMMON_JS}}", COMMON_JS)
+        .replace("{{PHONE_JS}}", PHONE_JS)
         .replace("{{BRAND}}", brand())
         .replace("{{NONCE}}", &nonce)
         .replace("{{DATA}}", &json);
@@ -102,6 +106,10 @@ pub fn whoami(data: Value) -> Response {
 
 pub fn join(data: Value) -> Response {
     render(StatusCode::OK, JOIN, &data)
+}
+
+pub fn handoff(data: Value) -> Response {
+    render(StatusCode::OK, HANDOFF, &data)
 }
 
 /// `scheme://host[:port]` of a URL, when it is plain enough to put in a CSP header.

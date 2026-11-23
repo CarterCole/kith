@@ -13,6 +13,12 @@
   <div class="stack">
     <button id="passkey" class="primary" type="button">Sign in with a passkey</button>
   </div>
+  <div id="phone-box" class="phone hidden">
+    <div class="or">or use your phone</div>
+    <img id="phone-qr" class="phone-qr hidden" alt="A QR code: scan it with your phone to sign in here">
+    <p id="phone-note" class="meta center"></p>
+    <button id="phone-again" class="secondary hidden" type="button">Show a new code</button>
+  </div>
   <div id="upstreams" class="stack mt"></div>
   <div id="otp-box" class="hidden">
     <label for="otp">One-time code from your authenticator app</label>
@@ -30,12 +36,14 @@
     <div class="stack mt">
       <button id="wallet" class="secondary" type="button">Sign with an Ethereum wallet</button>
       <button id="show-otp" class="secondary" type="button">Add a one-time code</button>
+      <button id="phone" class="secondary hidden" type="button">Sign in with your phone</button>
     </div>
   </details>
 </main>
 <script id="kith-data" type="application/json">{{DATA}}</script>
 <script nonce="{{NONCE}}">
 {{COMMON_JS}}
+{{PHONE_JS}}
 let challenge = { id: D.challenge_id, message: D.message };
 $("client").textContent = D.client_name;
 try { $("did").value = localStorage.getItem("kith_did") || ""; } catch {}
@@ -56,8 +64,20 @@ if (D.signup) {
 }
 $("show-otp").onclick = () => { $("otp-box").classList.remove("hidden"); $("otp").focus(); };
 
+// A phone that holds the passkey can sign this browser in by scanning a QR code.
+const phoneDone = (redirect) => {
+  status("Signed in. Returning to " + D.client_name + "…", "ok");
+  location.assign(redirect);
+};
+if (D.phone && phoneByDefault) {
+  phoneStart(D.request_id, phoneDone);
+} else if (D.phone) {
+  $("phone").classList.remove("hidden");
+  $("phone").onclick = () => { $("phone").classList.add("hidden"); phoneStart(D.request_id, phoneDone); };
+}
+
 function busy(on) {
-  for (const id of ["passkey", "wallet", "continue"]) $(id).disabled = on;
+  for (const id of ["passkey", "wallet", "continue", "phone"]) $(id).disabled = on;
   for (const b of $("upstreams").children) b.disabled = on;
 }
 
