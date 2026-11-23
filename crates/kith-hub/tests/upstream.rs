@@ -336,6 +336,11 @@ async fn telegram_login_and_unlink() {
     assert!(r.location().starts_with(APP_CB));
     let session = r.cookie("kith_session").expect("session cookie");
 
+    // A sign-in that rests on Telegram alone cannot add a second factor: whoever holds
+    // the Telegram account would choose it.
+    let setup = send(&w.app, Request::post("/v1/account/totp").header(header::COOKIE, session.as_str()).header(header::CONTENT_TYPE, "application/json").body(Body::from("{}")).unwrap()).await;
+    assert_eq!(setup.status, StatusCode::FORBIDDEN, "{}", setup.text());
+
     // Tokens say how weak the evidence was: AAL1, amr fed, no device.
     let tok = redeem(&w, &r.location(), &verifier).await;
     let id = jws::decode(tok["id_token"].as_str().unwrap()).unwrap().claims;
@@ -430,6 +435,13 @@ async fn callback_rejections() {
 async fn step_up_with_totp() {
     let w = world().await;
 
+    // Before an authenticator is enrolled, the page isn't told to ask for a code.
+    let (_, challenge) = pkce();
+    let page = get_(&w.app, &authorize_url(&challenge, "&acr_values=urn%3Akith%3Aacr%3Aaal2"), None).await;
+    let request_id = page_data(&page.text())["request_id"].as_str().unwrap().to_string();
+    let r = come_back(&w, &visit_provider(&w, &request_id, TG_USER, "").await).await;
+    assert_eq!(page_data(&r.text())["federated"]["totp"], false);
+
     // Enroll TOTP from the laptop.
     let dev = w.state().device("laptop").unwrap().clone();
     let sk = SessionKey::create(&w.did, &dev, DeviceSigner::Key(&w.laptop.secret), 3600).unwrap();
@@ -452,6 +464,7 @@ async fn step_up_with_totp() {
     let d = page_data(&r.text());
     assert_eq!(d["request_id"], request_id.as_str());
     assert_eq!((d["federated"]["did"].as_str(), d["federated"]["provider"].as_str()), (Some(w.did.as_str()), Some("Telegram")));
+    assert_eq!(d["federated"]["totp"], true, "enrolled, so the page asks for a code");
     let token = d["federated"]["token"].as_str().unwrap();
     let code = totp::code_at(&secret, now());
 

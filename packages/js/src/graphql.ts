@@ -9,6 +9,9 @@
  * - Row level: for types marked `@auth` at the type level (or listed in `rowLevel`),
  *   every object is checked with `"<Type>.read"`; lists are filtered, single objects
  *   are denied.
+ * - Step-up: a denied field that a higher assurance level would allow is an
+ *   `INSUFFICIENT_USER_AUTHENTICATION` error with an RFC 9470 `WWW-Authenticate`
+ *   challenge in `extensions.http` (spec §4.3.2), not FORBIDDEN.
  * - Meta-fields: `__typename` is always allowed, since client libraries add it to every
  *   selection set. `__schema` and `__type` (introspection) are open unless
  *   `introspection: "authenticated"`, which asks for a principal.
@@ -49,6 +52,12 @@ export interface KithGraphQLOptions {
   toResource?: (typeName: string, obj: any) => Resource;
   /** "error" (default) adds a FORBIDDEN error; "null" silently returns null. */
   onDeny?: "error" | "null";
+  /**
+   * When a denied field (or a single row) would be allowed after a stronger sign-in,
+   * return an `INSUFFICIENT_USER_AUTHENTICATION` error carrying the RFC 9470 challenge
+   * instead (spec §4.3.2). Default true.
+   */
+  stepUp?: boolean;
   /**
    * Who may introspect the schema (`__schema`, `__type`). "open" (default) lets anyone;
    * "authenticated" needs a principal, or `anonymous`. `__typename` is always allowed.
@@ -110,6 +119,48 @@ function forbidden(action: string) {
   return new GraphQLError(`Not authorized: ${action}`, { extensions: { code: "FORBIDDEN", action } });
 }
 
+const ACR_PREFIX = "urn:kith:acr:aal";
+
+/**
+ * The RFC 9470 `WWW-Authenticate` value that asks the client to sign in again at
+ * `level` (spec §4.3.2). The client sends the user to the hub with `acr_values` set to
+ * the `acr_values` it names.
+ */
+export function stepUpChallenge(level: 2 | 3): string {
+  return `Bearer error="insufficient_user_authentication", error_description="A stronger sign-in is required", acr_values="${ACR_PREFIX}${level}"`;
+}
+
+/**
+ * The level a resource server asked for, or `null`: from a `WWW-Authenticate` value, a
+ * `Response`, or a GraphQL error from `kithGraphQL`. Of several `acr_values`, the
+ * lowest Kith level wins, as the hub reads them.
+ */
+export function stepUpRequired(from: string | Response | { extensions?: Record<string, unknown> } | null | undefined): 2 | 3 | null {
+  let text: string | null | undefined;
+  if (typeof from === "string") text = from;
+  else if (typeof Response !== "undefined" && from instanceof Response) text = from.headers.get("www-authenticate");
+  else if (from && typeof from === "object" && "extensions" in from) {
+    const e = from.extensions ?? {};
+    if (e.code !== "INSUFFICIENT_USER_AUTHENTICATION") return null;
+    text = `Bearer error="insufficient_user_authentication", acr_values="${String(e.acr_values ?? "")}"`;
+  }
+  if (!text || !/error="insufficient_user_authentication"/.test(text)) return null;
+  const values = /acr_values="([^"]*)"/.exec(text)?.[1] ?? "";
+  const levels = values.split(/\s+/).filter((v) => /^urn:kith:acr:aal[23]$/.test(v)).map((v) => Number(v.slice(ACR_PREFIX.length)) as 2 | 3);
+  return levels.length ? (Math.min(...levels) as 2 | 3) : null;
+}
+
+function stepUp(action: string, level: 2 | 3) {
+  return new GraphQLError(`A stronger sign-in is required for ${action}`, {
+    extensions: {
+      code: "INSUFFICIENT_USER_AUTHENTICATION",
+      action,
+      acr_values: `${ACR_PREFIX}${level}`,
+      http: { status: 401, headers: { "WWW-Authenticate": stepUpChallenge(level) } },
+    },
+  });
+}
+
 export function kithGraphQL(schema: GraphQLSchema, opts: KithGraphQLOptions): GraphQLSchema {
   const getPrincipal = opts.getPrincipal ?? ((ctx: KithContext) => ctx?.kith?.principal);
   const toResource = opts.toResource ?? defaultToResource;
@@ -134,6 +185,15 @@ export function kithGraphQL(schema: GraphQLSchema, opts: KithGraphQLOptions): Gr
     opts.onDecision?.({ principal, action, resource, allowed: d.allowed, reasons: d.reasons });
     return d.allowed;
   };
+  // A denied field that a stronger sign-in would allow asks for one, even with
+  // `onDeny: "null"`: the user can do something about it. Rows filtered out of a list
+  // are not stepped up.
+  const deny = (principal: Principal, action: string, resource: Resource, context: Record<string, unknown>) => {
+    const level = opts.stepUp === false ? null : opts.engine.stepUp(principal, action, resource, context);
+    if (level) throw stepUp(action, level);
+    if (opts.onDeny === "null") return null;
+    throw forbidden(action);
+  };
 
   for (const type of Object.values(schema.getTypeMap())) {
     if (!(type instanceof GraphQLObjectType) || type.name.startsWith("__")) continue;
@@ -156,10 +216,7 @@ export function kithGraphQL(schema: GraphQLSchema, opts: KithGraphQLOptions): Gr
         const context = { ...(clientArgs(args) as Record<string, unknown>), operationType: info.operation.operation, field: key };
         if (checkField) {
           const resource = isRoot ? { type: "Operation", id: key } : toResource(type.name, source);
-          if (!check(principal, action, resource, context)) {
-            if (opts.onDeny === "null") return null;
-            throw forbidden(action);
-          }
+          if (!check(principal, action, resource, context)) return deny(principal, action, resource, context);
         }
         const result = await original(source, args, ctx, info);
         if (!rowCheck || result == null) return result;
@@ -167,8 +224,7 @@ export function kithGraphQL(schema: GraphQLSchema, opts: KithGraphQLOptions): Gr
         const visible = (item: any) => item == null || check(principal, readAction, toResource(returnType, item), { operationType: info.operation.operation, field: key });
         if (Array.isArray(result)) return result.filter(visible);
         if (!visible(result)) {
-          if (opts.onDeny === "null") return null;
-          throw forbidden(readAction);
+          return deny(principal, readAction, toResource(returnType, result), { operationType: info.operation.operation, field: key });
         }
         return result;
       };

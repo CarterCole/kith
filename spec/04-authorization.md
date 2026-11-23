@@ -264,6 +264,53 @@ does for every other role.
 `test-vectors/authz.json`, under `assume`, has who may assume what, the memberships
 that result, decisions made with them, and bundles that must not load.
 
+### 4.3.2 Step-up (normative)
+
+A principal signs in once at whatever level its factors give (§2.5), and a policy asks
+for more only where it matters: a condition on `principal.aal`, or a set whose rule
+does. Nothing else declares a level. When a request is denied, a resource server can
+ask whether a stronger sign-in would change that:
+
+```cedar
+permit(principal in Role::"billing-reader", action == Action::"Query.export", resource)
+  when { principal has aal && principal.aal >= 2 };
+```
+
+**The step-up level** of a denied request is the lowest of 2 and 3, above the
+principal's `aal`, at which this holds: the same request is allowed for the principal
+with
+- `aal` set to that level, every other attribute as it was;
+- the groups and roles it holds, plus the sets it would hold at that level and does not
+  hold at its own. A set the session does not hold for another reason (revoked,
+  excluded, left out of the token) stays out. An assumed role is recomputed at that
+  level as §4.3.1 says, and the standing sets are used when it cannot be assumed there.
+
+There is none when the request is allowed, when neither level is enough, or when an
+actor holds a delegation: an agent cannot sign in again as the user. A principal with
+no `aal` counts as 0, so its level is at least 2, never 1. Only `aal` changes: a policy
+that names `amr` (`principal.amr.contains("otp")`) is not seen by this test.
+
+The level is a hint, never a grant. After the user steps up, the request is decided
+again with the new token. It costs at most two more evaluations, and only on a denial.
+
+**Asking for it.** The resource server answers as RFC 9470 says, with HTTP 401 and:
+
+```
+WWW-Authenticate: Bearer error="insufficient_user_authentication",
+  error_description="A stronger sign-in is required", acr_values="urn:kith:acr:aal2"
+```
+
+The client sends the user to the hub with that `acr_values` (§7.3.1), which asks only
+for the factor the session is missing, and retries with the new token.
+
+| Implementation | Level | Challenge | Client side |
+|----------------|-------|-----------|-------------|
+| Rust | `Engine::step_up` | | |
+| JS | `engine.stepUp` | `stepUpChallenge(level)` | `stepUpRequired(error \| Response \| header)` |
+| Python | `engine.step_up` | `step_up_challenge(level)` | `step_up_required(error \| header)` |
+
+`test-vectors/authz.json`, under `step_up`, has the level for each case above.
+
 ## 4.4 Delegation
 
 Before evaluating Cedar, if the principal carries `caps`, the action and resource must
@@ -283,6 +330,13 @@ same way.
 
 - Lists of row-level types are filtered. A denied single object returns null plus a
   `FORBIDDEN` error.
+- A denied field or single object that a stronger sign-in would allow (§4.3.2) is an
+  `INSUFFICIENT_USER_AUTHENTICATION` error instead, with `acr_values` in its extensions
+  and the challenge: JS puts it in `extensions.http` (status 401 and the
+  `WWW-Authenticate` header, which GraphQL Yoga sends), Python in
+  `extensions["www_authenticate"]` for the framework to send. This holds with
+  `onDeny: "null"` too, since the user can do something about it. Rows filtered out of
+  a list are not stepped up. `stepUp: false` (JS) or `step_up=False` (Python) turns it off.
 - No principal gives `UNAUTHENTICATED`, unless an `anonymous` principal is configured.
 - `__typename` is always allowed. Client libraries add it to every selection set, and it
   reveals only a name the client already has.
@@ -314,10 +368,16 @@ Every implementation MUST pass [`test-vectors/authz.json`](test-vectors/authz.js
 The vectors cover explicit, nested, dynamic and role-of-group membership, AAL-dependent
 dynamic roles, context conditions, row-level attributes (including floats and nulls),
 and delegation attenuation. Its `entities` suite covers §4.2.1 and §4.2.2: parents,
-related entities, the conflicts that deny, and every typed value. Rust, JS and Python
+related entities, the conflicts that deny, and every typed value. Its `step_up` suite
+covers §4.3.2. Rust, JS and Python
 all run them (`scripts/test-all.sh`).
 
 Not yet implemented:
+- **Step-up for `amr` and freshness.** §4.3.2 raises only `aal`. A policy that asks for
+  a kind of factor, or for a recent sign-in (RFC 9470 `max_age`), is denied without a
+  hint.
+- **A Rust challenge helper.** The Rust core gives the level; there is no Rust
+  resource-server middleware to send the challenge.
 - **Action groups.** `action in Action::"…"` matches nothing, because no action has
   parents. §9 (draft) puts groups in an audience's schema.
 - **Hierarchy in the GraphQL mapping.** The middlewares pass no parents by themselves.

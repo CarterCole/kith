@@ -329,6 +329,10 @@ pub(crate) struct AuthRequest {
     /// Authenticated, waiting on the consent page: the login and its hub session
     /// (the hash of the cookie value, never the value).
     pub(crate) pending: Option<(Authn, String)>,
+    /// A hub session too weak for this request that the login page may step up
+    /// (spec §7.3.1): its identity and the hash of its cookie value.
+    #[serde(default)]
+    pub(crate) step_up: Option<(String, String)>,
 }
 
 /// An authorization code waiting to be redeemed.
@@ -616,7 +620,10 @@ pub async fn authorize(
         federated: None,
         ask_consent: prompts.contains(&"consent"),
         pending: None,
+        step_up: None,
     };
+    // A session that holds but is too weak: the login page adds a factor to it.
+    let mut step_up = None;
 
     let _ = h.store.sweep(now());
     // SSO: reuse the hub session when it is strong and fresh enough.
@@ -652,6 +659,8 @@ pub async fn authorize(
                     return fail("server_error", "could not save the sign-in request");
                 }
                 return Redirect::to(&consent_url(&request_id)).into_response();
+            } else if fresh && session_holds(&h, &a).is_some() && h.totp_session_alive(&a) {
+                step_up = Some((a.st.did.clone(), store::hash(&sid)));
             }
         }
     }
@@ -659,6 +668,7 @@ pub async fn authorize(
         return fail("login_required", "no hub session satisfies this request");
     }
 
+    let req = AuthRequest { step_up, ..req };
     let request_id = random_id();
     if h.store.put_request(&request_id, &req).is_err() {
         return fail("server_error", "could not save the sign-in request");
@@ -704,8 +714,16 @@ pub(crate) fn login_page(
         "min_aal": ar.min_aal,
         "upstreams": upstream::summary(h),
         "signup": h.cfg.signup,
-        "federated": federated.map(|(f, provider)| json!({"did": f.did, "provider": provider, "token": f.token})),
+        "federated": federated.map(|(f, provider)| json!({"did": f.did, "provider": provider, "token": f.token, "totp": has_totp(h, &f.did)})),
+        // Signed in already, but not strongly enough: ask only for what is missing.
+        "step_up": ar.step_up.as_ref().filter(|_| federated.is_none()).map(|(did, _)| json!({"did": did, "totp": has_totp(h, did)})),
     })))
+}
+
+/// Whether `did` has a confirmed authenticator, so the login page asks for a code only
+/// when one can work. Told only after a first factor has shown who is signing in.
+fn has_totp(h: &Hub, did: &str) -> bool {
+    matches!(h.store.totp(did), Ok(Some(r)) if r.confirmed)
 }
 
 /// Finish a login: start the hub session, then mint the code or stop at the consent
@@ -716,6 +734,18 @@ pub(crate) fn complete_login(
     request_id: &str,
     ar: AuthRequest,
     a: Authn,
+) -> Option<(String, HeaderValue)> {
+    complete_login_carrying(h, request_id, ar, a, None)
+}
+
+/// [`complete_login`] for a step-up: the new session takes over `carry`'s `sid` and
+/// the clients it has signed in to, under a new cookie value.
+fn complete_login_carrying(
+    h: &Hub,
+    request_id: &str,
+    ar: AuthRequest,
+    a: Authn,
+    carry: Option<SsoSession>,
 ) -> Option<(String, HeaderValue)> {
     let client = h.client(&ar.client_id)?;
     let ask = h.needs_consent(&client, &a.st.did, &ar);
@@ -732,7 +762,7 @@ pub(crate) fn complete_login(
     if !still_there {
         return None;
     }
-    let cookie = start_session(h, &sid, &a)?;
+    let cookie = start_session_carrying(h, &sid, &a, carry)?;
     let next = if ask {
         consent_url(request_id)
     } else {
@@ -744,15 +774,20 @@ pub(crate) fn complete_login(
 /// Store a hub session for `a` under the cookie value `sid`, and return the
 /// `Set-Cookie` header that hands the browser that value.
 pub(crate) fn start_session(h: &Hub, sid: &str, a: &Authn) -> Option<HeaderValue> {
+    start_session_carrying(h, sid, a, None)
+}
+
+fn start_session_carrying(h: &Hub, sid: &str, a: &Authn, carry: Option<SsoSession>) -> Option<HeaderValue> {
     // `id` is what clients see as `sid`; the cookie value is only ever stored hashed.
+    let (id, clients) = carry.map_or_else(|| (random_id(), BTreeSet::new()), |s| (s.id, s.clients));
     h.store
         .put_session(
             sid,
             &SsoSession {
-                id: random_id(),
+                id,
                 authn: a.clone(),
                 expires: now() + SESSION_TTL,
-                clients: BTreeSet::new(),
+                clients,
             },
         )
         .ok()?;
@@ -929,11 +964,15 @@ pub struct LoginReq {
     /// Continues an upstream login that needed step-up: the token from the page.
     #[serde(default)]
     federated: Option<String>,
+    /// Adds `factors` to the hub session in the request's cookie, which the login page
+    /// offered to step up (spec §7.3.1).
+    #[serde(default)]
+    step_up: bool,
 }
 
 /// The login page posts here. On failure the response carries a fresh challenge so
 /// the page can retry (e.g. after asking for a TOTP code for step-up).
-pub async fn login(State(h): State<Arc<Hub>>, ip: ClientIp, Json(req): Json<LoginReq>) -> Response {
+pub async fn login(State(h): State<Arc<Hub>>, ip: ClientIp, headers: HeaderMap, Json(req): Json<LoginReq>) -> Response {
     if let Err(r) = h.rate_limit("login", &ip, h.cfg.login_limit) {
         return r;
     }
@@ -981,9 +1020,28 @@ pub async fn login(State(h): State<Arc<Hub>>, ip: ClientIp, Json(req): Json<Logi
             }
         }
     }
+    // Step-up: the session this request offered to strengthen, still the same one and
+    // still holding. Signing in as someone else is an ordinary sign-in.
+    let mut prior = None;
+    if req.step_up && ar.step_up.as_ref().is_none_or(|(offered, _)| *offered == did) {
+        let sid = cookie(&headers, SESSION_COOKIE);
+        let session = sid.as_ref().and_then(|sid| {
+            let (_, hash) = ar.step_up.as_ref()?;
+            (*hash == store::hash(sid)).then_some(())?;
+            h.store.session(sid).ok().flatten()
+        });
+        match (sid, session) {
+            (Some(sid), Some(s)) if s.authn.st.did == did && session_holds(&h, &s.authn).is_some() && h.totp_session_alive(&s.authn) => prior = Some((sid, s)),
+            _ => return retry(ApiError::unauthorized("there is no sign-in here to step up; sign in again")),
+        }
+    }
     let a = match h.authenticate(&did, &ch.message, &factors) {
         Ok(a) => Authn { attrs, ..a },
         Err(e) => return retry(e),
+    };
+    let a = match &prior {
+        Some((_, s)) => s.authn.stepped_up(a),
+        None => a,
     };
     if a.aal < ar.min_aal {
         return retry(
@@ -996,10 +1054,18 @@ pub async fn login(State(h): State<Arc<Hub>>, ip: ClientIp, Json(req): Json<Logi
                 ),
                 None,
             )
-            .with(json!({"aal": a.aal, "required_aal": ar.min_aal})),
+            .with(json!({"aal": a.aal, "required_aal": ar.min_aal, "totp": has_totp(&h, &did)})),
         );
     }
-    let Some((redirect, cookie)) = complete_login(&h, &req.request_id, ar, a) else {
+    // The weaker session ends; the stronger one keeps its `sid` and clients.
+    let carry = match prior {
+        Some((sid, _)) => match h.store.take_session(&sid) {
+            Ok(Some(s)) => Some(s),
+            _ => return retry(ApiError::unauthorized("that sign-in ended; sign in again")),
+        },
+        None => None,
+    };
+    let Some((redirect, cookie)) = complete_login_carrying(&h, &req.request_id, ar, a, carry) else {
         return ApiError::bad("invalid_request", "this sign-in request was already used")
             .into_response();
     };

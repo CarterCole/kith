@@ -18,6 +18,11 @@
 - **Log in with anything.** A device session chain, a signed challenge (SIWE-style), a
   passkey, TOTP step-up. The hub turns the evidence into a normal JWT with `aal` and
   `amr` claims.
+- **2FA only where it matters.** Sign in once with one factor. A policy that says
+  `principal.aal >= 2` makes just that permission ask for more: the API answers with an
+  RFC 9470 step-up challenge, and the hub asks only for the missing factor, a one-time
+  code or a passkey with PIN, adding it to the session you have. Set up the
+  authenticator app on the hub's account page (`/whoami`) by scanning a QR code.
 - **"Sign in with Kith" for existing apps.** The hub is a standard OpenID Connect
   provider: code flow with PKCE, username-less passkey login, SSO, step-up through
   `acr_values`, and pairwise subjects. With `--signup`, people can create an account in
@@ -162,9 +167,13 @@ const res = await kith.fetch("api://invoices", "/graphql", { method: "POST", bod
 **GraphQL server, Node** (Yoga, Apollo, Envelop, anything on graphql-js)
 
 ```ts
-import { Engine, createVerifier, kithGraphQL, kithContextFactory } from "@kith/auth";
+import { Engine, createVerifier, kithGraphQL, kithContextFactory, stepUpRequired } from "@kith/auth";
 kithGraphQL(schema, { engine: new Engine(bundle) });   // root fields default-deny, @auth rows and fields
 createYoga({ schema, context: kithContextFactory(createVerifier({ issuer: HUB, audience: "api://invoices" })) });
+
+// In the app: a field that needs a stronger sign-in says so (spec §4.3.2)
+const level = stepUpRequired(result.errors?.[0]);      // 2, 3 or null
+if (level) location.assign(authorizeUrl + "&acr_values=urn:kith:acr:aal" + level);
 ```
 
 **GraphQL server, Python** (Ariadne, Graphene, anything that takes graphql-core middleware)
@@ -181,6 +190,8 @@ GraphQL(schema, context_value=…, http_handler=GraphQLHTTPHandler(middleware=[K
 use kith_core::{token::verify_access_token, authz::{typed, Engine, EntityRef, Principal, Resource}};
 let claims = verify_access_token(tok, &jwks, HUB, "api://invoices", now())?;
 let ok = engine.authorize(&principal, "Query.invoices", &Resource::new("Operation", "Query.invoices"), &ctx)?.allowed;
+// Denied, but would a stronger sign-in help? Some(2) or Some(3): answer with RFC 9470
+let level = engine.step_up(&principal, "Query.export", &Resource::new("Operation", "Query.export"), &ctx)?;
 
 // A resource in a hierarchy, and a typed value in the context (spec §4.2.1, §4.2.2)
 let mut doc = Resource::new("Document", "d1");
@@ -222,6 +233,9 @@ forbid(principal, action, resource) when { context has actor && context.operatio
 //   "break-glass": { "assume": { "members": ["group:oncall"], "max_age": 600 } }
 // a role without "assume", such as "god", is never assumed
 permit(principal in Role::"break-glass", action == Action::"Mutation.deleteInvoice", resource);
+// only this permission needs 2FA: a weaker session is asked to step up (spec §4.3.2)
+permit(principal in Role::"billing-reader", action == Action::"Query.export", resource)
+  when { principal has aal && principal.aal >= 2 };
 // a folder and everything the request says is in it, from the office network only
 permit(principal in Role::"billing-reader", action == Action::"Document.read", resource in Folder::"finance")
   when { context has sourceIp && context.sourceIp.isInRange(ip("10.0.0.0/8")) };
@@ -233,7 +247,7 @@ permit(principal in Role::"billing-reader", action == Action::"Document.read", r
 |------|------|
 | `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
 | `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, bundle file checks, verified-domain proofs, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
-| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email, phone and domain contacts (TXT, CNAME or HTML-file proof, witnessed by any hub), OpenID Connect provider with passkey login and enrollment pages, public profile and `whoami` views, names in a verified domain with WebFinger, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
+| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email, phone and domain contacts (TXT, CNAME or HTML-file proof, witnessed by any hub), OpenID Connect provider with passkey login, step-up and enrollment pages, an account page that sets up an authenticator app, public profile and `whoami` views, names in a verified domain with WebFinger, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
 | `crates/kith-cli` | `kith` binary, including the local bundle editor (`kith bundle edit`) |
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |

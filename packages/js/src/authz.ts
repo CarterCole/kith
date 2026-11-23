@@ -301,6 +301,41 @@ export class Engine {
   }
 
   /**
+   * The lowest assurance level, 2 or 3, at which a denied request would be allowed
+   * (spec §4.3.2), so a resource server can ask the user to step up instead of just
+   * refusing. `null` when the request is allowed, when no level would help, or when an
+   * actor holds a delegation (an agent cannot sign in again as the user).
+   */
+  stepUp(principal: Principal, action: string, resource: Resource, context: Record<string, unknown> = {}): 2 | 3 | null {
+    if (principal.actor || this.authorize(principal, action, resource, context).allowed) return null;
+    const id = principal.id;
+    // What the principal holds at a level: with the assumed role when the role can be
+    // assumed there, standing otherwise.
+    const sets = (attrs: Record<string, unknown>) => {
+      const a = this.attributes(id, attrs);
+      if (principal.assumed) {
+        const m = this.assume(id, a, new Set(), principal.assumed);
+        if (!("refused" in m)) return m;
+      }
+      return this.memberships(id, a);
+    };
+    const now = sets(principal.attrs);
+    const current = typeof principal.attrs.aal === "number" ? principal.attrs.aal : 0;
+    // The session keeps every set it holds and gains only those the higher level adds:
+    // a set taken away from it (revoked, excluded) does not come back.
+    const gain = (held: string[], before: string[], after: string[]) =>
+      [...new Set([...held, ...after.filter((x) => !before.includes(x))])].sort();
+    for (const level of [2, 3] as const) {
+      if (level <= current) continue;
+      const attrs = { ...principal.attrs, aal: level };
+      const then = sets(attrs);
+      const raised = { ...principal, attrs, groups: gain(principal.groups, now.groups, then.groups), roles: gain(principal.roles, now.roles, then.roles) };
+      if (this.authorize(raised, action, resource, context).allowed) return level;
+    }
+    return null;
+  }
+
+  /**
    * Evaluate `action` on `resource`. Delegated principals must also hold a matching
    * capability: delegation can only narrow what the delegator could do.
    */

@@ -19,6 +19,7 @@
 //! | `GET  /oauth/userinfo`                    | OIDC userinfo                                   |
 //! | `GET  /oauth/logout`                      | RP-initiated logout                             |
 //! | `GET, POST /whoami`                       | the account page, and its passkey sign-in (see [`account`]) |
+//! | `POST /v1/account/totp`, `/v1/account/totp/confirm` | set up an authenticator app from the account page (session) |
 //! | `GET  /login`                             | redirects to `/whoami`                          |
 //! | `GET/PUT /v1/kel/{did}`                   | fetch / append a key event log                  |
 //! | `GET  /v1/did/{did}`                      | DID document                                    |
@@ -388,6 +389,41 @@ pub enum Factor {
 }
 
 impl Authn {
+    /// This sign-in with `more` added to it (step-up, spec §7.3.1): the kinds of factor
+    /// both used, the higher level, and the device and linked account of either, so
+    /// revoking or unlinking what the first one rested on still ends the session.
+    pub(crate) fn stepped_up(&self, more: Authn) -> Authn {
+        let kind = |m: &str| match m {
+            "wallet" | "swk" | "hwk" => Some("possession"),
+            "user" => Some("inherence"),
+            "otp" => Some("otp"),
+            "fed" => Some("federated"),
+            _ => None,
+        };
+        let mut amr: Vec<String> = vec![];
+        for m in self.amr.iter().chain(&more.amr) {
+            if m != "mfa" && !amr.contains(m) {
+                amr.push(m.clone());
+            }
+        }
+        let kinds: BTreeSet<_> = amr.iter().filter_map(|m| kind(m)).collect();
+        let mut aal = self.aal.max(more.aal);
+        if kinds.len() >= 2 {
+            aal = aal.max(2);
+            amr.push("mfa".into());
+        }
+        let mut attrs = self.attrs.clone();
+        attrs.extend(more.attrs);
+        Authn {
+            dev: more.dev.or_else(|| self.dev.clone()),
+            alias: more.alias.or_else(|| self.alias.clone()),
+            aal,
+            amr,
+            attrs,
+            ..more
+        }
+    }
+
     /// Nothing but an authenticator code vouches for this sign-in: no device that could
     /// be revoked and no linked account that could be unlinked.
     pub(crate) fn rests_on_totp_alone(&self) -> bool {
@@ -1297,28 +1333,36 @@ fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
 
 async fn totp_enroll(State(h): State<Arc<Hub>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let c = h.bearer(&headers)?;
-    if h.store.totp(&c.sub)?.is_some_and(|r| r.confirmed) {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "exists".into(),
-            "TOTP already enrolled".into(),
-            None,
-        ));
+    Ok(Json(h.totp_begin(&c.sub)?))
+}
+
+impl Hub {
+    /// A new, unconfirmed authenticator secret for `did`, replacing one not yet
+    /// confirmed. A confirmed one stays until it is reset (`DELETE /v1/totp`).
+    pub(crate) fn totp_begin(&self, did: &str) -> ApiResult<Value> {
+        if self.store.totp(did)?.is_some_and(|r| r.confirmed) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "exists".into(),
+                "TOTP already enrolled".into(),
+                None,
+            ));
+        }
+        let secret = totp::generate_secret();
+        let uri = totp::otpauth_uri(&secret, &self.cfg.rp_id, did);
+        let b32 = totp::to_base32(&secret);
+        self.store.put_totp(
+            did,
+            &store::TotpRecord {
+                secret,
+                confirmed: false,
+                last_step: 0,
+                failures: 0,
+                locked_until: 0,
+            },
+        )?;
+        Ok(json!({"secret": b32, "otpauth_uri": uri}))
     }
-    let secret = totp::generate_secret();
-    let uri = totp::otpauth_uri(&secret, &h.cfg.rp_id, &c.sub);
-    let b32 = totp::to_base32(&secret);
-    h.store.put_totp(
-        &c.sub,
-        &store::TotpRecord {
-            secret,
-            confirmed: false,
-            last_step: 0,
-            failures: 0,
-            locked_until: 0,
-        },
-    )?;
-    Ok(Json(json!({"secret": b32, "otpauth_uri": uri})))
 }
 
 #[derive(Deserialize)]
@@ -1495,6 +1539,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/join/{id}/qr.svg", get(join::qr_svg))
         .route("/", get(home))
         .route("/whoami", get(account::page).post(account::login))
+        .route("/v1/account/totp", post(account::totp_enroll))
+        .route("/v1/account/totp/confirm", post(account::totp_confirm))
         .route(
             "/login",
             get(|| async { axum::response::Redirect::to("/whoami") }),

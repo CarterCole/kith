@@ -687,6 +687,7 @@ async fn prompt_none_step_up_and_errors() {
         (Some(2), Some(3))
     );
     assert!(j["challenge_id"].is_string() && j["message"].is_string());
+    assert_eq!(j["totp"], false, "no authenticator enrolled, so the page won't ask for a code");
 
     // A passkey that isn't this identity's is rejected (and gets a retry challenge).
     let page = get(&w.app, &authorize_url("app", APP_CB, &challenge, ""), None).await;
@@ -2369,3 +2370,90 @@ async fn rp_initiated_logout_also_ends_offline_access() {
     assert_eq!(r.json()["error"], "invalid_grant", "a refresh token outlived the sign-out: {}", r.text());
 }
 
+
+/// A passkey assertion without user verification: possession only, AAL 1.
+fn passkey_factor_no_uv(passkey: &LocalSigner, message: &str) -> Value {
+    let (data, sig) = webauthn::soft_assert(&passkey.secret, "localhost", ORIGIN, &sha256(message.as_bytes()), false, 1).unwrap();
+    json!({"type": "webauthn", "authenticator_data": data.authenticator_data, "client_data_json": data.client_data_json, "signature": b64u(sig)})
+}
+
+/// Step-up (spec §7.3.1): an app asks for more than the hub session holds. The login
+/// page asks only for what is missing, the hub adds it to the session it has, and the
+/// session keeps its `sid` under a new cookie.
+#[tokio::test]
+async fn step_up_adds_a_factor_to_the_session() {
+    let w = world();
+    let bearer = hub_bearer(&w, "laptop", &w.laptop).await;
+    let auth = [(header::AUTHORIZATION, bearer.as_str())];
+
+    // An AAL 1 session: the passkey, without its PIN.
+    let (verifier, challenge) = pkce();
+    let page = get(&w.app, &authorize_url("app", APP_CB, &challenge, ""), None).await;
+    let d = page_data(&page.text());
+    assert!(d["step_up"].is_null(), "no session, nothing to step up");
+    let weak = post_json(&w.app, "/oauth/login", json!({"request_id": d["request_id"], "challenge_id": d["challenge_id"], "did": w.st.did, "factors": [passkey_factor_no_uv(&w.passkey, d["message"].as_str().unwrap())]})).await;
+    assert_eq!(weak.status, StatusCode::OK, "{}", weak.text());
+    let weak_cookie = weak.cookie().unwrap();
+    let first = tokens_from_login(&w, &weak, &verifier).await;
+    let first_id = jws::decode(first["id_token"].as_str().unwrap()).unwrap().claims;
+    assert_eq!(first_id["acr"], "urn:kith:acr:aal1");
+
+    // The app wants AAL 2. No authenticator yet: the page asks for a passkey.
+    let aal2 = |challenge: &str| authorize_url("app", APP_CB, challenge, "&acr_values=urn%3Akith%3Aacr%3Aaal2");
+    let (_, challenge) = pkce();
+    let page = get(&w.app, &aal2(&challenge), Some(&weak_cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(page_data(&page.text())["step_up"], json!({"did": w.st.did, "totp": false}));
+
+    // Enroll one; now the page asks for a code.
+    let enrolled = call(&w.app, "POST", "/v1/totp/enroll", &auth, None, Some(json!({}))).await.json();
+    let secret = totp::from_base32(enrolled["secret"].as_str().unwrap()).unwrap();
+    assert_eq!(call(&w.app, "POST", "/v1/totp/confirm", &auth, None, Some(json!({"code": totp::code_at(&secret, now())}))).await.status, StatusCode::OK);
+    let (verifier, challenge) = pkce();
+    let page = get(&w.app, &aal2(&challenge), Some(&weak_cookie)).await;
+    let d = page_data(&page.text());
+    assert_eq!(d["step_up"], json!({"did": w.st.did, "totp": true}));
+    let code = totp::code_at(&secret, now() + 30);
+    let step_up = |cookie: Option<String>, d: Value, challenge_id: Value| {
+        let app = w.app.clone();
+        let did = w.st.did.clone();
+        let code = code.clone();
+        async move {
+            let body = json!({"request_id": d["request_id"], "challenge_id": challenge_id, "did": did, "factors": [{"type": "totp", "code": code}], "step_up": true});
+            match cookie {
+                Some(c) => post_json_with(&app, "/oauth/login", body, &[(header::COOKIE, c.as_str())]).await,
+                None => post_json(&app, "/oauth/login", body).await,
+            }
+        }
+    };
+
+    // Without the session's cookie there is nothing to add the code to.
+    let r = step_up(None, d.clone(), d["challenge_id"].clone()).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+    assert!(r.cookie().is_none());
+
+    // With it, the code and the passkey together are AAL 2.
+    let ok = step_up(Some(weak_cookie.clone()), d.clone(), r.json()["challenge_id"].clone()).await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.text());
+    let strong_cookie = ok.cookie().unwrap();
+    assert_ne!(strong_cookie, weak_cookie, "a new cookie for the stronger session");
+    let tok = tokens_from_login(&w, &ok, &verifier).await;
+    let id = jws::decode(tok["id_token"].as_str().unwrap()).unwrap().claims;
+    assert_eq!(id["acr"], "urn:kith:acr:aal2");
+    assert_eq!(id["amr"], json!(["hwk", "otp", "mfa"]));
+    assert_eq!(id["sid"], first_id["sid"], "the same session, stepped up");
+
+    // The weak cookie is spent; the strong one signs in at AAL 2 without asking.
+    let (_, challenge) = pkce();
+    assert_eq!(get(&w.app, &aal2(&challenge), Some(&weak_cookie)).await.status, StatusCode::OK, "back to the login page");
+    let (_, challenge) = pkce();
+    assert!(get(&w.app, &aal2(&challenge), Some(&strong_cookie)).await.location().starts_with(APP_CB));
+
+    // A request that did not offer a step-up cannot be used for one (prompt=login).
+    let (_, challenge) = pkce();
+    let page = get(&w.app, &authorize_url("app", APP_CB, &challenge, "&acr_values=urn%3Akith%3Aacr%3Aaal3&prompt=login"), Some(&strong_cookie)).await;
+    let d = page_data(&page.text());
+    assert!(d["step_up"].is_null(), "prompt=login asks for a full sign-in");
+    let r = step_up(Some(strong_cookie.clone()), d.clone(), d["challenge_id"].clone()).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+}

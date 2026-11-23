@@ -627,3 +627,41 @@ async fn the_account_page_offers_to_add_a_device() {
     assert!(page.text().contains(r#"id="add""#));
     assert!(page.text().contains("/v1/join/invite"));
 }
+
+/// Setting up an authenticator app from the account page (spec §7.11.1): the hub
+/// session is the credential, the page shows a QR code, and a code confirms it.
+#[tokio::test]
+async fn the_account_page_sets_up_an_authenticator() {
+    let w = world(|_| {});
+    let acct = sign_up(&w).await;
+    let d = page_data(&get(&w.app, "/whoami", Some(&acct.cookie)).await.text());
+    assert_eq!(d["totp"], false);
+
+    let r = post(&w.app, "/v1/account/totp", json!({}), None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "signed out: {}", r.text());
+
+    let r = post(&w.app, "/v1/account/totp", json!({}), Some(&acct.cookie)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let secret = kith_core::totp::from_base32(j["secret"].as_str().unwrap()).unwrap();
+    assert!(j["otpauth_uri"].as_str().unwrap().starts_with("otpauth://totp/"));
+    assert!(j["qr"].as_str().unwrap().starts_with("data:image/svg+xml;base64,"));
+    assert_eq!(page_data(&get(&w.app, "/whoami", Some(&acct.cookie)).await.text())["totp"], false, "not until it is confirmed");
+
+    let confirm = |code: String, cookie: Option<String>| {
+        let app = w.app.clone();
+        async move { post(&app, "/v1/account/totp/confirm", json!({"code": code}), cookie.as_deref()).await }
+    };
+    let now = kith_core::util::now();
+    assert_eq!(confirm(kith_core::totp::code_at(&secret, now), None).await.status, StatusCode::UNAUTHORIZED);
+    let wrong = confirm("000000".into(), Some(acct.cookie.clone())).await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED, "{}", wrong.text());
+    let ok = confirm(kith_core::totp::code_at(&secret, now), Some(acct.cookie.clone())).await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.text());
+    assert_eq!(ok.json()["confirmed"], true);
+    assert_eq!(page_data(&get(&w.app, "/whoami", Some(&acct.cookie)).await.text())["totp"], true);
+
+    // One authenticator at a time: replacing it is `DELETE /v1/totp`.
+    let again = post(&w.app, "/v1/account/totp", json!({}), Some(&acct.cookie)).await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.text());
+}

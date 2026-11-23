@@ -4,7 +4,7 @@ from pathlib import Path
 from graphql import build_schema, graphql_sync
 
 from kith import Engine
-from kith.graphql import KithMiddleware
+from kith.graphql import KithMiddleware, step_up_challenge, step_up_required
 
 EX = Path(__file__).parents[3] / "examples"
 BUNDLE = json.loads((EX / "policy/bundle.template.json").read_text().replace("__ADA__", "did:kith:ada").replace("__BOB__", "did:kith:bob"))
@@ -36,11 +36,30 @@ def test_unauthenticated():
     assert run("{ me { did } }").errors[0].extensions["code"] == "UNAUTHENTICATED"
 
 
-def test_reader_sees_rows_not_notes():
+def test_reader_sees_rows_notes_ask_for_step_up():
     r = run("{ invoices { id internalNotes } }", ENGINE.principal("did:kith:ada", {"aal": 1}))
     assert [i["id"] for i in r.data["invoices"]] == ["inv_1", "inv_2", "inv_3"]
     assert r.data["invoices"][0]["internalNotes"] is None
-    assert r.errors[0].extensions["code"] == "FORBIDDEN"
+    e = r.errors[0].extensions
+    assert e["code"] == "INSUFFICIENT_USER_AUTHENTICATION", "AAL2 would make ada a billing admin"
+    assert e["acr_values"] == "urn:kith:acr:aal2"
+    assert e["www_authenticate"] == 'Bearer error="insufficient_user_authentication", error_description="A stronger sign-in is required", acr_values="urn:kith:acr:aal2"'
+    assert step_up_required(r.errors[0]) == 2
+
+
+def test_step_up_only_when_some_level_allows():
+    q = 'mutation { payInvoice(id: "inv_1", amount: 1200) { status } }'
+    assert run(q, ENGINE.principal("did:kith:ada", {"aal": 1})).errors[0].extensions["code"] == "INSUFFICIENT_USER_AUTHENTICATION"
+    bob = run(q, ENGINE.principal("did:kith:bob", {"aal": 1}))
+    assert bob.errors[0].extensions["code"] == "FORBIDDEN", "bob is no admin at any level"
+    assert step_up_required(bob.errors[0]) is None
+
+
+def test_step_up_required_reads_an_rfc_9470_challenge():
+    assert step_up_required(step_up_challenge(3)) == 3
+    assert step_up_required('Bearer error="insufficient_user_authentication", acr_values="aal3 urn:kith:acr:aal2"') == 2
+    assert step_up_required('Bearer error="invalid_token"') is None
+    assert step_up_required(None) is None
 
 
 def test_admin_notes_and_pay_limit():

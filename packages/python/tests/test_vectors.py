@@ -74,6 +74,27 @@ def test_assume_max_age():
     assert ASSUME_ENGINE.assume_max_age("break-glass") == 600 and ASSUME_ENGINE.assume_max_age("god") is None
 
 
+STEP_UP = VECTORS["step_up"]
+STEP_UP_ENGINE = Engine(STEP_UP["bundle"])
+
+
+@pytest.mark.parametrize("d", STEP_UP["decisions"], ids=lambda d: d["name"])
+def test_step_up(d):
+    """§4.3.2: the lowest level at which a denied request would be allowed."""
+    e = STEP_UP_ENGINE
+    attrs = e.attributes(d["principal"], d["attrs"])
+    if "groups" in d:
+        m = (d["groups"], d["roles"])
+    elif "assume" in d:
+        m = e.assume(d["principal"], attrs, [], d["assume"])
+    else:
+        m = e.memberships(d["principal"], attrs)
+    p = Principal(d["principal"], attrs, m[0], m[1], actor=d.get("actor"), caps=d.get("caps"), assumed=d.get("assume"))
+    r = Resource("Operation", d["action"])
+    assert e.authorize(p, d["action"], r, d["context"]).allowed == d["allowed"]
+    assert e.step_up(p, d["action"], r, d["context"]) == d["step_up"]
+
+
 def test_rule_injection_rejected():
     with pytest.raises(ValueError):
         Engine({"version": 1, "groups": {"x": {"rule": "true }; permit(principal, action, resource) when { true"}}, "policies": ""})

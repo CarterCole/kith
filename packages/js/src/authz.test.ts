@@ -64,6 +64,23 @@ for (const b of vectors.assume.invalid) {
 }
 test("assume: max_age", () => assert.equal(assumeEngine.assumeMaxAge("break-glass"), 600));
 
+// §4.3.2: the lowest level at which a denied request would be allowed.
+const stepUpEngine = new Engine(vectors.step_up.bundle);
+for (const d of vectors.step_up.decisions) {
+  test(`step-up: ${d.name}`, () => {
+    const attrs = stepUpEngine.attributes(d.principal, d.attrs);
+    const m = d.groups
+      ? { groups: d.groups, roles: d.roles }
+      : d.assume
+        ? (stepUpEngine.assume(d.principal, attrs, new Set(), d.assume) as { groups: string[]; roles: string[] })
+        : stepUpEngine.memberships(d.principal, attrs);
+    const p = { id: d.principal, attrs, ...m, actor: d.actor, caps: d.caps, assumed: d.assume };
+    const r = { type: "Operation", id: d.action };
+    assert.equal(stepUpEngine.authorize(p, d.action, r, d.context).allowed, d.allowed);
+    assert.equal(stepUpEngine.stepUp(p, d.action, r, d.context), d.step_up);
+  });
+}
+
 test("rule injection is rejected", () => {
   assert.throws(() => new Engine({ version: 1, groups: { x: { rule: 'true }; permit(principal, action, resource) when { true' } }, policies: "" }));
 });

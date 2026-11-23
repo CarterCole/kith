@@ -42,8 +42,9 @@ try { $("did").value = localStorage.getItem("kith_did") || ""; } catch {}
 if (D.min_aal >= 3) {
   status("This app requires a hardware security key.");
 } else if (D.min_aal >= 2) {
-  $("otp-box").classList.remove("hidden");
-  status("This app asks for a strong sign-in: a passkey with PIN or biometrics, or add a one-time code.");
+  // The page doesn't know yet whether this identity has an authenticator app; it asks
+  // for a code only once the hub says one is enrolled.
+  status("This app asks for a strong sign-in: a passkey with PIN or biometrics.");
 }
 if (!webauthnSupported()) {
   $("passkey").disabled = true;
@@ -76,26 +77,54 @@ for (const u of D.upstreams || []) {
   $("upstreams").append(b);
 }
 
-// Back from a provider, but this app needs more than it can give: add a one-time code.
+// Back from a provider, but this app needs more than it can give: add a one-time code
+// if this identity has an authenticator app, otherwise a passkey.
 let federated = D.federated || null;
-if (federated) {
+if (federated && federated.totp) {
   $("otp-box").classList.remove("hidden");
   $("continue").classList.remove("hidden");
   $("passkey").className = "secondary";
   if (D.min_aal < 3) status("Signed in with " + federated.provider + ". Enter a one-time code to finish, or use a passkey instead.");
   $("otp").focus();
+} else if (federated && D.min_aal < 3) {
+  status("Signed in with " + federated.provider + ", but this app needs a stronger sign-in. Use a passkey to finish.");
 }
+
+// Already signed in, but not strongly enough for this app: add a factor to that sign-in.
+const stepUp = !federated && D.step_up ? D.step_up : null;
+if (stepUp) {
+  $("more").classList.add("hidden");
+  if (stepUp.totp && D.min_aal < 3) {
+    $("otp-box").classList.remove("hidden");
+    $("continue").classList.remove("hidden");
+    $("passkey").className = "secondary";
+    status("You're signed in, but " + D.client_name + " needs a stronger sign-in. Enter a one-time code, or use a passkey with PIN or biometrics.");
+    $("otp").focus();
+  } else if (D.min_aal < 3) {
+    status("You're signed in, but " + D.client_name + " needs a stronger sign-in. Use a passkey with PIN or biometrics.");
+  } else {
+    status("You're signed in, but " + D.client_name + " needs a hardware security key.");
+  }
+}
+
 $("continue").onclick = async () => {
   if (!$("otp").value.trim()) { status("Enter a one-time code first.", "error"); $("otp").focus(); return; }
   busy(true);
-  try { await submit(federated.did, [], federated.token); } finally { busy(false); }
+  try {
+    if (federated) await submit(federated.did, [], federated.token);
+    else await submit(stepUp.did, []);
+  } finally { busy(false); }
 };
 
 async function submit(did, factors, federatedToken) {
   const code = $("otp").value.trim();
   if (code) factors.push({ type: "totp", code });
   status("Checking…");
-  const r = await postJSON("/oauth/login", { request_id: D.request_id, challenge_id: challenge.id, did, factors, federated: federatedToken });
+  // Add to the sign-in this browser has. A passkey of another identity (or one that
+  // names it by a sign-up handle) is checked by the hub, which treats another
+  // identity as an ordinary sign-in.
+  const step_up = !!stepUp && !federatedToken;
+  const r = await postJSON("/oauth/login", { request_id: D.request_id, challenge_id: challenge.id, did, factors, federated: federatedToken, step_up });
   if (r.ok) {
     // A sign-up handle isn't an identity to type into the wallet box.
     if (did.startsWith("did:kith:")) { try { localStorage.setItem("kith_did", did); } catch {} }
@@ -106,10 +135,12 @@ async function submit(did, factors, federatedToken) {
   if (r.body.challenge_id) challenge = { id: r.body.challenge_id, message: r.body.message };
   if (r.body.error === "step_up_required" && r.body.required_aal >= 3) {
     status("This app requires a hardware security key (assurance level 3). This passkey reached level " + r.body.aal + ". Try a device-bound security key.", "error");
-  } else if (r.body.error === "step_up_required") {
+  } else if (r.body.error === "step_up_required" && r.body.totp) {
     $("otp-box").classList.remove("hidden");
     $("otp").focus();
     status("One more step: enter a one-time code, then sign in again.", "error");
+  } else if (r.body.error === "step_up_required") {
+    status("This app needs a stronger sign-in. Use a passkey with PIN or biometrics, or set up an authenticator app on your account first.", "error");
   } else {
     status(r.body.error_description || "Sign-in failed.", "error");
   }

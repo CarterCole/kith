@@ -10,6 +10,9 @@ which this package does not ship yet.) Same rules as the JS package:
   object as the resource.
 * Types marked ``@auth`` (or in ``row_level``) are checked per object with
   ``"<Type>.read"``; lists are filtered.
+* A denied field that a higher assurance level would allow is an
+  ``INSUFFICIENT_USER_AUTHENTICATION`` error carrying the RFC 9470 challenge in
+  ``extensions["www_authenticate"]`` (spec §4.3.2), not FORBIDDEN.
 * ``__typename`` is always allowed, since client libraries add it to every selection
   set. ``__schema`` and ``__type`` (introspection) are open unless
   ``introspection="authenticated"``, which asks for a principal.
@@ -18,6 +21,7 @@ which this package does not ship yet.) Same rules as the JS package:
 from __future__ import annotations
 
 import inspect
+import re
 from typing import Any, Callable
 
 from graphql import GraphQLError, GraphQLResolveInfo, get_named_type
@@ -62,6 +66,49 @@ def _forbidden(action: str) -> GraphQLError:
     return GraphQLError(f"Not authorized: {action}", extensions={"code": "FORBIDDEN", "action": action})
 
 
+ACR_PREFIX = "urn:kith:acr:aal"
+
+
+def step_up_challenge(level: int) -> str:
+    """The RFC 9470 ``WWW-Authenticate`` value that asks the client to sign in again at
+    ``level`` (spec §4.3.2). The client sends the user to the hub with ``acr_values``
+    set to the ``acr_values`` it names."""
+    return f'Bearer error="insufficient_user_authentication", error_description="A stronger sign-in is required", acr_values="{ACR_PREFIX}{level}"'
+
+
+def step_up_required(source: Any) -> int | None:
+    """The level a resource server asked for, or ``None``: from a ``WWW-Authenticate``
+    value or a GraphQL error from :class:`KithMiddleware`. Of several ``acr_values``,
+    the lowest Kith level wins, as the hub reads them."""
+    if isinstance(source, str):
+        text = source
+    elif isinstance(getattr(source, "extensions", None), dict):
+        e = source.extensions
+        if e.get("code") != "INSUFFICIENT_USER_AUTHENTICATION":
+            return None
+        text = f'Bearer error="insufficient_user_authentication", acr_values="{e.get("acr_values", "")}"'
+    else:
+        return None
+    if 'error="insufficient_user_authentication"' not in text:
+        return None
+    m = re.search(r'acr_values="([^"]*)"', text)
+    levels = [int(v[len(ACR_PREFIX):]) for v in (m.group(1).split() if m else []) if v in (f"{ACR_PREFIX}2", f"{ACR_PREFIX}3")]
+    return min(levels) if levels else None
+
+
+def _step_up(action: str, level: int) -> GraphQLError:
+    return GraphQLError(
+        f"A stronger sign-in is required for {action}",
+        extensions={
+            "code": "INSUFFICIENT_USER_AUTHENTICATION",
+            "action": action,
+            "acr_values": f"{ACR_PREFIX}{level}",
+            # For the framework to send as the response's WWW-Authenticate header.
+            "www_authenticate": step_up_challenge(level),
+        },
+    )
+
+
 class KithMiddleware:
     """graphql-core middleware. Pass ``middleware=[KithMiddleware(engine)]``."""
 
@@ -75,6 +122,7 @@ class KithMiddleware:
         to_resource: Callable[[str, Any], Resource] = default_to_resource,
         on_deny: str = "error",
         introspection: str = "open",
+        step_up: bool = True,
     ):
         self.engine = engine
         self.get_principal = get_principal or (lambda ctx: (ctx.get("kith") if isinstance(ctx, dict) else getattr(ctx, "kith", None)))
@@ -86,11 +134,18 @@ class KithMiddleware:
         if introspection not in ("open", "authenticated"):
             raise ValueError('introspection must be "open" or "authenticated"')
         self.introspection = introspection
+        self.step_up = step_up
 
     def _check(self, principal: Principal, action: str, resource: Resource, context: dict) -> bool:
         return self.engine.authorize(principal, action, resource, context).allowed
 
-    def _deny(self, action: str):
+    def _deny(self, principal: Principal, action: str, resource: Resource, context: dict):
+        # A denied field that a stronger sign-in would allow asks for one, even with
+        # on_deny="null": the user can do something about it. Rows filtered out of a
+        # list are not stepped up.
+        level = self.engine.step_up(principal, action, resource, context) if self.step_up else None
+        if level:
+            raise _step_up(action, level)
         if self.on_deny == "null":
             return None
         raise _forbidden(action)
@@ -122,8 +177,9 @@ class KithMiddleware:
         if check_field:
             action = (directive or {}).get("action") or key
             resource = Resource("Operation", key) if is_root else self.to_resource(parent.name, root)
-            if not self._check(principal, action, resource, {**client_args(args), "operationType": op, "field": key}):
-                return self._deny(action)
+            context = {**client_args(args), "operationType": op, "field": key}
+            if not self._check(principal, action, resource, context):
+                return self._deny(principal, action, resource, context)
 
         result = next_(root, info, **args)
         if not row_check:
@@ -133,10 +189,11 @@ class KithMiddleware:
         def filter_rows(value: Any) -> Any:
             if value is None:
                 return None
-            ok = lambda item: item is None or self._check(principal, read, self.to_resource(rtype.name, item), {"operationType": op, "field": key})
+            ctx = {"operationType": op, "field": key}
+            ok = lambda item: item is None or self._check(principal, read, self.to_resource(rtype.name, item), ctx)
             if isinstance(value, (list, tuple)):
                 return [i for i in value if ok(i)]
-            return value if ok(value) else self._deny(read)
+            return value if ok(value) else self._deny(principal, read, self.to_resource(rtype.name, value), ctx)
 
         if inspect.isawaitable(result):
             async def awaited():

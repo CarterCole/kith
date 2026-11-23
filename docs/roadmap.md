@@ -31,9 +31,18 @@
   assumable: held only by a session that asks for it (`kith login --role`), for no
   longer than its `max_age`. A role without that setting, such as `god`, is never
   assumed ([spec §4.3.1](../spec/04-authorization.md)).
+- **Step-up per permission.** Only the permissions whose policy asks for `aal >= 2`
+  (or 3) need a second factor. A denied request that a stronger sign-in would allow
+  gets an RFC 9470 `insufficient_user_authentication` challenge naming the level
+  ([spec §4.3.2](../spec/04-authorization.md)), the same in Rust, JS and Python, and the
+  hub then asks only for the missing factor, adding it to the session it has
+  ([spec §7.3.1](../spec/07-oidc.md)). The login page asks for a one-time code only
+  when the identity has an authenticator, and the account page (`/whoami`) sets one up
+  with a QR code, no CLI needed ([spec §7.11](../spec/07-oidc.md)).
 - **GraphQL.** Root, field and row-level enforcement for graphql-js (Yoga, Apollo) and
   graphql-core middleware (Ariadne, Graphene). Both example APIs return identical
-  results. `__typename` always works and introspection is open or `authenticated`, the
+  results, and both turn a denial that a stronger sign-in would lift into a step-up
+  error. `__typename` always works and introspection is open or `authenticated`, the
   same in both ([spec §4.5](../spec/04-authorization.md)).
 - **Browser client.** Passkey creation, enrollment and login against a live hub, using a
   WebCrypto authenticator in tests.

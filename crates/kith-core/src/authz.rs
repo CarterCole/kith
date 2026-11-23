@@ -493,6 +493,57 @@ impl Engine {
         Ok(Ok(self.fixpoint(id, attrs, excluded, Some(role))?.0))
     }
 
+    /// The lowest assurance level, 2 or 3, at which a denied request would be allowed
+    /// (spec §4.3.2), so a resource server can ask the user to step up instead of just
+    /// refusing. `None` when the request is allowed, when no level would help, or when an
+    /// actor holds a delegation (an agent cannot sign in again as the user).
+    pub fn step_up(&self, principal: &Principal, action: &str, resource: &Resource, context: &Value) -> Result<Option<u8>> {
+        if principal.actor.is_some() || self.authorize(principal, action, resource, context)?.allowed {
+            return Ok(None);
+        }
+        let id = principal.id.as_str();
+        let none = BTreeSet::new();
+        // What the principal holds at a level: with the assumed role when the role can
+        // be assumed there, standing otherwise.
+        let sets = |attrs: &Map<String, Value>| -> Result<Memberships> {
+            let attrs = self.attributes(id, attrs);
+            match &principal.assumed {
+                Some(role) => match self.assume(id, &attrs, &none, role)? {
+                    Ok(m) => Ok(m),
+                    Err(_) => self.memberships(id, &attrs),
+                },
+                None => self.memberships(id, &attrs),
+            }
+        };
+        let now = sets(&principal.attrs)?;
+        let current = principal.attrs.get("aal").and_then(Value::as_f64).unwrap_or(0.0);
+        // The session keeps every set it holds and gains only those the higher level adds:
+        // a set taken away from it (revoked, excluded) does not come back.
+        let gain = |held: &[String], before: &[String], after: &[String]| -> Vec<String> {
+            let mut out: BTreeSet<String> = held.iter().cloned().collect();
+            out.extend(after.iter().filter(|s| !before.contains(s)).cloned());
+            out.into_iter().collect()
+        };
+        for level in 2u8..=3 {
+            if f64::from(level) <= current {
+                continue;
+            }
+            let mut attrs = principal.attrs.clone();
+            attrs.insert("aal".into(), json!(level));
+            let then = sets(&attrs)?;
+            let raised = Principal {
+                groups: gain(&principal.groups, &now.groups, &then.groups),
+                roles: gain(&principal.roles, &now.roles, &then.roles),
+                attrs,
+                ..principal.clone()
+            };
+            if self.authorize(&raised, action, resource, context)?.allowed {
+                return Ok(Some(level));
+            }
+        }
+        Ok(None)
+    }
+
     /// The longest an access token may carry `role` as assumed, if the role says.
     pub fn assume_max_age(&self, role: &str) -> Option<u64> {
         self.bundle.roles.get(role)?.assume.as_ref()?.max_age
@@ -732,6 +783,42 @@ mod tests {
             assert!(loaded.is_err(), "loaded: {}", b["note"]);
         }
         assert_eq!(e.assume_max_age("break-glass"), Some(600));
+    }
+
+    /// §4.3.2: the lowest level at which a denied request would be allowed.
+    #[test]
+    fn step_up_vectors() {
+        let v: Value = serde_json::from_str(include_str!("../../../spec/test-vectors/authz.json")).unwrap();
+        let v = &v["step_up"];
+        let e = Engine::new(serde_json::from_value(v["bundle"].clone()).unwrap()).unwrap();
+        let mut failed = vec![];
+        for d in v["decisions"].as_array().unwrap() {
+            let id = d["principal"].as_str().unwrap();
+            let attrs = e.attributes(id, d["attrs"].as_object().unwrap());
+            let assumed = d["assume"].as_str().map(String::from);
+            let m = match (&d.get("groups"), &assumed) {
+                (Some(_), _) => Memberships { groups: serde_json::from_value(d["groups"].clone()).unwrap(), roles: serde_json::from_value(d["roles"].clone()).unwrap() },
+                (None, Some(role)) => e.assume(id, &attrs, &BTreeSet::new(), role).unwrap().unwrap(),
+                (None, None) => e.memberships(id, &attrs).unwrap(),
+            };
+            let p = Principal {
+                id: id.into(),
+                attrs,
+                groups: m.groups,
+                roles: m.roles,
+                actor: d["actor"].as_str().map(String::from),
+                caps: d.get("caps").map(|c| serde_json::from_value(c.clone()).unwrap()),
+                assumed,
+            };
+            let action = d["action"].as_str().unwrap();
+            let r = Resource::new("Operation", action);
+            let allowed = e.authorize(&p, action, &r, &d["context"]).unwrap().allowed;
+            let step_up = e.step_up(&p, action, &r, &d["context"]).unwrap();
+            if allowed != d["allowed"].as_bool().unwrap() || json!(step_up) != d["step_up"] {
+                failed.push(format!("{}: allowed {allowed}, step_up {step_up:?}", d["name"].as_str().unwrap()));
+            }
+        }
+        assert!(failed.is_empty(), "wrong answers: {failed:#?}");
     }
 
     #[test]

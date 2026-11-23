@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 
 import cedarpy
@@ -337,6 +337,43 @@ class Engine:
     def assume_max_age(self, role: str) -> int | None:
         """The longest an access token may carry ``role`` as assumed, if the role says."""
         return ((self.roles.get(role) or {}).get("assume") or {}).get("max_age")
+
+    def step_up(self, principal: Principal, action: str, resource: Resource, context: Mapping[str, Any] | None = None) -> int | None:
+        """The lowest assurance level, 2 or 3, at which a denied request would be allowed
+        (spec §4.3.2), so a resource server can ask the user to step up instead of just
+        refusing. ``None`` when the request is allowed, when no level would help, or when
+        an actor holds a delegation (an agent cannot sign in again as the user)."""
+        if principal.actor or self.authorize(principal, action, resource, context).allowed:
+            return None
+        id = principal.id
+
+        def sets(attrs: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+            # With the assumed role when the role can be assumed at this level.
+            a = self.attributes(id, attrs)
+            if principal.assumed:
+                m = self.assume(id, a, [], principal.assumed)
+                if not isinstance(m, str):
+                    return m
+            return self.memberships(id, a)
+
+        now = sets(principal.attrs)
+        aal = principal.attrs.get("aal")
+        current = aal if isinstance(aal, (int, float)) and not isinstance(aal, bool) else 0
+
+        # The session keeps every set it holds and gains only those the higher level adds:
+        # a set taken away from it (revoked, excluded) does not come back.
+        def gain(held: list[str], before: list[str], after: list[str]) -> list[str]:
+            return sorted(set(held) | (set(after) - set(before)))
+
+        for level in (2, 3):
+            if level <= current:
+                continue
+            attrs = {**principal.attrs, "aal": level}
+            then = sets(attrs)
+            raised = replace(principal, attrs=attrs, groups=gain(principal.groups, now[0], then[0]), roles=gain(principal.roles, now[1], then[1]))
+            if self.authorize(raised, action, resource, context).allowed:
+                return level
+        return None
 
     def principal(self, id: str, attrs: Mapping[str, Any] | None = None, **kw: Any) -> Principal:
         """Build a principal from directory + ``attrs``, computing memberships."""

@@ -3,7 +3,13 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Your account · {{BRAND}}</title>
-<style nonce="{{NONCE}}">{{STYLE}}</style>
+<style nonce="{{NONCE}}">{{STYLE}}
+.qr { display: block; width: 200px; height: 200px; margin: 4px auto 10px; border-radius: 8px; background: #fff; }
+#totp-box { margin: 0 0 18px; padding: 14px 12px; border: 1px solid var(--line); border-radius: 10px; }
+#totp-box h2 { font-size: 16px; margin: 0 0 6px; }
+#totp-box p { font-size: 14px; }
+#totp-secret { text-align: center; font-size: 13px; letter-spacing: .04em; word-break: normal; }
+</style>
 </head>
 <body>
 <main>
@@ -23,7 +29,22 @@
       <button id="copy" class="secondary" type="button">Copy identity</button>
     </div>
     <ul id="items" class="items mt"></ul>
+    <div id="totp-box" class="hidden">
+      <h2>Set up an authenticator app</h2>
+      <p>Scan this with your authenticator app, such as 1Password, Google Authenticator or Authy. Apps that ask for a stronger sign-in will then accept its codes.</p>
+      <img id="totp-qr" class="qr" alt="QR code to add this account to an authenticator app">
+      <p class="note">Can't scan it? Enter this key in the app instead:</p>
+      <code id="totp-secret" class="block"></code>
+      <label for="totp-code">The 6-digit code the app shows</label>
+      <input id="totp-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" maxlength="8">
+      <div id="totp-status" class="status" role="status" aria-live="polite"></div>
+      <div class="stack">
+        <button id="totp-confirm" class="primary" type="button">Turn on</button>
+        <button id="totp-cancel" class="secondary" type="button">Cancel</button>
+      </div>
+    </div>
     <div class="stack">
+      <button id="totp" class="secondary hidden" type="button">Set up an authenticator app</button>
       <button id="add" class="primary" type="button">Add a device</button>
       <button id="logout" class="secondary" type="button">Sign out</button>
     </div>
@@ -64,6 +85,45 @@ if (D.signed_in) {
   item("Email", D.email || "none");
   if (D.linked.length) item("Linked sign-ins", D.linked.join(", "));
   item("Work", D.work + " bits");
+  item("Authenticator app", D.totp ? "On: apps that need a stronger sign-in accept its codes" : "Not set up");
+  // An authenticator app: a QR code to scan, then a code from it to turn it on.
+  if (!D.totp) $("totp").classList.remove("hidden");
+  $("totp").onclick = async () => {
+    $("totp").disabled = true;
+    const r = await postJSON("/v1/account/totp", {});
+    $("totp").disabled = false;
+    if (!r.ok) return status(r.body.error_description || "Couldn't start setting up an authenticator.", "error");
+    $("totp-qr").src = r.body.qr;
+    $("totp-secret").textContent = r.body.secret.match(/.{1,4}/g).join(" ");
+    $("totp").classList.add("hidden");
+    $("totp-box").classList.remove("hidden");
+    status("");
+    $("totp-code").focus();
+  };
+  $("totp-cancel").onclick = () => {
+    $("totp-box").classList.add("hidden");
+    $("totp").classList.remove("hidden");
+    status("");
+  };
+  const confirmTotp = async () => {
+    const code = $("totp-code").value.replace(/\s/g, "");
+    if (!code) { $("totp-status").textContent = "Enter the code from the app."; $("totp-status").className = "status error"; return $("totp-code").focus(); }
+    $("totp-confirm").disabled = true;
+    const r = await postJSON("/v1/account/totp/confirm", { code });
+    $("totp-confirm").disabled = false;
+    const say = (text, kind) => { $("totp-status").textContent = text; $("totp-status").className = "status " + kind; };
+    if (r.ok) {
+      say("Authenticator app turned on.", "ok");
+      setTimeout(() => location.replace("/whoami"), 800);
+      return;
+    }
+    say(r.status === 429 ? "Too many wrong codes. Wait a few minutes, then try again."
+      : r.status === 401 ? "That code didn't work. Check the app's clock, then try the code it shows now."
+      : r.body.error_description || "Couldn't turn it on.", "error");
+    $("totp-code").select();
+  };
+  $("totp-confirm").onclick = confirmTotp;
+  $("totp-code").onkeydown = (e) => { if (e.key === "Enter") confirmTotp(); };
   $("copy").onclick = async () => {
     try { await navigator.clipboard.writeText(D.did); status("Copied.", "ok"); }
     catch { status("Couldn't copy. Select the identity above instead.", "error"); }

@@ -135,5 +135,36 @@
       {"note": "assume.max_age is null", "bundle": {"version": 1, "policies": "", "roles": {"x": {"assume": {"members": ["did:kith:ada"], "max_age": null}}}}},
       {"note": "assume.members is null", "bundle": {"version": 1, "policies": "", "roles": {"x": {"assume": {"members": null}}}}}
     ]
+  },
+  "step_up": {
+    "description": "Step-up (spec §4.3.2). When a request is denied, 'step_up' is the lowest assurance level, 2 or 3, at which the same principal would be allowed: its 'aal' raised, plus the sets it gains only by that, every other set as it was. null when allowed, when no level helps, or when an actor holds a delegation.",
+    "bundle": {
+      "version": 1,
+      "groups": {
+        "finance": {"members": ["did:kith:ada"]},
+        "strong": {"rule": "principal has aal && principal.aal >= 2"},
+        "revoked": {"members": ["did:kith:ada"]}
+      },
+      "roles": {
+        "billing-reader": {"members": ["group:finance"]},
+        "billing-admin": {"rule": "principal in Group::\"finance\" && principal in Group::\"strong\""},
+        "break-glass": {"assume": {"rule": "principal in Group::\"finance\" && principal in Group::\"strong\""}}
+      },
+      "policies": "@id(\"read\")\npermit(principal in Role::\"billing-reader\", action == Action::\"Query.invoices\", resource);\n@id(\"pay\")\npermit(principal in Role::\"billing-admin\", action == Action::\"Mutation.payInvoice\", resource) when { context has amount && context.amount < 10000 };\n@id(\"delete\")\npermit(principal in Role::\"billing-admin\", action == Action::\"Mutation.deleteInvoice\", resource) when { principal.aal >= 3 };\n@id(\"export\")\npermit(principal in Role::\"billing-reader\", action == Action::\"Query.export\", resource) when { principal has aal && principal.aal >= 2 };\n@id(\"drop\")\npermit(principal in Role::\"break-glass\", action == Action::\"Mutation.dropDb\", resource);"
+    },
+    "decisions": [
+      {"name": "allowed needs no step-up", "principal": "did:kith:ada", "attrs": {"aal": 1}, "action": "Query.invoices", "context": {}, "allowed": true, "step_up": null},
+      {"name": "a condition on aal itself", "principal": "did:kith:ada", "attrs": {"aal": 1}, "action": "Query.export", "context": {}, "allowed": false, "step_up": 2},
+      {"name": "a role that rests on a level-dependent group", "principal": "did:kith:ada", "attrs": {"aal": 1}, "action": "Mutation.payInvoice", "context": {"amount": 5}, "allowed": false, "step_up": 2},
+      {"name": "no level lifts the amount limit", "principal": "did:kith:ada", "attrs": {"aal": 1}, "action": "Mutation.payInvoice", "context": {"amount": 50000}, "allowed": false, "step_up": null},
+      {"name": "the lowest level that works, from 1", "principal": "did:kith:ada", "attrs": {"aal": 1}, "action": "Mutation.deleteInvoice", "context": {}, "allowed": false, "step_up": 3},
+      {"name": "the lowest level that works, from 2", "principal": "did:kith:ada", "attrs": {"aal": 2}, "action": "Mutation.deleteInvoice", "context": {}, "allowed": false, "step_up": 3},
+      {"name": "already at the top", "principal": "did:kith:ada", "attrs": {"aal": 3}, "action": "Mutation.payInvoice", "context": {"amount": 50000}, "allowed": false, "step_up": null},
+      {"name": "not a member at any level", "principal": "did:kith:eve", "attrs": {"aal": 1}, "action": "Query.export", "context": {}, "allowed": false, "step_up": null},
+      {"name": "no aal at all asks for 2, never 1", "principal": "did:kith:ada", "attrs": {}, "action": "Query.export", "context": {}, "allowed": false, "step_up": 2},
+      {"name": "a set the session does not hold stays out", "principal": "did:kith:ada", "attrs": {"aal": 1}, "groups": ["strong"], "roles": [], "action": "Query.export", "context": {}, "allowed": false, "step_up": null, "note": "the token's sets are given: finance was removed from it, and stepping up does not bring it back"},
+      {"name": "an assumed role recomputed at the higher level", "principal": "did:kith:ada", "attrs": {"aal": 1}, "assume": "break-glass", "groups": ["finance"], "roles": ["billing-reader"], "action": "Mutation.dropDb", "context": {}, "allowed": false, "step_up": 2},
+      {"name": "a delegation is never stepped up", "principal": "did:kith:ada", "attrs": {"aal": 1}, "actor": "did:kith:agent", "caps": [{"action": "*"}], "action": "Query.export", "context": {}, "allowed": false, "step_up": null}
+    ]
   }
 }

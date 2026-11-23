@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { buildSchema, graphql } from "graphql";
 import { Engine, type Principal } from "./authz.ts";
-import { kithGraphQL } from "./graphql.ts";
+import { kithGraphQL, stepUpChallenge, stepUpRequired } from "./graphql.ts";
 
 const root = new URL("../../../examples/", import.meta.url);
 const template = readFileSync(new URL("policy/bundle.template.json", root), "utf8");
@@ -39,11 +39,32 @@ test("unauthenticated is rejected", async () => {
   assert.equal(r.errors?.[0].extensions?.code, "UNAUTHENTICATED");
 });
 
-test("billing reader sees all rows but not internal notes at AAL1", async () => {
+test("billing reader sees all rows; internal notes ask for a step-up at AAL1", async () => {
   const r = await run("{ invoices { id internalNotes } }", principal("did:kith:ada", 1));
   assert.deepEqual((r.data as any).invoices.map((i: any) => i.id), ["inv_1", "inv_2", "inv_3"]);
   assert.equal((r.data as any).invoices[0].internalNotes, null);
-  assert.equal(r.errors?.[0].extensions?.code, "FORBIDDEN");
+  const e = r.errors?.[0].extensions as any;
+  assert.equal(e?.code, "INSUFFICIENT_USER_AUTHENTICATION", "AAL2 would make ada a billing admin");
+  assert.equal(e?.acr_values, "urn:kith:acr:aal2");
+  assert.equal(e?.http?.status, 401);
+  assert.equal(e?.http?.headers?.["WWW-Authenticate"], 'Bearer error="insufficient_user_authentication", error_description="A stronger sign-in is required", acr_values="urn:kith:acr:aal2"');
+  assert.equal(stepUpRequired(r.errors![0]), 2);
+});
+
+test("a step-up is asked for only when some level would allow it", async () => {
+  const pay = await run('mutation { payInvoice(id: "inv_1", amount: 1200) { status } }', principal("did:kith:ada", 1));
+  assert.equal(pay.errors?.[0].extensions?.code, "INSUFFICIENT_USER_AUTHENTICATION");
+  const bob = await run('mutation { payInvoice(id: "inv_1", amount: 1200) { status } }', principal("did:kith:bob", 1));
+  assert.equal(bob.errors?.[0].extensions?.code, "FORBIDDEN", "bob is no admin at any level");
+  assert.equal(stepUpRequired(bob.errors![0]), null);
+});
+
+test("stepUpRequired reads an RFC 9470 challenge", () => {
+  assert.equal(stepUpRequired(stepUpChallenge(3)), 3);
+  assert.equal(stepUpRequired('Bearer error="insufficient_user_authentication", acr_values="aal3 urn:kith:acr:aal2"'), 2);
+  assert.equal(stepUpRequired('Bearer error="invalid_token"'), null);
+  assert.equal(stepUpRequired(new Response(null, { status: 401, headers: { "WWW-Authenticate": stepUpChallenge(2) } })), 2);
+  assert.equal(stepUpRequired(undefined), null);
 });
 
 test("billing admin (AAL2) sees internal notes and can pay under the limit", async () => {

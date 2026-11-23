@@ -263,6 +263,29 @@ These optional parameters are also honoured:
   page if the session is fresh enough, meets the required AAL, and its device is still
   active in the KEL.
 
+### 7.3.1 Step-up
+
+A request that needs more than the hub session holds (`acr_values`, or the client's
+`min_aal`) does not start a new sign-in. If the session is fresh enough for `max_age`,
+its device and linked account still hold, and `prompt=login` was not asked for, the
+login page adds a factor to it:
+- The page data carries `step_up: {did, totp}`. `totp` says whether the identity has a
+  confirmed authenticator. The page asks for a one-time code when it has one and AAL2
+  is enough, for a passkey with PIN or biometrics when it has none, and for a hardware
+  security key for AAL3.
+- The page posts `{request_id, challenge_id, did, factors, step_up: true}` with the
+  session cookie. The hub checks that this request offered a step-up to the session in
+  that cookie, and that the session still holds for the same identity. If not, it
+  refuses with a fresh challenge. A passkey of another identity is an ordinary sign-in.
+- The new factors are verified as in §7.4. The result adds them to the session's: the
+  higher level, the kinds of factor both used (two kinds are AAL2, with `mfa` in
+  `amr`), the device and linked account of either, and `auth_time` now.
+- The old cookie stops working. The stronger session gets a new cookie value and keeps
+  the old `sid` and the clients signed in through it, so logout still reaches them.
+
+A resource server asks for this with RFC 9470 (§4.3.2): the client sends the user here
+with the `acr_values` it was given.
+
 **Consent.** After authentication, and before any code is issued, the hub asks the user
 whether to share what the client requested (`GET /oauth/consent?request_id=…`).
 - The page names the client and the host of its redirect URI, and lists each scope
@@ -302,9 +325,13 @@ The page posts `{request_id, challenge_id, did, factors}` to `POST /oauth/login`
 - On success, the response is `{redirect}` and sets the session cookie. The redirect
   goes to the client, or to the consent page first (§7.3).
 - On failure, the response carries a **fresh challenge**, so the page can retry. For
-  `step_up_required`, the response also includes `aal` and `required_aal`. The page then
-  asks for a one-time code if that would be enough (AAL2), or explains that a hardware
-  security key is needed (AAL3).
+  `step_up_required`, the response also includes `aal`, `required_aal` and `totp`
+  (whether the identity has a confirmed authenticator; sent only after a first factor
+  has verified). The page then asks for a one-time code if the identity has one and it
+  would be enough (AAL2), asks for a stronger passkey if it has none, or explains that
+  a hardware security key is needed (AAL3). The page never shows the code box before
+  it knows the identity has an authenticator; the user can still open it from "Other
+  ways to sign in".
 
 The challenge message is SIWE/CAIP-122-shaped and names the client:
 
@@ -506,10 +533,12 @@ The hub MUST check:
 login is AAL1 with `amr: ["fed"]` and no `dev` (§2.5).
 
 **Step-up.** If the request needs more than AAL1, the callback shows the login page
-again instead of redirecting. The page asks for a one-time code and posts
+again instead of redirecting. If the identity has a confirmed authenticator (the
+page data's `federated.totp`), the page asks for a one-time code and posts
 `{request_id, challenge_id, did, factors: [totp], federated}` to `/oauth/login`.
 - `federated` is a token the hub gave only to that page.
 - A caller that knows only the `request_id` cannot reuse the upstream login.
+- Without an authenticator, the page asks for a passkey instead.
 - Upstream login plus TOTP is AAL2, with `amr: ["otp", "fed", "mfa"]`.
 
 **Revocation.** `alias_unlink` ends the hub sessions and refresh tokens that signed in
@@ -1033,8 +1062,19 @@ without `--signup`.
   attempt returns a fresh challenge. The endpoint shares `/oauth/login`'s rate limit.
 - Signed in, it shows the DID, the devices in the log (and which one signed in), the
   session's assurance level and expiry, and what the hub keeps about the identity: a
-  verified email, provider accounts linked to it, and its work (§7.12). It never shows
-  the handle. "Sign out" is `GET /oauth/logout`.
+  verified email, provider accounts linked to it, its work (§7.12), and whether it has
+  an authenticator app. It never shows the handle. "Sign out" is `GET /oauth/logout`.
+- **Authenticator app.** Signed in, the page can set one up, with the hub session as
+  the credential and no CLI:
+  - `POST /v1/account/totp` returns `{secret, otpauth_uri, qr}`, as
+    `POST /v1/totp/enroll` does, plus `qr`, the URI as a QR code in a `data:` SVG URL.
+    A new call replaces a secret not yet confirmed. With a confirmed one it is 409;
+    replacing it is `DELETE /v1/totp`.
+  - `POST /v1/account/totp/confirm` with `{code}` turns it on. It shares the per-address
+    TOTP rate limit, and the identity's lockout applies.
+  - Both need a session that rests on one of the identity's devices. A session through a
+    provider alone, or through a one-time code alone, gets 403: otherwise whoever holds
+    the provider account would choose the second factor. Without a session it is 401.
 - The session holds only while the device it signed in with is still in the log, as for
   SSO. `GET /` sends a signed-in browser here, and anyone else to `/signup` (with
   `--signup`). The sign-up page ends here unless an app sent the visitor.
@@ -1292,7 +1332,8 @@ the keys here are not the ones the log commits to.
 - Session management through `check_session_iframe`.
 - Pushed authorization requests (PAR), DPoP-bound tokens.
 - `claims` request parameter; request objects (JAR).
-- TOTP enrollment from the browser (CLI only today).
+- Replacing or removing the authenticator app from the account page (`DELETE
+  /v1/totp` and the CLI can).
 - Recovery with the recovery key from a browser, or from a machine that is not a device
   of the identity (§7.11, §7.13); profile attributes and email verification for an
   identity created in the browser.
