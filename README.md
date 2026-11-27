@@ -208,6 +208,8 @@ let ok = engine.authorize(&principal, "Document.read", &doc, &json!({ "sourceIp"
 
 ```bash
 kith policy publish bundle.json              # as the org: DAG blocks up, root into the org's KEL
+kith hub serve --org acme=did:kith:…         # /orgs/acme: members see the org; its god role drafts policy changes
+kith org approve https://hub.example/orgs/acme/drafts/<id>   # as the org: rebuild, review and sign a draft
 kith policy add-revoker                      # let the hub sign heartbeats (a revoke-only device)
 kith policy slice --org did:kith:… --action Query.invoices   # just that field, checked against the KEL
 kith policy why --org did:kith:… --principal did:kith:ada…   # who signed for her roles, and why she has each
@@ -252,7 +254,7 @@ permit(principal in Role::"billing-reader", action == Action::"Document.read", r
 |------|------|
 | `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
 | `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, bundle file checks, verified-domain proofs, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
-| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email, phone and domain contacts (TXT, CNAME or HTML-file proof, witnessed by any hub), OpenID Connect provider with passkey login (or a phone's passkey, by QR code), step-up and enrollment pages, an account page that sets up an authenticator app, public profile and `whoami` views, names in a verified domain with WebFinger, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
+| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email, phone and domain contacts (TXT, CNAME or HTML-file proof, witnessed by any hub), OpenID Connect provider with passkey login (or a phone's passkey, by QR code), step-up and enrollment pages, an account page that sets up an authenticator app, public profile and `whoami` views, names in a verified domain with WebFinger, org pages with policy drafts for the org's keys to sign, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
 | `crates/kith-cli` | `kith` binary, including the local bundle editor (`kith bundle edit`) |
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |

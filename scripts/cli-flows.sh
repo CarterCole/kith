@@ -232,4 +232,31 @@ assert len(adds)==2,[e['kind'] for e in kel]
 assert mk in [s['signer'] for s in adds[0]['sigs']],adds[0]['sigs']
 print('the server signed one change as manage, the laptop the next')"
 
+step "org page: a member drafts a change on the hub, and only the org's keys put it in force (spec §8.6.1)"
+# The hub names Carol's org, so it restarts with --org (same data directory).
+kill "$HUB"; wait "$HUB" 2>/dev/null || true
+$K hub serve --addr 127.0.0.1:$PORT --data "$D/hub" --bundle "$D/bundle.json" --contact-outbox "$D/outbox.jsonl" --org "carol-co=$CAROL" > "$D/hub.log" 2>&1 &
+HUB=$!
+for _ in $(seq 50); do curl -sf "$KITH_HUB/.well-known/jwks.json" >/dev/null && break; sleep 0.1; done
+BOB=$(cat "$D/bob.did")
+printf '{"version":1,"groups":{"staff":{"members":["%s"]}},"roles":{"god":{"members":["%s"]}},"policies":""}' "$BOB" "$BOB" > "$D/carol-bundle.json"
+$K --home "$D/carol" policy publish "$D/carol-bundle.json" >/dev/null
+TOK=$($K --home "$D/bob" token)
+curl -sf -H "authorization: Bearer $TOK" "$KITH_HUB/v1/orgs/carol-co" | python3 -c "import sys,json;v=json.load(sys.stdin);assert v['viewer']['can_edit'] and v['viewer']['groups']==['staff'],v['viewer'];print('bob sees carol-co as',v['viewer']['groups'],v['viewer']['roles'])"
+ADA=$(cat "$D/ada.did")
+DRAFT=$(curl -sf -H "authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d "{\"bundle\":{\"version\":1,\"groups\":{\"staff\":{\"members\":[\"$BOB\",\"$ADA\"]}},\"roles\":{\"god\":{\"members\":[\"$BOB\"]}},\"policies\":\"\"}}" \
+  "$KITH_HUB/v1/orgs/carol-co/drafts")
+URL=$(python3 -c "import sys,json;print(json.loads(sys.argv[1])['url'])" "$DRAFT")
+DRAFT_ID=$(python3 -c "import sys,json;print(json.loads(sys.argv[1])['id'])" "$DRAFT")
+# Approving as anyone but the org is refused before anything is signed.
+if $K --home "$D/bob" org approve "$URL" --yes 2>/dev/null; then echo "FAIL: bob approved carol-co's draft"; exit 1; fi
+$K --home "$D/carol" org approve "$URL" --yes
+curl -sf -H "authorization: Bearer $TOK" "$KITH_HUB/v1/orgs/carol-co/drafts/$DRAFT_ID" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d['state']=='applied',d['state'];print('draft',d['state'])"
+curl -sf -H "authorization: Bearer $TOK" "$KITH_HUB/v1/orgs/carol-co" | python3 -c "
+import sys,json;v=json.load(sys.stdin);m=v['bundle']['groups']['staff']['members']
+assert '$ADA' in m,m;print('staff now has',len(m),'members; policy at seq',v['policy']['seq'])"
+if $K --home "$D/carol" org approve "$URL" --yes 2>/dev/null; then echo "FAIL: a draft was applied twice"; exit 1; fi
+echo "an applied draft can't be signed again (good)"
+
 step "all CLI flows passed"

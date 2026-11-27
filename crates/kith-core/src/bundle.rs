@@ -300,3 +300,130 @@ impl<'de> Visitor<'de> for Walk<'_> {
         Ok(())
     }
 }
+
+/// One difference between two bundles, for a reviewer: a draft's page and `kith org
+/// approve` show these before anyone signs (spec §8.6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Change {
+    Version { from: u32, to: u32 },
+    SetAdded { set: String },
+    SetRemoved { set: String },
+    /// Explicit members came or went (`members`; for an assumable role, also `assume.members`).
+    Members { set: String, added: Vec<String>, removed: Vec<String> },
+    /// Anything else about the set changed: `description`, `rule` or `assume`.
+    SetChanged { set: String, fields: Vec<String> },
+    PolicyAdded { id: String },
+    PolicyRemoved { id: String },
+    PolicyChanged { id: String },
+    DirectoryAdded { id: String },
+    DirectoryRemoved { id: String },
+    DirectoryChanged { id: String },
+}
+
+/// What changes from `old` to `new`, sets first, then policies (by id, the same way
+/// the policy DAG files them), then directory entries. Fails if either bundle's
+/// policies don't parse.
+pub fn changes(old: &Bundle, new: &Bundle) -> crate::Result<Vec<Change>> {
+    use std::collections::BTreeMap;
+    let mut out = vec![];
+    if old.version != new.version {
+        out.push(Change::Version { from: old.version, to: new.version });
+    }
+    for (kind, a, b) in [("Group", &old.groups, &new.groups), ("Role", &old.roles, &new.roles)] {
+        let names: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+        for name in names {
+            let set = format!("{kind}::{name}");
+            match (a.get(name), b.get(name)) {
+                (None, Some(_)) => out.push(Change::SetAdded { set }),
+                (Some(_), None) => out.push(Change::SetRemoved { set }),
+                (Some(x), Some(y)) => {
+                    let all = |d: &crate::authz::SetDef| -> BTreeSet<String> {
+                        d.members.iter().chain(d.assume.iter().flat_map(|a| a.members.iter())).cloned().collect()
+                    };
+                    let (mx, my) = (all(x), all(y));
+                    let added: Vec<String> = my.difference(&mx).cloned().collect();
+                    let removed: Vec<String> = mx.difference(&my).cloned().collect();
+                    if !added.is_empty() || !removed.is_empty() {
+                        out.push(Change::Members { set: set.clone(), added, removed });
+                    }
+                    let mut fields = vec![];
+                    if x.description != y.description {
+                        fields.push("description".to_string());
+                    }
+                    if x.rule != y.rule {
+                        fields.push("rule".to_string());
+                    }
+                    let shape = |d: &crate::authz::SetDef| d.assume.as_ref().map(|a| (a.rule.clone(), a.max_age));
+                    if x.assume.is_some() != y.assume.is_some() || shape(x) != shape(y) {
+                        fields.push("assume".to_string());
+                    }
+                    if !fields.is_empty() {
+                        out.push(Change::SetChanged { set, fields });
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+    }
+    let by_id = |b: &Bundle| -> crate::Result<BTreeMap<String, String>> {
+        Ok(crate::pdag::policy_entries(&b.policies)?.into_iter().map(|p| (p.id, p.text)).collect())
+    };
+    let (pa, pb) = (by_id(old)?, by_id(new)?);
+    for id in pa.keys().chain(pb.keys()).collect::<BTreeSet<_>>() {
+        match (pa.get(id), pb.get(id)) {
+            (None, Some(_)) => out.push(Change::PolicyAdded { id: id.clone() }),
+            (Some(_), None) => out.push(Change::PolicyRemoved { id: id.clone() }),
+            (Some(x), Some(y)) if x != y => out.push(Change::PolicyChanged { id: id.clone() }),
+            _ => {}
+        }
+    }
+    for id in old.directory.keys().chain(new.directory.keys()).collect::<BTreeSet<_>>() {
+        match (old.directory.get(id), new.directory.get(id)) {
+            (None, Some(_)) => out.push(Change::DirectoryAdded { id: id.clone() }),
+            (Some(_), None) => out.push(Change::DirectoryRemoved { id: id.clone() }),
+            (Some(x), Some(y)) if x.attrs != y.attrs => out.push(Change::DirectoryChanged { id: id.clone() }),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+
+    fn bundle(v: Value) -> Bundle {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn changes_name_each_set_member_policy_and_directory_entry() {
+        let old = bundle(serde_json::json!({
+            "version": 1,
+            "groups": {"staff": {"members": ["did:kith:ada", "did:kith:cy"]}, "gone": {"members": ["did:kith:ada"]}},
+            "roles": {"god": {"rule": "principal in Group::\"staff\""}},
+            "directory": {"did:kith:ada": {"attrs": {"team": "a"}}},
+            "policies": "@id(\"read\") permit(principal, action == Action::\"Query.a\", resource);"
+        }));
+        let new = bundle(serde_json::json!({
+            "version": 1,
+            "groups": {"staff": {"members": ["did:kith:ada", "did:kith:bob"]}, "ops": {"members": []}},
+            "roles": {"god": {"rule": "principal in Group::\"staff\" && principal.aal >= 2"}},
+            "directory": {"did:kith:ada": {"attrs": {"team": "b"}}, "did:kith:bob": {}},
+            "policies": "@id(\"write\") permit(principal, action == Action::\"Query.b\", resource);"
+        }));
+        let c = changes(&old, &new).unwrap();
+        let has = |want: Change| assert!(c.contains(&want), "{want:?} missing from {c:?}");
+        has(Change::Members { set: "Group::staff".into(), added: vec!["did:kith:bob".into()], removed: vec!["did:kith:cy".into()] });
+        has(Change::SetAdded { set: "Group::ops".into() });
+        has(Change::SetRemoved { set: "Group::gone".into() });
+        has(Change::SetChanged { set: "Role::god".into(), fields: vec!["rule".into()] });
+        has(Change::DirectoryChanged { id: "did:kith:ada".into() });
+        has(Change::DirectoryAdded { id: "did:kith:bob".into() });
+        has(Change::PolicyAdded { id: "write".into() });
+        has(Change::PolicyRemoved { id: "read".into() });
+        assert_eq!(c.len(), 8, "{c:?}");
+        assert!(changes(&new, &new).unwrap().is_empty());
+    }
+}

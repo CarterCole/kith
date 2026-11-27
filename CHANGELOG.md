@@ -4,6 +4,18 @@ Kith is a draft. The format will change until v1, so entries record what changed
 behaviour, not a promise about compatibility. Versions follow the workspace version in
 `Cargo.toml`.
 
+## Unreleased
+
+### Added
+
+- **Org pages and drafts** (spec §8.6.1). `kith hub serve --org NAME=DID` gives an org a
+  page at `/orgs/NAME` for its members: its devices, manage policy and whole policy,
+  read back from the signed root. The org's `god` role edits groups, roles and policies
+  there and saves a draft, which nothing serves until `kith org approve <link>`, run
+  where a manage key is, rebuilds its root, shows the changes and signs it.
+- `pdag::bundle_of` reads a whole policy back from its root, and
+  `bundle::changes` lists what differs between two bundles.
+
 ## 0.4.0 (2026-11-26)
 
 ### Added

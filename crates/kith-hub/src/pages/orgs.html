@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Organizations · {{BRAND}}</title>
+<style nonce="{{NONCE}}">{{STYLE}}
+main { max-width: 760px; }
+h2 { font-size: 17px; margin: 22px 0 8px; }
+h3 { font-size: 15px; margin: 0; }
+.card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin: 0 0 10px; }
+.card .head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.tag { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
+.member { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; padding: 4px 0; word-break: break-all; }
+.member button, .row button { width: auto; padding: 4px 10px; font-size: 13px; font-weight: 500; }
+.row { display: flex; gap: 8px; margin-top: 8px; }
+.row input { flex: 1; }
+textarea { width: 100%; min-height: 120px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: transparent; color: var(--ink); box-sizing: border-box; }
+.change { font-size: 14px; padding: 6px 0; border-top: 1px solid var(--line); }
+.change:first-child { border-top: 0; }
+pre.cmd { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all;
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 6px 0 12px; }
+.muted { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="brand">{{BRAND}}</div>
+  <h1 id="title">Organizations</h1>
+  <p id="lede" class="meta"></p>
+  <div id="signed-out" class="hidden">
+    <p>Sign in on your account page with your passkey, then come back here.</p>
+    <a id="signin" class="primary" href="/whoami">Sign in</a>
+  </div>
+  <div id="content"></div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+</main>
+<script id="kith-data" type="application/json">{{DATA}}</script>
+<script nonce="{{NONCE}}">
+{{COMMON_JS}}
+// Everything shown comes from the API and goes into the page as text, never as HTML.
+function el(tag, attrs = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k.startsWith("on")) e[k] = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids) e.append(k);
+  return e;
+}
+const short = (did) => did && did.length > 28 ? did.slice(0, 18) + "…" + did.slice(-6) : did;
+const when = (ts) => new Date(ts * 1000).toLocaleString();
+async function api(method, url, body) {
+  const r = await fetch(url, { method, headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+  return { ok: r.ok, status: r.status, body: await r.json().catch(() => ({})) };
+}
+function signedOut(r) {
+  if (r.status !== 401) return false;
+  $("signed-out").classList.remove("hidden");
+  $("lede").textContent = "";
+  return true;
+}
+const C = $("content");
+
+async function showList() {
+  const r = await api("GET", "/v1/orgs");
+  if (signedOut(r)) return;
+  if (!r.ok) return status(r.body.error_description || "Could not load your organizations.", "error");
+  $("lede").textContent = "The organizations on this hub that you belong to.";
+  if (!r.body.orgs.length) C.append(el("p", {}, "You don't belong to any organization on this hub."));
+  for (const o of r.body.orgs) {
+    C.append(el("div", { class: "card" }, el("div", { class: "head" }, el("h3", {}, el("a", { href: "/orgs/" + encodeURIComponent(o.name) }, o.name)), el("code", {}, short(o.did)))));
+  }
+}
+
+// The bundle being edited: a copy of the one in force.
+let edit = null;
+function setCard(kind, name, def, canEdit) {
+  const key = (kind === "Group" ? "group:" : "role:") + name;
+  const card = el("div", { class: "card" });
+  const tags = el("span", {});
+  if (def.rule) tags.append(el("span", { class: "tag" }, "rule"), " ");
+  if (def.assume) tags.append(el("span", { class: "tag" }, "assumed, " + (def.assume.max_age ? def.assume.max_age + " s" : "no limit")));
+  card.append(el("div", { class: "head" }, el("h3", {}, kind + " " + name), tags));
+  if (def.description) card.append(el("p", { class: "muted" }, def.description));
+  if (def.rule) card.append(el("p", { class: "muted" }, "Rule: ", el("code", {}, def.rule)));
+  const list = def.assume ? def.assume.members : def.members;
+  for (const m of list || []) {
+    const row = el("div", { class: "member" }, el("code", { title: m }, m.startsWith("did:") ? short(m) : m));
+    if (canEdit) row.append(el("button", { class: "secondary", type: "button", onclick: () => { const l = def.assume ? def.assume.members : def.members; l.splice(l.indexOf(m), 1); render(); } }, "Remove"));
+    card.append(row);
+  }
+  if (!(list || []).length && !def.rule) card.append(el("p", { class: "muted" }, "No members."));
+  if (canEdit) {
+    const input = el("input", { placeholder: "did:kith:…, group:name or role:name", "aria-label": "Add a member to " + key, spellcheck: "false" });
+    card.append(el("div", { class: "row" }, input, el("button", { class: "secondary", type: "button", onclick: () => {
+      const v = input.value.trim();
+      if (!v) return;
+      const l = def.assume ? (def.assume.members = def.assume.members || []) : (def.members = def.members || []);
+      if (!l.includes(v)) l.push(v);
+      render();
+    } }, "Add")));
+  }
+  return card;
+}
+
+let org = null;
+function render() {
+  C.replaceChildren();
+  const o = org, canEdit = o.viewer.can_edit;
+  C.append(el("ul", { class: "items" },
+    el("li", {}, "Identity", el("span", { class: "value" }, o.did)),
+    el("li", {}, "Who approves changes", el("span", { class: "value" }, describe(o.manage))),
+    el("li", {}, "Devices", el("span", { class: "value" }, o.devices.map((d) => d.name + " (" + d.kind + ", aal " + d.aal + ")").join(", ") || "none")),
+    el("li", {}, "Aliases", el("span", { class: "value" }, (o.aliases || []).join(", ") || "none")),
+    el("li", {}, "Policy in force", el("span", { class: "value" }, "log seq " + o.policy.seq + ", " + when(o.policy.ts) + ", signed by " + o.policy.signers.map((s) => signerName(o, s)).join(", "))),
+    el("li", {}, "You", el("span", { class: "value" }, [...o.viewer.groups.map((g) => "group " + g), ...o.viewer.roles.map((r) => "role " + r)].join(", ") || "a member")),
+  ));
+  if (o.drafts.length) {
+    C.append(el("h2", {}, "Drafts waiting for the org's keys"));
+    for (const d of o.drafts) C.append(el("div", { class: "card" }, el("div", { class: "head" }, el("a", { href: "/orgs/" + encodeURIComponent(o.name) + "/drafts/" + encodeURIComponent(d.id) }, d.changes.length + " change" + (d.changes.length === 1 ? "" : "s")), el("span", { class: "muted" }, "by " + short(d.author) + ", " + when(d.created)))));
+  }
+  C.append(el("h2", {}, "Groups"));
+  for (const [n, def] of Object.entries(edit.groups || {})) C.append(setCard("Group", n, def, canEdit));
+  C.append(el("h2", {}, "Roles"));
+  for (const [n, def] of Object.entries(edit.roles || {})) C.append(setCard("Role", n, def, canEdit));
+  if (canEdit) {
+    const name = el("input", { placeholder: "name", "aria-label": "New set name", spellcheck: "false" });
+    const add = (kind) => () => {
+      const n = name.value.trim();
+      if (!/^[A-Za-z0-9_.-]+$/.test(n)) return status("Use letters, digits, dots, dashes and underscores.", "error");
+      const where = kind === "Group" ? (edit.groups = edit.groups || {}) : (edit.roles = edit.roles || {});
+      if (!where[n]) where[n] = { members: [] };
+      render();
+    };
+    C.append(el("div", { class: "row" }, name, el("button", { class: "secondary", type: "button", onclick: add("Group") }, "New group"), el("button", { class: "secondary", type: "button", onclick: add("Role") }, "New role")));
+  }
+  C.append(el("h2", {}, "Policies"));
+  const pol = el("textarea", { "aria-label": "Cedar policies", spellcheck: "false" });
+  pol.value = edit.policies || "";
+  if (!canEdit) pol.readOnly = true;
+  pol.oninput = () => { edit.policies = pol.value; };
+  C.append(pol);
+  if (canEdit) {
+    C.append(el("p", { class: "note" }, "Saving makes a draft. Nothing changes until the org's keys sign it: you'll get a command to run where they are."));
+    C.append(el("div", { class: "stack mt" }, el("button", { class: "primary", type: "button", onclick: save }, "Save draft"), el("button", { class: "secondary", type: "button", onclick: () => { edit = structuredClone(org.bundle); render(); status(""); } }, "Undo my edits")));
+  }
+}
+function signerName(o, id) {
+  const s = o.manage.signers.find((x) => x.id === id);
+  return s && s.device ? s.device : short(id);
+}
+function describe(m) {
+  const name = (id) => signerName(org, id);
+  const walk = (p) => typeof p === "string" ? name(p) : p.of ? (p.threshold + " of [" + p.of.map(walk).join(", ") + "]") : JSON.stringify(p);
+  return walk(m.policy);
+}
+async function save() {
+  status("Checking…");
+  const r = await api("POST", "/v1/orgs/" + encodeURIComponent(D.name) + "/drafts", { bundle: edit });
+  if (!r.ok) return status(r.body.error_description || "Could not save the draft.", "error");
+  location.assign("/orgs/" + encodeURIComponent(D.name) + "/drafts/" + encodeURIComponent(r.body.id));
+}
+async function showOrg() {
+  $("title").textContent = D.name;
+  const r = await api("GET", "/v1/orgs/" + encodeURIComponent(D.name));
+  if (signedOut(r)) return;
+  if (!r.ok) return status(r.body.error_description || "Could not load this org.", "error");
+  org = r.body;
+  edit = structuredClone(org.bundle);
+  $("lede").textContent = org.viewer.can_edit ? "You can draft changes. The org's keys sign them." : "You are a member. Only the org's " + "god role drafts changes.";
+  render();
+}
+
+function changeText(c) {
+  switch (c.kind) {
+    case "members": return [c.set + ":", ...c.added.map((m) => "+ " + m), ...c.removed.map((m) => "− " + m)].join("\n");
+    case "set_added": return "new " + c.set;
+    case "set_removed": return "removes " + c.set;
+    case "set_changed": return c.set + ": changes its " + c.fields.join(", ");
+    case "policy_added": return "new policy " + c.id;
+    case "policy_removed": return "removes policy " + c.id;
+    case "policy_changed": return "changes policy " + c.id;
+    case "directory_added": return "new directory entry " + c.id;
+    case "directory_removed": return "removes directory entry " + c.id;
+    case "directory_changed": return "changes directory entry " + c.id;
+    case "version": return "version " + c.from + " → " + c.to;
+    default: return JSON.stringify(c);
+  }
+}
+async function showDraft() {
+  $("title").textContent = D.name + ": draft";
+  const [r, o] = await Promise.all([
+    api("GET", "/v1/orgs/" + encodeURIComponent(D.name) + "/drafts/" + encodeURIComponent(D.draft)),
+    api("GET", "/v1/orgs/" + encodeURIComponent(D.name)),
+  ]);
+  if (signedOut(r)) return;
+  if (!r.ok) return status(r.body.error_description || "Could not load this draft.", "error");
+  const d = r.body;
+  const state = { open: "Waiting for the org's keys to sign it.", applied: "Signed by the org and in force.", stale: "The policy changed since this draft was made. Start a new one." }[d.state] || d.state;
+  $("lede").textContent = state;
+  C.append(el("ul", { class: "items" },
+    el("li", {}, "By", el("span", { class: "value" }, d.author)),
+    el("li", {}, "Made", el("span", { class: "value" }, when(d.created))),
+    el("li", {}, "New policy root", el("span", { class: "value" }, d.root)),
+    el("li", {}, "Replaces", el("span", { class: "value" }, d.base.root + " (log seq " + d.base.seq + ")")),
+  ));
+  C.append(el("h2", {}, "Changes"));
+  const box = el("div", { class: "card" });
+  for (const c of d.changes) box.append(el("div", { class: "change" }, el("pre", { class: "muted" }, changeText(c))));
+  C.append(box);
+  for (const w of d.warnings || []) C.append(el("p", { class: "note" }, "Warning: " + w));
+  if (d.state === "open") {
+    C.append(el("h2", {}, "Sign it"));
+    C.append(el("p", {}, "On a machine that holds one of the org's manage keys, run this. It rebuilds the root from the draft, shows the same changes, and asks for the key's PIN or Touch ID:"));
+    C.append(el("pre", { class: "cmd" }, "kith org approve " + d.url));
+    if (o.ok && o.body.viewer.can_edit) {
+      C.append(el("div", { class: "stack" }, el("button", { class: "secondary", type: "button", onclick: async () => {
+        const x = await api("DELETE", "/v1/orgs/" + encodeURIComponent(D.name) + "/drafts/" + encodeURIComponent(D.draft));
+        if (x.status === 204) location.assign("/orgs/" + encodeURIComponent(D.name)); else status(x.body.error_description || "Could not discard it.", "error");
+      } }, "Discard this draft")));
+    }
+  }
+  C.append(el("p", { class: "note" }, el("a", { href: "/orgs/" + encodeURIComponent(D.name) }, "Back to " + D.name)));
+}
+
+({ list: showList, org: showOrg, draft: showDraft })[D.view]();
+</script>
+</body>
+</html>

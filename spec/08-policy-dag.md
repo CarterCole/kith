@@ -176,6 +176,47 @@ the expected contents of several slices.
   - If a revoke key is stolen, the attacker can revoke access or withhold
     heartbeats, which is denial of service. They can never grant access.
 
+### 8.6.1 Org pages and drafts
+
+A hub may give an org a page for its members (`kith hub serve --org NAME=DID`). The page
+reads the org's policy back from its signed root, and lets the org's `god` role **draft**
+a new one. A draft is a proposal kept on the hub. Only the org's manage policy puts it in
+force, by signing its root into the org's KEL like any other `policy_root`. Whoever
+controls the hub can write drafts, never policy.
+
+| Method, path | Who | Does |
+|--------------|-----|------|
+| `GET /orgs`, `/orgs/{name}`, `/orgs/{name}/drafts/{id}` | a browser | The pages. They read the routes below with the hub session (§7.11). |
+| `GET /v1/orgs` | a hub session or hub access token | The named orgs the caller is a member of. |
+| `GET /v1/orgs/{name}` | a member, or the org itself | The org's devices, manage policy (with device names), aliases, the policy head (`root`, `seq`, `ts`, `signers`), the whole bundle read from the root, the caller's `groups`, `roles` and `can_edit`, and the open drafts. `Cache-Control: no-store`. |
+| `POST /v1/orgs/{name}/drafts` `{bundle}` | the org's `god` role | Checks the bundle as `kith bundle check` does, builds its DAG, and keeps the draft: `id`, `url`, `author`, `created`, `root`, `base` (the `root` and `seq` it replaces), `changes` and `warnings`. `400` for a bundle with errors, or one that changes nothing. |
+| `GET /v1/orgs/{name}/drafts/{id}` | a member, or the org itself | The draft with its `bundle` and `state`. |
+| `DELETE /v1/orgs/{name}/drafts/{id}` | the org's `god` role | Discards it. |
+
+- **Members** are whoever the org's current root puts in at least one group or role,
+  computed as for a token (§8.9): from the root's slice for the caller, with the org's
+  revocations applied and the caller's `aal` from the sign-in. A revoked caller is not
+  a member. The org's own identity always reads its page and drafts, so its keys can
+  approve them, but it drafts nothing unless its policy gives it `god`.
+- **State.** A draft is `applied` once a `policy_root` after its base commits its root,
+  `stale` when the org's policy moved on without it, and `open` otherwise. A draft lasts
+  30 days; an org keeps at most 50.
+- **Changes** list, against the root in force: sets added and removed, members added and
+  removed (an assumable role's `assume.members` count), sets whose `description`, `rule`
+  or `assume` changed, policies added, removed or changed by id, and directory entries
+  added, removed or changed.
+- **Approving.** `kith org approve <link>`, run in the org's home where a manage key
+  is, trusts the hub for nothing it can check. It rebuilds the root from the draft's
+  bundle and refuses a draft whose root differs. It refuses one whose base is not the
+  root its own copy of the log commits to. It reads that root's blocks back, hash-checked,
+  works out the changes itself and shows them. Only then does it sign the new
+  `policy_root` with the manage keys it holds (§1.3.3), asking for a PIN or Touch ID
+  where the key needs one.
+- Reading a whole root back (`pdag::bundle_of`) returns every group, role, policy and
+  directory entry. Unnamed policies keep the positions their positional ids (`policy0`, …)
+  come from, so building the bundle read back gives the same root. A missing block is an
+  error, never a smaller bundle.
+
 ## 8.7 Revocation chain
 
 ```json

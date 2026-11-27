@@ -384,6 +384,60 @@ pub fn prove(store: &dyn BlockGet, root: &str, query: &Query) -> Result<(Slice, 
     Ok((slice, rec.into_blocks()))
 }
 
+/// The whole bundle a policy DAG holds: every group, role, policy and directory entry.
+/// For showing an org's policy and diffing a new one against it; deciding needs only a
+/// slice ([`load`]). Every block is hash-checked, and a missing one is an error, never a
+/// smaller bundle. Policies come back in an order that gives each unnamed one the
+/// positional id it was stored under, so [`build`] over the result gives `root` again.
+pub fn bundle_of(store: &dyn BlockGet, root: &str) -> Result<Bundle> {
+    let root_v = get_verified(store, root)?;
+    if root_v["kith"] != DAG_VERSION {
+        return Err(Error::Unsupported(format!("policy dag {}", root_v["kith"])));
+    }
+    let r = Reader { store, root: root_v };
+    let version = r.root["version"].as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| Error::Encoding(format!("policy dag version {}", r.root["version"])))?;
+    let mut b = Bundle { version, ..Default::default() };
+    for (key, l) in dag::map_entries(store, &r.index("sets")?)? {
+        let cid = as_link(&l).ok_or_else(|| Error::Encoding(format!("set index entry {key} is not a link")))?;
+        let e: SetEntry = serde_json::from_value(get_verified(store, cid)?)?;
+        if e.key() != key {
+            return Err(Error::Encoding(format!("set index entry {key} holds {}", e.key())));
+        }
+        let def = SetDef { description: e.description, members: e.members, rule: e.rule, assume: e.assume };
+        match e.kind.as_str() {
+            "Group" => b.groups.insert(e.name, def),
+            "Role" => b.roles.insert(e.name, def),
+            other => return Err(Error::Encoding(format!("set {key} has kind {other}"))),
+        };
+    }
+    for (id, d) in dag::map_entries(store, &r.index("directory")?)? {
+        b.directory.insert(id, serde_json::from_value(d)?);
+    }
+    // Every policy is filed under exactly one principal key.
+    let mut policies: BTreeMap<String, PolicyEntry> = BTreeMap::new();
+    for (key, list) in dag::map_entries(store, &r.index("principals")?)? {
+        let list = list.as_array().ok_or_else(|| Error::Encoding(format!("policy index principals[{key}] is not a list")))?.clone();
+        for l in list {
+            let cid = as_link(&l).ok_or_else(|| Error::Encoding("policy index entry is not a link".into()))?;
+            let e: PolicyEntry = serde_json::from_value(get_verified(store, cid)?)?;
+            policies.insert(e.id.clone(), e);
+        }
+    }
+    // `policyN` must be the Nth policy again; named ones fill the other places in id order.
+    let mut slots: Vec<Option<PolicyEntry>> = vec![None; policies.len()];
+    let mut named = vec![];
+    for (id, e) in policies {
+        match id.strip_prefix("policy").and_then(|n| n.parse::<usize>().ok()).filter(|&n| n < slots.len()) {
+            Some(n) if slots[n].is_none() => slots[n] = Some(e),
+            _ => named.push(e),
+        }
+    }
+    let mut named = named.into_iter();
+    let ordered: Vec<PolicyEntry> = slots.into_iter().filter_map(|s| s.or_else(|| named.next())).collect();
+    b.policies = ordered.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n\n");
+    Ok(b)
+}
+
 impl Slice {
     /// The slice as an ordinary bundle, minus policies (see [`Slice::engine`]).
     pub fn bundle(&self) -> Bundle {
@@ -538,6 +592,37 @@ mod tests {
         // Forbids travel with their action: a slice can't silently drop one.
         let pay = load(&a, &root, &Query::Actions { actions: vec!["Mutation.payInvoice".into()], principals: vec![] }).unwrap();
         assert!(pay.policies.iter().any(|p| p.effect == "forbid"));
+    }
+
+    /// The whole bundle back from a root (an org page, a draft's diff): rebuilding what
+    /// comes back gives the same root, so nothing was lost or reordered.
+    #[test]
+    fn a_whole_bundle_reads_back_to_the_same_root() {
+        let v = vectors();
+        let mut bundle: Bundle = serde_json::from_value(v["bundle"].clone()).unwrap();
+        // Policies without an @id are named by position, so mix both kinds.
+        bundle.policies = format!(
+            "permit(principal, action == Action::\"Query.first\", resource);\n{}\npermit(principal, action == Action::\"Query.last\", resource);",
+            bundle.policies
+        );
+        let store = MemStore::new();
+        let root = build(&store, &bundle).unwrap();
+        let back = bundle_of(&store, &root).unwrap();
+        assert_eq!(back.groups, bundle.groups);
+        assert_eq!(back.roles, bundle.roles);
+        assert_eq!(back.directory.keys().collect::<Vec<_>>(), bundle.directory.keys().collect::<Vec<_>>());
+        assert_eq!(build(&MemStore::new(), &back).unwrap(), root, "the bundle read back rebuilds the same root");
+        // Unnamed policies keep their places; named ones may come back in another order.
+        let ids: BTreeSet<String> = policy_entries(&back.policies).unwrap().into_iter().map(|p| p.id).collect();
+        let want: BTreeSet<String> = policy_entries(&bundle.policies).unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, want);
+        let first = policy_entries(&back.policies).unwrap();
+        assert_eq!((first[0].id.as_str(), first[5].id.as_str()), ("policy0", "policy5"));
+        // A block that is missing is an error, never a smaller bundle.
+        let mut blocks = store.blocks();
+        let set_cid = as_link(&get_verified(&store, &root).unwrap()["sets"]).unwrap().to_string();
+        blocks.remove(&set_cid);
+        assert!(bundle_of(&MemStore::from_blocks(blocks), &root).is_err());
     }
 
     #[test]

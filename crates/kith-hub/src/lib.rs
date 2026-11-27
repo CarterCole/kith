@@ -39,6 +39,7 @@
 //! | `POST /v1/join`, `/v1/join/invite`, `GET /join/{id}` | join a device, from a terminal or by QR code, approved by manage signers (see [`join`]) |
 //! | `POST /v1/handoff`, `GET /handoff/{id}`   | sign in by scanning a QR code with a phone that holds the passkey (see [`handoff`]) |
 //! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
+//! | `GET /orgs/{name}`, `/v1/orgs/…`          | an org's page for its members, and policy drafts its manage keys sign with `kith org approve` (see [`orgpage`]) |
 //! | `/v1/admin/…`                             | identities, sessions, consent, clients, TOTP resets and the bundle in force, for the operator (see [`admin`]) |
 //!
 //! Browser apps may call discovery, JWKS, `/oauth/token` and `/oauth/userinfo` from
@@ -62,6 +63,7 @@ pub mod jwe;
 pub mod namespace;
 pub mod oidc;
 pub mod org;
+pub mod orgpage;
 pub mod pages;
 pub mod profile;
 pub mod qr;
@@ -125,6 +127,8 @@ pub struct HubConfig {
     /// Take groups and roles from this org's policy DAG (with its revocations
     /// applied) instead of `bundle_path`.
     pub policy_org: Option<String>,
+    /// Orgs with a page on this hub, by name: `/orgs/{name}` (spec §8.6.1).
+    pub orgs: std::collections::BTreeMap<String, String>,
     /// Where heartbeats get their beacon value, and how often they are signed.
     pub beacon: org::BeaconSource,
     pub heartbeat_secs: u64,
@@ -182,6 +186,7 @@ impl HubConfig {
             upstreams: vec![],
             registration_token: None,
             policy_org: None,
+            orgs: Default::default(),
             beacon: org::BeaconSource::None,
             heartbeat_secs: 15,
             login_limit: RateLimit {
@@ -1664,6 +1669,13 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/handoff/{id}/finish", post(handoff::finish))
         .route("/handoff/{id}", get(handoff::page))
         .route("/handoff/{id}/qr.svg", get(handoff::qr_svg))
+        .route("/orgs", get(orgpage::page_list))
+        .route("/orgs/{name}", get(orgpage::page))
+        .route("/orgs/{name}/drafts/{id}", get(orgpage::page_draft))
+        .route("/v1/orgs", get(orgpage::list))
+        .route("/v1/orgs/{name}", get(orgpage::get))
+        .route("/v1/orgs/{name}/drafts", post(orgpage::create_draft))
+        .route("/v1/orgs/{name}/drafts/{id}", get(orgpage::get_draft).delete(orgpage::delete_draft))
         .route("/", get(home))
         .route("/whoami", get(account::page).post(account::login))
         .route("/v1/account/totp", post(account::totp_enroll))

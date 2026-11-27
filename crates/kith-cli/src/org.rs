@@ -15,7 +15,20 @@ use kith_core::pdag::{self, Query};
 use kith_core::revoke::{Entry, Follower, FreshnessPolicy, Heartbeat, Revocation};
 use kith_core::util::now;
 
-use super::{check, fetch_state, http, print, publish, Home};
+use super::{bearer, check, confirm, fetch_state, http, print, publish, Home};
+
+#[derive(Subcommand)]
+pub enum OrgCmd {
+    /// Sign a policy draft made on the hub's org page into this org's log. Run it in the
+    /// org's home (`--home`), where one of its manage keys is. The root is rebuilt from
+    /// the draft here, and the changes are worked out here, before anything is signed.
+    Approve {
+        /// The draft's link: https://hub.example/orgs/<name>/drafts/<id>.
+        link: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
 
 #[derive(Subcommand)]
 pub enum PolicyCmd {
@@ -324,6 +337,163 @@ fn follow(
     Ok((f, hb))
 }
 
+/// Blocks read through a hub's `/v1/blocks`. Every block is hash-checked by whoever
+/// reads it ([`kith_core::dag::get_verified`]), so the hub is trusted for nothing.
+struct HubBlocks<'a>(&'a str);
+
+impl kith_core::dag::BlockGet for HubBlocks<'_> {
+    fn get(&self, cid: &str) -> kith_core::Result<Option<Vec<u8>>> {
+        let r = http()
+            .get(format!("{}/v1/blocks/{cid}", self.0))
+            .send()
+            .map_err(|e| kith_core::Error::NotFound(format!("block {cid}: {e}")))?;
+        if r.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !r.status().is_success() {
+            return Err(kith_core::Error::NotFound(format!("block {cid}: hub returned {}", r.status())));
+        }
+        Ok(Some(r.bytes().map_err(|e| kith_core::Error::NotFound(format!("block {cid}: {e}")))?.to_vec()))
+    }
+}
+
+/// Upload a built DAG's blocks and commit its root in this org's log with the manage
+/// keys held here. Returns the log seq of the new `policy_root`.
+fn commit_root(home: &mut Home, store: &MemStore, root: &str) -> Result<u64> {
+    let hub = home.hub()?;
+    let blocks = store.blocks();
+    check(
+        http()
+            .put(format!("{hub}/v1/blocks"))
+            .json(&blocks_to_json(&blocks))
+            .send()?,
+    )?;
+    let st = home.synced_state()?;
+    // Revocations up to now are presumed folded into the new bundle.
+    let r = check(
+        http()
+            .get(format!("{hub}/v1/revocations/{}", st.did))
+            .send()?,
+    )?;
+    let through = r["entries"]
+        .as_array()
+        .and_then(|a| a.last())
+        .and_then(|e| e["seq"].as_u64())
+        .unwrap_or(0);
+    let mut ev = next_event(
+        &st,
+        EventBody::PolicyRoot {
+            root: root.to_string(),
+            revocations_through: through,
+        },
+    );
+    home.sign_as_manage(&st, &mut ev)?;
+    let st = home.append(ev)?;
+    publish(home)?;
+    eprintln!("published {} blocks; policy root committed at kel seq {} (revocations through {through})", blocks.len(), st.seq);
+    Ok(st.seq)
+}
+
+fn change_line(c: &kith_core::bundle::Change) -> String {
+    use kith_core::bundle::Change::*;
+    match c {
+        Version { from, to } => format!("version {from} -> {to}"),
+        SetAdded { set } => format!("new {set}"),
+        SetRemoved { set } => format!("removes {set}"),
+        Members { set, added, removed } => {
+            let mut lines = vec![format!("{set}:")];
+            lines.extend(added.iter().map(|m| format!("    + {m}")));
+            lines.extend(removed.iter().map(|m| format!("    - {m}")));
+            lines.join("\n")
+        }
+        SetChanged { set, fields } => format!("{set}: changes its {}", fields.join(", ")),
+        PolicyAdded { id } => format!("new policy {id}"),
+        PolicyRemoved { id } => format!("removes policy {id}"),
+        PolicyChanged { id } => format!("changes policy {id}"),
+        DirectoryAdded { id } => format!("new directory entry {id}"),
+        DirectoryRemoved { id } => format!("removes directory entry {id}"),
+        DirectoryChanged { id } => format!("changes directory entry {id}"),
+    }
+}
+
+/// `kith org approve <link>`: check a draft from the hub's org page and sign its root.
+pub fn approve(home: &mut Home, link: &str, yes: bool) -> Result<()> {
+    let hub = home.hub()?;
+    let did = home.did()?;
+    let link = link.trim().trim_end_matches('/');
+    let rest = link
+        .strip_prefix(&format!("{hub}/orgs/"))
+        .ok_or_else(|| anyhow!("that is not a draft on this identity's hub; it looks like {hub}/orgs/<name>/drafts/<id>"))?;
+    let (name, id) = match rest.split('/').collect::<Vec<_>>()[..] {
+        [name, "drafts", id] if !name.is_empty() && !id.is_empty() => (name.to_string(), id.to_string()),
+        _ => bail!("that is not a draft link; it looks like {hub}/orgs/<name>/drafts/<id>"),
+    };
+    let auth = bearer(home)?;
+    let d = check(
+        http()
+            .get(format!("{hub}/v1/orgs/{name}/drafts/{id}"))
+            .header("authorization", auth)
+            .send()?,
+    )?;
+    if d["org"] != json!(did) {
+        bail!(
+            "this draft is for {}, not {did}; run it in that org's home (--home)",
+            d["org"].as_str().unwrap_or("another org")
+        );
+    }
+    match d["state"].as_str() {
+        Some("open") => {}
+        Some("applied") => bail!("this draft is in force already"),
+        Some("stale") => bail!("the org's policy changed since this draft was made; make a new one"),
+        other => bail!("the draft is {}", other.unwrap_or("in an unknown state")),
+    }
+    // Trust nothing the hub says about the draft: rebuild its root, and work out the
+    // changes against the root this org's own log commits to.
+    let bundle: Bundle = serde_json::from_value(d["bundle"].clone()).context("the draft's bundle")?;
+    let report = kith_core::bundle::check(&serde_json::to_string(&d["bundle"])?);
+    if !report.ok() {
+        bail!("the draft's bundle has errors: {}", report.errors.join("; "));
+    }
+    let store = MemStore::new();
+    let root = pdag::build(&store, &bundle)?;
+    if d["root"].as_str() != Some(root.as_str()) {
+        bail!("the hub says this draft's root is {}, but its bundle builds {root}; nothing was signed", d["root"]);
+    }
+    let st = home.synced_state()?;
+    let head = st.policy.clone().ok_or_else(|| anyhow!("{did} has no policy yet; publish one first with `kith policy publish`"))?;
+    if d["base"]["root"].as_str() != Some(head.root.as_str()) {
+        bail!("the org's policy changed since this draft was made; make a new one");
+    }
+    let current = pdag::bundle_of(&HubBlocks(&hub), &head.root)?;
+    let changes = kith_core::bundle::changes(&current, &bundle)?;
+    if changes.is_empty() {
+        bail!("this draft changes nothing");
+    }
+    eprintln!(
+        "Draft {id} for {name} ({did}), by {}:",
+        d["author"].as_str().unwrap_or("?")
+    );
+    for c in &changes {
+        eprintln!("  {}", change_line(c));
+    }
+    for w in &report.warnings {
+        eprintln!("  warning: {w}");
+    }
+    eprintln!("New policy root {root}, replacing {} (log seq {}).", head.root, head.seq);
+    if !confirm(
+        "Sign it with this org's manage keys?",
+        yes,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+    )? {
+        bail!("not signed (pass --yes to skip the question)");
+    }
+    let seq = commit_root(home, &store, &root)?;
+    println!("{root}");
+    eprintln!("In force: {name}'s policy is now {root} (log seq {seq}).");
+    Ok(())
+}
+
 pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
     let hub = home.hub()?;
     match cmd {
@@ -334,43 +504,14 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
             )?;
             let store = MemStore::new();
             let root = pdag::build(&store, &b)?;
-            let blocks = store.blocks();
             if let Some(dir) = blocks_dir {
                 std::fs::create_dir_all(&dir)?;
-                for (cid, bytes) in &blocks {
+                for (cid, bytes) in &store.blocks() {
                     std::fs::write(dir.join(cid), bytes)?;
                 }
             }
-            check(
-                http()
-                    .put(format!("{hub}/v1/blocks"))
-                    .json(&blocks_to_json(&blocks))
-                    .send()?,
-            )?;
-            let st = home.synced_state()?;
-            // Revocations up to now are presumed folded into the new bundle.
-            let r = check(
-                http()
-                    .get(format!("{hub}/v1/revocations/{}", st.did))
-                    .send()?,
-            )?;
-            let through = r["entries"]
-                .as_array()
-                .and_then(|a| a.last())
-                .and_then(|e| e["seq"].as_u64())
-                .unwrap_or(0);
-            let mut ev = next_event(
-                &st,
-                EventBody::PolicyRoot {
-                    root: root.clone(),
-                    revocations_through: through,
-                },
-            );
-            home.sign_as_manage(&st, &mut ev)?;
-            home.append(ev)?;
-            publish(home)?;
+            commit_root(home, &store, &root)?;
             println!("{root}");
-            eprintln!("published {} blocks; policy root committed at kel seq {} (revocations through {through})", blocks.len(), home.state()?.seq);
         }
         PolicyCmd::Slice {
             org,

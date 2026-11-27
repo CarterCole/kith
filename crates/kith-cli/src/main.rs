@@ -216,6 +216,9 @@ enum Cmd {
     /// Policy DAGs: publish a bundle, fetch provable slices, list grants.
     #[command(subcommand)]
     Policy(org::PolicyCmd),
+    /// Orgs on a hub's /orgs pages: sign a policy draft made there (spec §8.6.1).
+    #[command(subcommand)]
+    Org(org::OrgCmd),
     /// Push a signed revocation for this org.
     #[command(subcommand)]
     Revoke(org::RevokeCmd),
@@ -575,6 +578,10 @@ enum HubCmd {
         /// Take groups and roles from this org's policy DAG instead of --bundle.
         #[arg(long)]
         policy_org: Option<String>,
+        /// Give an org a page for its members at /orgs/NAME, where its `god` role drafts
+        /// policy changes for the org's keys to sign (`kith org approve`). Repeatable.
+        #[arg(long = "org", value_name = "NAME=DID", env = "KITH_ORGS", value_delimiter = ',')]
+        orgs: Vec<String>,
         /// Beacon for heartbeats: drand, nist or none.
         #[arg(long, default_value = "drand")]
         beacon: String,
@@ -1426,6 +1433,7 @@ fn main() -> Result<()> {
         signup,
         brand,
         policy_org,
+        orgs,
         beacon,
         heartbeat,
         contact_outbox,
@@ -1451,6 +1459,15 @@ fn main() -> Result<()> {
         let mut cfg = kith_hub::HubConfig::new(issuer, data);
         cfg.bundle_path = bundle;
         cfg.policy_org = policy_org;
+        for o in orgs {
+            let (name, did) = o.split_once('=').ok_or_else(|| anyhow!("--org takes NAME=DID, not {o}"))?;
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || !did.starts_with("did:kith:") {
+                bail!("--org {o}: the name is letters, digits, - and _, and the DID a did:kith:");
+            }
+            if cfg.orgs.insert(name.to_string(), did.to_string()).is_some() {
+                bail!("--org {name} is given twice");
+            }
+        }
         cfg.beacon = kith_hub::org::BeaconSource::parse(&beacon)?;
         cfg.heartbeat_secs = heartbeat;
         if let Some(rp) = rp_id {
@@ -2362,6 +2379,7 @@ fn main() -> Result<()> {
         }
         Cmd::Hub(_) | Cmd::Bundle(_) => unreachable!(),
         Cmd::Policy(cmd) => org::policy(&mut home, cmd)?,
+        Cmd::Org(org::OrgCmd::Approve { link, yes }) => org::approve(&mut home, &link, yes)?,
         Cmd::Revoke(cmd) => org::revoke(&mut home, cmd)?,
         Cmd::Anchor(cmd) => org::anchor(&home, cmd)?,
         Cmd::Revocations {

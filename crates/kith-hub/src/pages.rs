@@ -15,6 +15,7 @@ const LOGOUT: &str = include_str!("pages/logout.html");
 const WHOAMI: &str = include_str!("pages/whoami.html");
 const JOIN: &str = include_str!("pages/join.html");
 const HANDOFF: &str = include_str!("pages/handoff.html");
+const ORGS: &str = include_str!("pages/orgs.html");
 static BRAND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The name pages show to people. Letters, digits and spaces only, so it can sit in HTML
@@ -106,6 +107,11 @@ pub fn whoami(data: Value) -> Response {
 
 pub fn join(data: Value) -> Response {
     render(StatusCode::OK, JOIN, &data)
+}
+
+/// `/orgs`, an org's page and a draft's (spec §8.6.1).
+pub fn orgs(data: Value) -> Response {
+    render(StatusCode::OK, ORGS, &data)
 }
 
 pub fn handoff(data: Value) -> Response {

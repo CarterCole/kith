@@ -193,7 +193,7 @@ impl Hub {
             .collect()
     }
 
-    fn policy_head(&self, org: &str) -> ApiResult<(KeyState, kith_core::kel::PolicyHead)> {
+    pub(crate) fn policy_head(&self, org: &str) -> ApiResult<(KeyState, kith_core::kel::PolicyHead)> {
         let st = self.resolve(org).map_err(|e| ApiError(StatusCode::NOT_FOUND, "not_found".into(), e.to_string(), None))?;
         let head = st.policy.clone().ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "not_found".into(), format!("{org} has no policy root"), None))?;
         Ok((st, head))
@@ -216,6 +216,12 @@ impl Hub {
     /// [`Self::org_memberships`] for a session that assumes `role` (spec §4.3.1).
     pub(crate) fn org_memberships_assuming(&self, did: &str, device: Option<&str>, attrs: &serde_json::Map<String, Value>, role: Option<&str>) -> ApiResult<Option<OrgMemberships>> {
         let Some(org) = &self.cfg.policy_org else { return Ok(None) };
+        self.memberships_in(org, did, device, attrs, role).map(Some)
+    }
+
+    /// Groups and roles of `did` in `org`, from that org's current policy root with its
+    /// revocations applied, whether or not this hub takes its own roles from `org`.
+    pub(crate) fn memberships_in(&self, org: &str, did: &str, device: Option<&str>, attrs: &serde_json::Map<String, Value>, role: Option<&str>) -> ApiResult<OrgMemberships> {
         let (_, head) = self.policy_head(org)?;
         let (slice, _) = pdag::prove(&self.orgs.blocks, &head.root, &Query::Principal { id: did.into() })?;
         let through = head.revocations_through;
@@ -233,13 +239,13 @@ impl Hub {
             None => (engine.memberships_excluding(did, &attrs, &excluded)?, None),
             Some(role) => (crate::assume_or_refuse(&engine, did, &attrs, &excluded, role)?, engine.assume_max_age(role)),
         };
-        Ok(Some(OrgMemberships {
+        Ok(OrgMemberships {
             memberships,
             max_age,
             attrs,
-            org: org.clone(),
+            org: org.to_string(),
             pol: PolicyRef { root: head.root, rev },
-        }))
+        })
     }
 
     /// Refuse `did`, signing in from `device` (if any), when the configured policy org

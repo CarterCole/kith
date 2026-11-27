@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS rate_limits (bucket TEXT PRIMARY KEY, window_start IN
 CREATE TABLE IF NOT EXISTS handles (handle TEXT PRIMARY KEY, did TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS provider_links (alias TEXT PRIMARY KEY, did TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS work (did TEXT PRIMARY KEY, bits INTEGER NOT NULL, nonce INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS org_drafts (id TEXT PRIMARY KEY, org TEXT NOT NULL, created INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS org_drafts_org ON org_drafts (org);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1');
 ";
 
@@ -546,6 +548,41 @@ impl Store {
                     .transpose()?,
             )
         })
+    }
+
+    /// Save a policy draft for `org` (spec §8.9). Drafts older than `ttl` seconds go, and
+    /// an org keeps at most `cap`: the oldest make room.
+    pub(crate) fn put_draft(&self, id: &str, org: &str, created: i64, data: &Value, ttl: i64, cap: usize) -> anyhow::Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM org_drafts WHERE created < ?1", params![created.saturating_sub(ttl)])?;
+            c.execute(
+                "DELETE FROM org_drafts WHERE org = ?1 AND id NOT IN (SELECT id FROM org_drafts WHERE org = ?1 ORDER BY created DESC, id LIMIT ?2)",
+                params![org, cap.saturating_sub(1) as i64],
+            )?;
+            c.execute("INSERT INTO org_drafts (id, org, created, data) VALUES (?1, ?2, ?3, ?4)", params![id, org, created, data.to_string()])?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn draft(&self, id: &str) -> anyhow::Result<Option<Value>> {
+        self.with(|c| one(c, "SELECT data FROM org_drafts WHERE id = ?1", params![id]))
+    }
+
+    /// An org's drafts, newest first.
+    pub(crate) fn drafts(&self, org: &str) -> anyhow::Result<Vec<Value>> {
+        self.with(|c| {
+            let mut q = c.prepare("SELECT data FROM org_drafts WHERE org = ?1 ORDER BY created DESC, id")?;
+            let rows = q.query_map(params![org], |r| r.get::<_, String>(0))?;
+            let mut out = vec![];
+            for r in rows {
+                out.push(serde_json::from_str(&r?)?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub(crate) fn delete_draft(&self, id: &str) -> anyhow::Result<bool> {
+        self.with(|c| Ok(c.execute("DELETE FROM org_drafts WHERE id = ?1", params![id])? > 0))
     }
 
     /// The hub-held co-signer key for `did`, created on first use.

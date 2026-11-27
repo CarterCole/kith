@@ -88,6 +88,15 @@
   - Fresh, degraded and stale levels, `context.kith.sync_age` for per-action
     budgets, and a monotonic clock.
   - Hub tokens are issued from the DAG with revocations applied.
+  - Org pages and drafts ([spec §8.6.1](../spec/08-policy-dag.md)): `kith hub serve
+    --org NAME=DID` gives an org a page at `/orgs/NAME` for its members, with its
+    devices, manage policy and whole policy read back from the signed root
+    (`pdag::bundle_of`, which rebuilds the same root). The org's `god` role edits groups,
+    roles and policies there and saves a draft; `kith org approve <link>` rebuilds the
+    draft's root, works out the changes against the log's own root, and signs it with
+    the org's manage keys. Checked by `tests/orgs.rs` and `scripts/cli-flows.sh`, and the
+    page in a browser against a local hub, with a token standing in for the passkey
+    sign-in.
   - OpenTimestamps: parse and write `.ots` byte-exactly, Bitcoin header verification,
     calendar stamp and upgrade.
 - **OpenID Connect provider** ([spec §7](../spec/07-oidc.md)).
@@ -306,6 +315,13 @@
 - **Work.** `work` is a cost score, not proof of a person, and GPUs buy it cheaply.
   There is no JS or Python helper for mining or checking yet, and no per-hub
   difficulty policy, such as requiring N bits to sign up.
+- **Org pages.** Only the org's `god` role drafts, and it drafts the whole bundle: there
+  are no per-group admins until grants (§10) exist. The page edits members, new sets
+  and policy text, but not rules, `assume` settings or the directory (they are kept as they are).
+  Signing in happens on `/whoami`, which doesn't send you back. A draft's link is all
+  `kith org approve` needs, so the page shows that command; it can't sign in the
+  browser, because the manage keys are not passkeys. Org names are set by the hub's
+  operator, not claimed by the org.
 - **Audiences.** The hub mints tokens for any `audience`. It needs a registry of
   resource servers and per-audience claim release (privacy, and smaller tokens).
 - **Signers still to do:**
