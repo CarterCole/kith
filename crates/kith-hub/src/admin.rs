@@ -4,7 +4,8 @@
 //! and [`HubConfig::admin_role`](crate::HubConfig::admin_role)):
 //! * a caller presenting the configured admin token as a bearer;
 //! * a hub access token (`aud` = issuer, no actor) whose roles include the admin
-//!   role, so the policy bundle decides who runs the hub.
+//!   role, so the policy bundle decides who runs the hub. The sign-in behind the token
+//!   must be strong ([`ADMIN_MIN_AAL`]), whatever level the bundle gives the role at.
 //!
 //! | method, path                                   | what                                                                 |
 //! |------------------------------------------------|----------------------------------------------------------------------|
@@ -13,7 +14,7 @@
 //! | `GET /v1/admin/sessions[?did=…]`               | live hub sessions (never their cookies)                              |
 //! | `DELETE /v1/admin/sessions/{sid}`              | end one session: its codes and refresh tokens die, clients are told |
 //! | `DELETE /v1/admin/identities/{did}/sessions`   | sign an identity out everywhere                                      |
-//! | `DELETE /v1/admin/identities/{did}/totp`       | forget an identity's authenticator; sign-ins resting on it alone end |
+//! | `DELETE /v1/admin/identities/{did}/totp`       | forget an identity's authenticator, for an owner who lost it         |
 //! | `GET /v1/admin/clients`                        | configured and registered clients, without secrets                   |
 //! | `DELETE /v1/admin/clients/{id}`                | delete a registered client (configured ones live in the clients file)|
 //! | `GET /v1/admin/grants/{did}`                   | what an identity agreed to share, per client                         |
@@ -35,6 +36,11 @@ use kith_core::util::now;
 use crate::oidc::{self, ct_eq, Client, SsoSession};
 use crate::{ApiError, ApiResult, Hub};
 
+/// The assurance level a hub token needs, on top of the admin role, to use the admin
+/// API (spec §7.10). A role is a line in a bundle and may be given at any level; the
+/// operator's API should not be one weak sign-in away.
+pub const ADMIN_MIN_AAL: u8 = 2;
+
 /// Who is calling: `admin-token`, or the DID behind a hub token in the admin role.
 fn authorize(h: &Hub, headers: &HeaderMap) -> ApiResult<String> {
     let auth = headers
@@ -52,15 +58,17 @@ fn authorize(h: &Hub, headers: &HeaderMap) -> ApiResult<String> {
     }
     if let Some(role) = &h.cfg.admin_role {
         if let Ok(c) = h.bearer(headers) {
-            if c.roles.contains(role) {
-                return Ok(c.sub);
+            let refuse = |why: String| ApiError(StatusCode::FORBIDDEN, "forbidden".into(), why, None);
+            if !c.roles.contains(role) {
+                return Err(refuse(format!("this identity is not in the {role} role")));
             }
-            return Err(ApiError(
-                StatusCode::FORBIDDEN,
-                "forbidden".into(),
-                format!("this identity is not in the {role} role"),
-                None,
-            ));
+            if c.aal < ADMIN_MIN_AAL {
+                return Err(refuse(format!(
+                    "the admin API needs a strong sign-in (assurance level {ADMIN_MIN_AAL} or more); this one reached level {}",
+                    c.aal
+                )));
+            }
+            return Ok(c.sub);
         }
     }
     Err(ApiError(StatusCode::UNAUTHORIZED, "unauthorized".into(), "the admin API takes the admin token, or a hub access token for an identity in the admin role".into(), None))
@@ -276,6 +284,6 @@ pub async fn revoke_grant(
 
 pub async fn reset_totp(State(h): State<Arc<Hub>>, headers: HeaderMap, Path(did): Path<String>) -> ApiResult<Response> {
     authorize(&h, &headers)?;
-    Ok(ok(json!({"reset": h.store.delete_totp(&did, now())?})))
+    Ok(ok(json!({"reset": h.store.delete_totp(&did)?})))
 }
 

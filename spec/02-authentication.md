@@ -81,7 +81,7 @@ The `factors` array accepts:
 |------|--------|--------|
 | `signature` | `sig` (§1.3) | `sig.signer` is a device with the `session` cap, or a manage signer, of the identity, and the signature is over `message` |
 | `webauthn` | `device_id`, `authenticator_data`, `client_data_json`, `signature` | §2.4 with an origin allowlist and RP id, from a passkey device with the `session` cap |
-| `totp` | `code` | RFC 6238 ±1 step, no step reuse; 5 wrong codes lock the factor for 15 minutes (`429 locked`, with `retry_after`), and the lockout survives a hub restart. The check and the update are one step, so parallel attempts cannot share a failure count or use one code twice. Attempts from one address are limited as well (§7.9). |
+| `totp` | `code` | A second factor: checked only after another factor of the same request has verified, wherever it sits in the array (see below). RFC 6238 ±1 step, no step reuse; 5 wrong codes lock the factor for 15 minutes (`429 locked`, with `retry_after`), and the lockout survives a hub restart. The check and the update are one step, so parallel attempts cannot share a failure count or use one code twice. Attempts from one address are limited as well (§7.9). |
 
 **Resetting TOTP.** `DELETE /v1/totp` (bearer) forgets the caller's authenticator so a
 new one can be enrolled. It needs a current code in the body (`{"code": "123456"}`), or
@@ -90,12 +90,20 @@ can enroll when nothing is enrolled, could swap in its own authenticator and wit
 the TOTP gate on the co-signer (§2.6). An operator who has neither uses the admin API
 (§7.10). `kith totp reset [--code …]` does the first two.
 
-A sign-in that rests on an authenticator code alone (`amr` is just `otp`, with no
-device and no linked account) has no device whose revocation could end it. Resetting
-the authenticator ends it instead: its SSO session stops working and its refresh
-tokens are refused. That is how someone who finds an authenticator they did not enroll
-cuts off whoever did: revoke the devices, reset TOTP, enroll again. Sign-ins that rest
-on anything else are untouched.
+**A code alone does not sign in.** A hub MUST NOT start a session or mint a token for a
+`totp` factor by itself, on any endpoint. A code is six digits and an identity's DID is
+public, so a code that signed in alone could be guessed: five tries every fifteen
+minutes is about one chance in 700 a day, for as long as someone cares to try. A hub
+therefore verifies every other factor of a request first and looks at the code only
+if they all passed. The one other thing that counts is the session a step-up adds the
+code to (§7.3.1): it is the same identity's, still holds, and already rests on a device
+or a linked account, so the code is its second factor. A code sent alone, or beside a
+factor that fails, is refused
+without being checked or spent: the sender learns nothing, and can't lock the
+authenticator with wrong guesses. Sessions and refresh tokens that an earlier hub
+issued for a code alone (`amr` is just `otp`, with no device and no linked account)
+MUST be refused. The co-signer (§2.6) still takes a code from anyone who knows the DID
+of an identity that has one, so the lockout can be triggered there.
 
 ## 2.4 Passkeys
 
@@ -127,6 +135,7 @@ Enrollment from a browser:
 | Evidence | aal | amr |
 |----------|-----|-----|
 | software device key | device's aal (default 1) | `swk` |
+| agent device key (§1.3.3) | 1 | `swk`, `agent` |
 | hardware or passkey session chain | device's aal | `hwk` |
 | passkey assertion with UV | device's aal (default 2) | `hwk`, `user` |
 | passkey assertion without UV | at most 1 | `hwk` |

@@ -37,8 +37,12 @@
 //! | `GET  /v1/domains/attest`                 | witness any DID's proof of a domain, signed (no token) |
 //! | `POST /v1/enroll`, `GET /enroll/{id}`     | enroll a browser passkey as a device            |
 //! | `POST /v1/join`, `/v1/join/invite`, `GET /join/{id}` | join a device, from a terminal or by QR code, approved by manage signers (see [`join`]) |
+//! | `POST /v1/handoff`, `GET /handoff/{id}`   | sign in by scanning a QR code with a phone that holds the passkey (see [`handoff`]) |
 //! | `/v1/blocks`, `/v1/policy`, `/v1/revocations` | policy DAGs and revocations (see [`org`])   |
 //! | `/v1/admin/…`                             | identities, sessions, consent, clients, TOTP resets and the bundle in force, for the operator (see [`admin`]) |
+//!
+//! Browser apps may call discovery, JWKS, `/oauth/token` and `/oauth/userinfo` from
+//! another origin (see [`cors`]).
 //!
 //! State that must outlive a restart is in one SQLite file in the data directory
 //! (see [`store`]).
@@ -50,7 +54,9 @@ pub mod account;
 pub mod admin;
 pub mod contacts;
 pub mod domains;
+pub mod cors;
 pub mod enroll;
+pub mod handoff;
 pub mod join;
 pub mod jwe;
 pub mod namespace;
@@ -131,6 +137,13 @@ pub struct HubConfig {
     /// The hub is behind exactly one reverse proxy: the client address is the last
     /// `X-Forwarded-For` entry, which that proxy appended.
     pub behind_proxy: bool,
+    /// The hub is behind CloudFront (spec §7.9). A request that carries one of these
+    /// values in [`ORIGIN_SECRET_HEADER`], a custom origin header that only CloudFront
+    /// adds, takes its client address from `CloudFront-Viewer-Address`. Other requests
+    /// fall back to [`behind_proxy`](Self::behind_proxy) or the peer, so a client that
+    /// reaches the origin some other way can't choose its address. Two values let the
+    /// secret be rotated. Empty: the CloudFront headers are ignored.
+    pub cloudfront_secrets: Vec<String>,
     /// Turns on the admin API for callers that present this bearer token.
     pub admin_token: Option<String>,
     /// Hub access tokens (`aud` = issuer) whose roles include this one may use the
@@ -184,6 +197,7 @@ impl HubConfig {
                 window_secs: 60,
             },
             behind_proxy: false,
+            cloudfront_secrets: vec![],
             admin_token: None,
             admin_role: Some("hub-admin".into()),
             signup: false,
@@ -270,6 +284,7 @@ pub struct Hub {
     pub(crate) enrollments: Mutex<HashMap<String, enroll::Enrollment>>,
     pub(crate) signups: Mutex<HashMap<String, signup::Attempt>>,
     pub(crate) joins: Mutex<HashMap<String, join::Join>>,
+    pub(crate) handoffs: Mutex<HashMap<String, handoff::Handoff>>,
     pub(crate) upstream: Mutex<upstream::UpstreamState>,
     pub(crate) http: reqwest::Client,
     pub orgs: org::Orgs,
@@ -424,27 +439,16 @@ impl Authn {
         }
     }
 
-    /// Nothing but an authenticator code vouches for this sign-in: no device that could
-    /// be revoked and no linked account that could be unlinked.
+    /// Nothing but an authenticator code vouched for this sign-in: no device and no
+    /// linked account. The hub no longer starts one (spec §2.3, [`Hub::authenticate`]);
+    /// this picks out the sessions and refresh tokens an earlier hub left in the store,
+    /// which are refused.
     pub(crate) fn rests_on_totp_alone(&self) -> bool {
         self.dev.is_none() && self.alias.is_none() && self.amr == ["otp"]
     }
 }
 
 impl Hub {
-    /// A sign-in that rests on the authenticator alone ends when it is reset, so that
-    /// resetting it is a way to cut off whoever enrolled it. Anything else is unaffected.
-    pub(crate) fn totp_session_alive(&self, a: &Authn) -> bool {
-        if !a.rests_on_totp_alone() {
-            return true;
-        }
-        match self.store.totp_reset_at(&a.st.did) {
-            Ok(Some(reset)) => a.auth_time > reset,
-            Ok(None) => true,
-            Err(_) => false,
-        }
-    }
-
     pub fn open(cfg: HubConfig) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(cfg.data_dir.join("kels"))?;
         let key_path = cfg.data_dir.join("hub-key.json");
@@ -517,6 +521,7 @@ impl Hub {
             enrollments: Mutex::new(HashMap::new()),
             signups: Mutex::new(HashMap::new()),
             joins: Mutex::new(HashMap::new()),
+            handoffs: Mutex::new(HashMap::new()),
             upstream: Mutex::new(upstream::UpstreamState::default()),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
@@ -712,10 +717,11 @@ impl Hub {
     /// Count a TOTP attempt from `ip` against [`HubConfig::totp_limit`]. The identity's
     /// own lockout still applies; this stops one address from trying many identities.
     pub(crate) fn limit_totp(&self, ip: &ClientIp) -> ApiResult<()> {
-        match self
-            .store
-            .hit(&format!("totp|{}", ip.0), self.cfg.totp_limit, now())?
-        {
+        match self.store.hit(
+            &format!("totp|{}", ip.limit_key()),
+            self.cfg.totp_limit,
+            now(),
+        )? {
             None => Ok(()),
             Some(retry) => Err(ApiError(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -741,7 +747,10 @@ impl Hub {
         ip: &ClientIp,
         limit: RateLimit,
     ) -> Result<(), Response> {
-        match self.store.hit(&format!("{what}|{}", ip.0), limit, now()) {
+        match self
+            .store
+            .hit(&format!("{what}|{}", ip.limit_key()), limit, now())
+        {
             Ok(None) => Ok(()),
             Ok(Some(retry)) => {
                 let e = ApiError(
@@ -798,6 +807,14 @@ impl Hub {
 
     /// Verify authentication `factors` for `did` over a challenge `message`.
     pub fn authenticate(&self, did: &str, message: &str, factors: &[Factor]) -> ApiResult<Authn> {
+        self.authenticate_onto(did, message, factors, None)
+    }
+
+    /// [`Hub::authenticate`], adding to `onto`: a live session of the same identity that
+    /// a step-up strengthens (spec §7.3.1). That session already rests on a device or a
+    /// linked account, so it counts as the other factor a one-time code needs (spec
+    /// §2.3). The caller checks that `onto` still holds; it is not merged here.
+    pub(crate) fn authenticate_onto(&self, did: &str, message: &str, factors: &[Factor], onto: Option<&Authn>) -> ApiResult<Authn> {
         let st = self
             .resolve(did)
             .map_err(|e| ApiError::unauthorized(format!("unknown identity: {e}")))?;
@@ -806,7 +823,14 @@ impl Hub {
         let mut kinds = BTreeSet::new();
         let mut dev = None;
         let mut alias = None;
-        for f in factors {
+        // A one-time code is a second factor: it is looked at only once another factor of
+        // this request has verified (spec §2.3). Sent alone, or beside a factor that
+        // fails, it is neither checked nor spent, so guessing codes takes more than
+        // knowing a DID, and a stranger can't lock the authenticator from here.
+        let (codes, others): (Vec<&Factor>, Vec<&Factor>) = factors
+            .iter()
+            .partition(|f| matches!(f, Factor::Totp { .. }));
+        for f in others.into_iter().chain(codes) {
             match f {
                 Factor::Signature { sig } => {
                     if !st.is_authentication_signer(&sig.signer) {
@@ -831,6 +855,9 @@ impl Hub {
                     } else {
                         "swk".into()
                     });
+                    if d.is_some_and(|d| d.kind == DeviceKind::Agent) {
+                        amr.push("agent".into());
+                    }
                     dev = dev.or(d.map(|d| d.id.clone()));
                     kinds.insert("possession");
                 }
@@ -885,6 +912,12 @@ impl Hub {
                     kinds.insert("possession");
                 }
                 Factor::Totp { code } => {
+                    let onto_holds = onto.is_some_and(|o| o.st.did == st.did && !o.rests_on_totp_alone() && o.aal > 0);
+                    if aal == 0 && !onto_holds {
+                        return Err(ApiError::unauthorized(
+                            "a one-time code alone does not sign in: use a passkey, a device or a linked account, and add the code to that",
+                        ));
+                    }
                     self.check_totp(&st.did, code, true)?;
                     aal = aal.max(1);
                     amr.push("otp".into());
@@ -1091,15 +1124,44 @@ impl KelResolver for Hub {
     }
 }
 
-/// The address a request came from, for rate limits: the peer, or behind a trusted
-/// proxy ([`HubConfig::behind_proxy`]) the entry that proxy appended to
-/// `X-Forwarded-For`. Earlier entries are whatever the client claimed.
+/// The address a request came from, for rate limits and the phone sign-in page:
+/// - behind CloudFront ([`HubConfig::cloudfront_secrets`]), on a request that carries
+///   the secret, the viewer's address from `CloudFront-Viewer-Address`;
+/// - otherwise behind a trusted proxy ([`HubConfig::behind_proxy`]) the entry that proxy
+///   appended to `X-Forwarded-For` (earlier entries are whatever the client claimed);
+/// - otherwise the peer.
 pub struct ClientIp(pub String);
+
+impl ClientIp {
+    /// What rate limits count: the address, or for IPv6 its /64, since one subscriber
+    /// usually holds a whole /64 and can pick any address in it. An IPv4 address mapped
+    /// into IPv6 counts as itself. Anything that isn't an address counts as written.
+    pub fn limit_key(&self) -> String {
+        let Ok(ip) = self.0.parse::<std::net::IpAddr>() else {
+            return self.0.clone();
+        };
+        match ip.to_canonical() {
+            std::net::IpAddr::V6(v6) => {
+                let prefix = u128::from(v6) & !(u128::MAX >> 64);
+                format!("{}/64", std::net::Ipv6Addr::from(prefix))
+            }
+            v4 => v4.to_string(),
+        }
+    }
+}
+
+/// The custom origin header that carries [`HubConfig::cloudfront_secrets`].
+pub const ORIGIN_SECRET_HEADER: &str = "kith-origin-secret";
+/// CloudFront's header with the viewer's address and source port.
+pub const VIEWER_ADDRESS_HEADER: &str = "cloudfront-viewer-address";
 
 impl FromRequestParts<Arc<Hub>> for ClientIp {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, h: &Arc<Hub>) -> Result<Self, Self::Rejection> {
+        if let Some(ip) = cloudfront_viewer(&parts.headers, &h.cfg.cloudfront_secrets) {
+            return Ok(ClientIp(ip));
+        }
         if h.cfg.behind_proxy {
             let forwarded = parts
                 .headers
@@ -1119,6 +1181,58 @@ impl FromRequestParts<Arc<Hub>> for ClientIp {
             .map(|c| c.0.ip().to_string());
         Ok(ClientIp(peer.unwrap_or_else(|| "local".into())))
     }
+}
+
+/// The viewer's address, when the request carries one of `secrets` (so CloudFront sent
+/// it) and exactly one `CloudFront-Viewer-Address` that parses.
+fn cloudfront_viewer(headers: &HeaderMap, secrets: &[String]) -> Option<String> {
+    if secrets.is_empty() {
+        return None;
+    }
+    let given = single_header(headers, ORIGIN_SECRET_HEADER)?;
+    if !secrets.iter().any(|s| oidc::ct_eq(given, s)) {
+        return None;
+    }
+    let ip = single_header(headers, VIEWER_ADDRESS_HEADER).and_then(viewer_ip);
+    if ip.is_none() {
+        // CloudFront sent the secret but not the address: its origin request policy
+        // doesn't forward the header. Say so once, rather than for every request.
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "a request carried the CloudFront secret but no single valid CloudFront-Viewer-Address; \
+                 using the proxy's address instead (spec §7.9)"
+            );
+        }
+    }
+    ip
+}
+
+/// The one value of header `name`: none if it is missing, repeated, or not text.
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut all = headers.get_all(name).iter();
+    let value = all.next()?;
+    if all.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
+}
+
+/// The address in a `CloudFront-Viewer-Address` value, in its usual form. CloudFront
+/// writes the address, a colon and the source port: `198.51.100.10:46532`, and for IPv6
+/// `2001:db8::1:46532` with no brackets, so the port is whatever follows the last colon.
+/// `[2001:db8::1]:46532` is taken too.
+pub fn viewer_ip(value: &str) -> Option<String> {
+    let (addr, port) = value.trim().rsplit_once(':')?;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let addr = addr
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(addr);
+    let ip: std::net::IpAddr = addr.parse().ok()?;
+    Some(ip.to_canonical().to_string())
 }
 
 // ---------------------------------------------------------------- handlers
@@ -1283,10 +1397,16 @@ fn token_exchange(h: &Hub, req: &TokenReq) -> ApiResult<Value> {
                 st,
                 dev: Some(v.device.id.clone()),
                 aal: v.aal,
-                amr: vec![match v.device.kind {
-                    DeviceKind::Passkey | DeviceKind::Hardware => "hwk".to_string(),
-                    _ => "swk".to_string(),
-                }],
+                amr: {
+                    let mut amr = vec![match v.device.kind {
+                        DeviceKind::Passkey | DeviceKind::Hardware => "hwk".to_string(),
+                        _ => "swk".to_string(),
+                    }];
+                    if v.device.kind == DeviceKind::Agent {
+                        amr.push("agent".into());
+                    }
+                    amr
+                },
                 auth_time: t,
                 alias: None,
                 attrs: Map::new(),
@@ -1389,8 +1509,8 @@ struct ResetReq {
 /// `DELETE /v1/totp`: forget the caller's authenticator so a new one can be enrolled.
 /// The caller shows the current code, or has signed in strongly (AAL 2). Otherwise a
 /// weak session, a stolen laptop's say, could swap in its own authenticator and with
-/// it the TOTP gate on the co-signer. Sign-ins that rested on the authenticator alone
-/// end with it. An operator without either uses `DELETE /v1/admin/identities/{did}/totp`.
+/// it the TOTP gate on the co-signer. An operator without either uses
+/// `DELETE /v1/admin/identities/{did}/totp`.
 async fn totp_reset(
     State(h): State<Arc<Hub>>,
     ip: ClientIp,
@@ -1413,7 +1533,7 @@ async fn totp_reset(
             ))
         }
     }
-    Ok(Json(json!({"reset": h.store.delete_totp(&c.sub, now())?})))
+    Ok(Json(json!({"reset": h.store.delete_totp(&c.sub)?})))
 }
 
 /// Returns (creating on first call) the hub-held co-signer key for the caller.
@@ -1537,6 +1657,13 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/join/{id}/pop", post(join::pop))
         .route("/join/{id}", get(join::page))
         .route("/join/{id}/qr.svg", get(join::qr_svg))
+        .route("/v1/handoff", post(handoff::start))
+        .route("/v1/handoff/{id}", get(handoff::status))
+        .route("/v1/handoff/{id}/approve", post(handoff::approve))
+        .route("/v1/handoff/{id}/deny", post(handoff::deny))
+        .route("/v1/handoff/{id}/finish", post(handoff::finish))
+        .route("/handoff/{id}", get(handoff::page))
+        .route("/handoff/{id}/qr.svg", get(handoff::qr_svg))
         .route("/", get(home))
         .route("/whoami", get(account::page).post(account::login))
         .route("/v1/account/totp", post(account::totp_enroll))
@@ -1581,6 +1708,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
             "/v1/admin/grants/{did}/{client_id}",
             delete(admin::revoke_grant),
         )
+        .layer(axum::middleware::from_fn_with_state(hub.clone(), cors::layer))
         .with_state(hub)
 }
 
@@ -1607,6 +1735,13 @@ pub async fn serve(cfg: HubConfig, addr: &str) -> anyhow::Result<()> {
         hub.cfg.upstreams.len(),
         hub.cfg.data_dir.join(store::FILE).display()
     );
+    if !hub.cfg.cloudfront_secrets.is_empty() {
+        eprintln!(
+            "client addresses: CloudFront-Viewer-Address on requests with the CloudFront secret ({} accepted), otherwise {}",
+            hub.cfg.cloudfront_secrets.len(),
+            if hub.cfg.behind_proxy { "the last X-Forwarded-For entry" } else { "the peer" }
+        );
+    }
     axum::serve(
         listener,
         router(hub).into_make_service_with_connect_info::<SocketAddr>(),
@@ -1619,6 +1754,69 @@ pub async fn serve(cfg: HubConfig, addr: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn rate_limits_count_an_ipv6_64() {
+        for (ip, key) in [
+            ("2001:db8:1:2:3:4:5:6", "2001:db8:1:2::/64"),
+            ("2001:db8:1:2::", "2001:db8:1:2::/64"),
+            ("2001:0db8:0001:0002:ffff::1", "2001:db8:1:2::/64"),
+            ("::1", "::/64"),
+            ("203.0.113.7", "203.0.113.7"),
+            ("::ffff:203.0.113.7", "203.0.113.7"),
+            ("local", "local"),
+        ] {
+            assert_eq!(ClientIp(ip.into()).limit_key(), key, "{ip}");
+        }
+    }
+
+    #[test]
+    fn cloudfront_viewer_addresses() {
+        for (value, ip) in [
+            ("198.51.100.10:46532", "198.51.100.10"),
+            ("2001:db8::1:46532", "2001:db8::1"),
+            ("2001:0db8:0000:0000:0000:0000:0000:0001:443", "2001:db8::1"),
+            ("[2001:db8::1]:46532", "2001:db8::1"),
+            ("2001:db8:::46532", "2001:db8::"),
+            ("[::ffff:198.51.100.10]:1", "198.51.100.10"),
+        ] {
+            assert_eq!(viewer_ip(value).as_deref(), Some(ip), "{value}");
+        }
+        // CloudFront always writes a port.
+        for bad in [
+            "",
+            "198.51.100.10",
+            "198.51.100.10:",
+            "198.51.100.10:x",
+            "edge:443",
+            "1.2.3.4, 5.6.7.8:9",
+        ] {
+            assert_eq!(viewer_ip(bad), None, "{bad:?}");
+        }
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let secrets = [SECRET.to_string()];
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in pairs {
+                m.append(*k, HeaderValue::from_static(v));
+            }
+            m
+        };
+        let secret = (ORIGIN_SECRET_HEADER, SECRET);
+        let address = (VIEWER_ADDRESS_HEADER, "203.0.113.9:1");
+        let other = (VIEWER_ADDRESS_HEADER, "198.51.100.1:1");
+        let ok = headers(&[secret, address]);
+        assert_eq!(
+            cloudfront_viewer(&ok, &secrets).as_deref(),
+            Some("203.0.113.9")
+        );
+        assert_eq!(cloudfront_viewer(&ok, &[]), None, "not configured");
+        let twice = headers(&[secret, address, other]);
+        assert_eq!(cloudfront_viewer(&twice, &secrets), None, "two addresses");
+        assert_eq!(cloudfront_viewer(&headers(&[secret]), &secrets), None);
+        assert_eq!(cloudfront_viewer(&headers(&[address]), &secrets), None);
+    }
 
     fn hub() -> Arc<Hub> {
         let dir = std::env::temp_dir().join(format!("kith-hub-unit-{}", random_id()));
@@ -1698,5 +1896,39 @@ mod tests {
                 "round {round}: four wrong codes, {failures} counted"
             );
         }
+    }
+
+    /// Earlier hubs started a session for a one-time code alone. One still in the
+    /// store is not honoured (spec §2.3).
+    #[test]
+    fn a_stored_session_that_rests_on_a_code_alone_no_longer_holds() {
+        use kith_core::keys::{KeyType, LocalSigner};
+        use kith_core::policy::SignerPolicy;
+
+        let h = hub();
+        let key = LocalSigner::generate(KeyType::Ed25519);
+        let next = SignerPolicy::single(LocalSigner::generate(KeyType::Ed25519).id);
+        let mut inception =
+            kith_core::kel::new_inception(SignerPolicy::single(&key.id), &next, vec![]);
+        inception.sign(&key).unwrap();
+        let did = kith_core::kel::did_for_inception(&inception).unwrap();
+        let st = h.put_kel(&did, vec![inception]).unwrap();
+        let signed_in_by = |amr: &[&str]| Authn {
+            st: st.clone(),
+            dev: None,
+            aal: 1,
+            amr: amr.iter().map(|m| m.to_string()).collect(),
+            auth_time: now(),
+            alias: None,
+            attrs: Map::new(),
+        };
+        assert!(
+            oidc::session_holds(&h, &signed_in_by(&["swk"])).is_some(),
+            "a manage key's sign-in holds"
+        );
+        assert!(
+            oidc::session_holds(&h, &signed_in_by(&["otp"])).is_none(),
+            "a session made by a code alone still holds"
+        );
     }
 }

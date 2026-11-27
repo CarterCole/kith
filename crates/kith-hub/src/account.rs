@@ -47,6 +47,7 @@ pub async fn page(State(h): State<Arc<Hub>>, headers: HeaderMap) -> Response {
             "message": message,
             "rp_id": h.cfg.rp_id,
             "signup": h.cfg.signup,
+            "phone": true,
         }));
     };
     let a = &s.authn;
@@ -89,7 +90,7 @@ pub async fn page(State(h): State<Arc<Hub>>, headers: HeaderMap) -> Response {
 /// through a one-time code alone, may not choose a second factor for the account.
 fn device_session(h: &Hub, headers: &HeaderMap) -> ApiResult<KeyState> {
     let (s, st) = current(h, headers).ok_or_else(|| ApiError::unauthorized("sign in on the account page first"))?;
-    if s.authn.dev.is_none() || !h.totp_session_alive(&s.authn) {
+    if s.authn.dev.is_none() {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
             "forbidden".into(),

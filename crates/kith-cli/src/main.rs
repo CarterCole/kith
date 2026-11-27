@@ -241,7 +241,7 @@ enum DeviceCmd {
         key: Option<String>,
         #[arg(long)]
         device_id: Option<String>,
-        /// software | passkey (simulated WebAuthn authenticator)
+        /// software | passkey (simulated WebAuthn authenticator) | hardware | agent
         #[arg(long, default_value = "software")]
         kind: String,
         /// Defaults: software 1, passkey 2, hardware 3.
@@ -523,6 +523,18 @@ enum HubCmd {
         /// that proxy appended to `X-Forwarded-For`.
         #[arg(long)]
         behind_proxy: bool,
+        /// The hub is behind CloudFront, which adds this value as the custom origin
+        /// header `Kith-Origin-Secret`: requests that carry it take the visitor's address
+        /// from `CloudFront-Viewer-Address`. Others fall back to --behind-proxy or the
+        /// peer. At least 32 characters (`openssl rand -hex 32`); comma-separate two to
+        /// rotate it.
+        #[arg(
+            long,
+            env = "KITH_CLOUDFRONT_SECRET",
+            value_delimiter = ',',
+            hide_env_values = true
+        )]
+        cloudfront_secret: Vec<String>,
         /// Let anyone create an account in the browser at `/signup` (a passkey, and a
         /// recovery key the browser makes). Off by default: it opens the registry.
         #[arg(long)]
@@ -1024,7 +1036,11 @@ fn new_device(name: &str, kind: DeviceKind, aal: u8) -> (Device, LocalSigner, Ex
         name: name.into(),
         kind,
         aal,
-        caps: vec!["session".into(), "alias".into()],
+        caps: if kind == DeviceKind::Agent {
+            vec!["session".into()]
+        } else {
+            vec!["session".into(), "alias".into()]
+        },
         rp_id: (kind == DeviceKind::Passkey).then(|| "localhost".to_string()),
         xkey: Some(xkey.public_did_key()),
     };
@@ -1219,6 +1235,7 @@ fn main() -> Result<()> {
         registration_token,
         admin_token,
         behind_proxy,
+        cloudfront_secret,
         signup,
         brand,
         policy_org,
@@ -1267,6 +1284,18 @@ fn main() -> Result<()> {
         cfg.registration_token = registration_token.filter(|t| !t.is_empty());
         cfg.admin_token = admin_token.filter(|t| !t.is_empty());
         cfg.behind_proxy = behind_proxy;
+        cfg.cloudfront_secrets = cloudfront_secret
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cfg
+            .cloudfront_secrets
+            .iter()
+            .any(|s| s.len() < 32 || !s.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            bail!("--cloudfront-secret: use at least 32 printable characters with no spaces, e.g. `openssl rand -hex 32`");
+        }
         cfg.signup = signup;
         if let Some(b) = &brand {
             kith_hub::pages::set_brand(b);
@@ -1516,10 +1545,11 @@ fn main() -> Result<()> {
                 "software" => DeviceKind::Software,
                 "passkey" => DeviceKind::Passkey,
                 "hardware" => DeviceKind::Hardware,
+                "agent" => DeviceKind::Agent,
                 other => bail!("unknown device kind {other}"),
             };
             let aal = aal.unwrap_or(match kind {
-                DeviceKind::Software | DeviceKind::Wallet => 1,
+                DeviceKind::Software | DeviceKind::Wallet | DeviceKind::Agent => 1,
                 DeviceKind::Passkey => 2,
                 DeviceKind::Hardware => 3,
             });
@@ -2204,6 +2234,7 @@ fn kind_str(k: DeviceKind) -> &'static str {
         DeviceKind::Passkey => "passkey",
         DeviceKind::Hardware => "hardware",
         DeviceKind::Wallet => "wallet",
+        DeviceKind::Agent => "agent",
     }
 }
 

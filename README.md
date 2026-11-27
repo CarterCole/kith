@@ -101,6 +101,7 @@ kith init --hub https://hub.example          # root identity + this device + 2-o
 kith init --keystore file                    # or a plaintext identity.json (the default on Linux)
 kith keys list && kith keys migrate          # where each key lives; move a file-backed home into the keychain
 kith device add --name phone --kind passkey --out phone.json
+kith device add --name build-bot --kind agent --out bot.json   # a non-human key: aal 1, session cap only
 kith device join --hub https://hub.example   # join an identity made in the browser: approve this machine there
                                              # (phones join by the QR code on the hub's account page)
 kith manage set 2 passkey mac phone --recovery-key kith-recovery-key.json   # who approves new devices
@@ -118,6 +119,7 @@ kith hub serve --signup                      # let anyone create an account at /
                                              # /whoami: sign in with that passkey, see your identity
 kith work --bits 24                          # spend compute on your identity; the hub records the best proof
 kith hub serve --admin-token "$TOKEN"        # /v1/admin/…: identities, sessions, consent, clients, the bundle in force
+kith hub serve --behind-proxy --cloudfront-secret "$SECRET"   # behind CloudFront: rate limits per visitor, not per edge
 kith bundle check bundle.json                # before deploying: keys written twice, unknown members, missing sets
 kith bundle edit bundle.json --people people.json   # edit it in your browser, on this machine; save, commit, deploy
 kith alias link 'https://oauth.telegram.org#<your id>'   # let that Telegram account sign in as you
@@ -247,7 +249,7 @@ permit(principal in Role::"billing-reader", action == Action::"Document.read", r
 |------|------|
 | `spec/` | Normative spec and [conformance vectors](spec/test-vectors/) |
 | `crates/kith-core` | Keys, WebAuthn, signer policies, KEL, aliases, JWS, sessions and delegation, access tokens, TOTP, Cedar authz, bundle file checks, verified-domain proofs, vault, policy DAG, revocations, beacons (drand, NIST 2.0), OpenTimestamps |
-| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email, phone and domain contacts (TXT, CNAME or HTML-file proof, witnessed by any hub), OpenID Connect provider with passkey login, step-up and enrollment pages, an account page that sets up an authenticator app, public profile and `whoami` views, names in a verified domain with WebFinger, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
+| `crates/kith-hub` | Reference hub: KEL registry, challenge login, token exchange, TOTP, co-signer, verified email, phone and domain contacts (TXT, CNAME or HTML-file proof, witnessed by any hub), OpenID Connect provider with passkey login (or a phone's passkey, by QR code), step-up and enrollment pages, an account page that sets up an authenticator app, public profile and `whoami` views, names in a verified domain with WebFinger, SQLite state store, rate limits, admin API, block store and IPFS-gateway route, revocation feeds and heartbeats |
 | `crates/kith-cli` | `kith` binary, including the local bundle editor (`kith bundle edit`) |
 | `packages/js` | `@kith/auth`: verifier, Cedar engine (wasm), GraphQL middleware, browser client, policy DAG slices, revocation follower, beacon verifiers |
 | `packages/python` | `kith-auth`: verifier, Cedar engine (cedarpy), graphql-core middleware |

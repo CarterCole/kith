@@ -533,27 +533,9 @@ impl Store {
         })
     }
 
-    /// Forget `did`'s authenticator and remember when, so that sign-ins which rested
-    /// on it alone (no device to revoke) stop working. `true` if one was enrolled.
-    pub(crate) fn delete_totp(&self, did: &str, t: i64) -> anyhow::Result<bool> {
-        self.with(|c| {
-            let had = c.execute("DELETE FROM totp WHERE did = ?1", params![did])? > 0;
-            c.execute("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![format!("totp_reset|{did}"), t.to_string()])?;
-            Ok(had)
-        })
-    }
-
-    /// When `did`'s authenticator was last reset, if ever.
-    pub(crate) fn totp_reset_at(&self, did: &str) -> anyhow::Result<Option<i64>> {
-        self.with(|c| {
-            Ok(c.query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![format!("totp_reset|{did}")],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-            .and_then(|v| v.parse().ok()))
-        })
+    /// Forget `did`'s authenticator. `true` if one was enrolled.
+    pub(crate) fn delete_totp(&self, did: &str) -> anyhow::Result<bool> {
+        self.with(|c| Ok(c.execute("DELETE FROM totp WHERE did = ?1", params![did])? > 0))
     }
 
     pub(crate) fn cosigner(&self, did: &str) -> anyhow::Result<Option<LocalSigner>> {

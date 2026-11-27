@@ -38,6 +38,34 @@ tests (`crates/kith-hub/tests/oidc.rs`).
 Discovery is served at both `/.well-known/openid-configuration` and
 `/.well-known/oauth-authorization-server`.
 
+### 7.1.1 Browser apps (CORS)
+
+A single-page app redeems its code and refreshes its tokens with `fetch` from its own
+origin, so these endpoints answer CORS requests and preflights:
+
+| Endpoint | Origins allowed |
+|----------|-----------------|
+| discovery (both paths), `jwks_uri` | any: `Access-Control-Allow-Origin: *`, sent whether or not the request has an `Origin` |
+| `token_endpoint`, `userinfo_endpoint` | the web origin of any registered client's redirect URI (§7.2), echoed back, with `Vary: Origin` |
+
+- A web origin is `scheme://host[:port]` of an `https` or loopback `http` redirect URI,
+  in lower case and without the default port, as a browser sends it. Private-use
+  schemes have none, so they open nothing. `https://app.example:443/cb` allows
+  `https://app.example`.
+- The origin is checked against every client, configured or registered, not only the
+  one named in the request: a preflight carries no body. PKCE and client
+  authentication still decide who gets a token.
+- A preflight from an allowed origin gets `204` with `GET, POST` (`GET` for the public
+  documents), the `authorization` and `content-type` headers, and a 10-minute
+  `Access-Control-Max-Age`. From any other origin it gets `403` and no
+  `Access-Control-*` headers.
+- Responses, errors included, carry `Access-Control-Allow-Origin` for an allowed origin,
+  and `Access-Control-Expose-Headers: www-authenticate` on the token and userinfo
+  endpoints.
+- Never `Access-Control-Allow-Credentials`: these endpoints read no cookies.
+- Every other path answers no CORS, so scripts on other origins cannot read the login
+  and consent pages or the `/v1` API.
+
 ## 7.2 Clients
 
 Clients are registered in a JSON file, passed as `kith hub serve --clients clients.json`:
@@ -320,6 +348,7 @@ JSON and read with `textContent`, never interpolated into HTML.
    same message. The account must be a device or manage signer of the identity.
 3. **TOTP** can be added to either, and raises the session to at least AAL2 (§2.5).
 4. **An upstream provider**, one button for each the hub is configured with (§7.8).
+5. **A phone** that holds the passkey, by scanning a QR code the page shows (§7.15).
 
 The page posts `{request_id, challenge_id, did, factors}` to `POST /oauth/login`.
 - On success, the response is `{redirect}` and sets the session cookie. The redirect
@@ -946,14 +975,41 @@ Not yet implemented:
 - **Rate limits.** `POST /oauth/login` allows 20 attempts per minute and
   `POST /oauth/register` 20 per hour, per client address. One more answers `429` with
   a `Retry-After` header and `{"error": "rate_limited", "retry_after": <seconds>}`.
-  Behind one reverse proxy, start the hub with `--behind-proxy`: the client address
-  is then the last `X-Forwarded-For` entry, the one your proxy appended (earlier
-  entries are whatever the client sent). Without the flag that header is ignored.
-  Every place a TOTP code is checked (`/v1/auth/verify`, `/v1/cosign`, and a token
+  The client address is the peer's unless the hub is told what is in front of it (next
+  item). Every limit per client address counts an IPv6 address by its /64: one
+  subscriber usually holds a whole /64 and can send from any address in it. An IPv4
+  address mapped into IPv6 (`::ffff:198.51.100.10`) counts as the IPv4 address. Every
+  place a TOTP code is checked (`/v1/auth/verify`, `/v1/cosign`, and a token
   exchange with `totp`) shares a third budget of 20 per minute per address
   (`totp_limit`), and a reset with a code counts against it too. TOTP has its own
   lockout per identity (§2.3). Counters live in the store, so a restart does not reset
   them.
+- **The client address behind a proxy.** Rate limits, and the address the phone sign-in
+  page shows (§7.15), are only as good as the address the hub is given.
+  - Behind one reverse proxy, start the hub with `--behind-proxy`: the client address is
+    then the last `X-Forwarded-For` entry, the one your proxy appended (earlier entries
+    are whatever the client sent). Without the flag that header is ignored.
+  - Behind a CDN that last entry is the CDN's edge, so every visitor through one edge
+    shares one budget, and one of them can spend it for all. Trusting the entry before
+    it is no fix when the origin can be reached without the CDN, as a public hostname
+    such as a Tailscale Funnel's can: a client that goes there directly writes that
+    entry itself.
+  - **Behind CloudFront**, give the hub a secret with `--cloudfront-secret` (or
+    `KITH_CLOUDFRONT_SECRET`), at least 32 characters (`openssl rand -hex 32`), and set
+    the same value on the distribution's origin as the custom header
+    `Kith-Origin-Secret`. A request that carries the secret takes its address from
+    `CloudFront-Viewer-Address`: the viewer's address, a colon and the source port
+    (`198.51.100.10:46532`, or for IPv6 `2001:db8::1:46532`), whose port the hub drops.
+    Any other request (no secret, a wrong one, or not exactly one address that parses)
+    falls back to `--behind-proxy` or the peer, so going around CloudFront gets a client
+    only its own address. The hub does not refuse such requests.
+  - The origin request policy must forward `CloudFront-Viewer-Address` and must not
+    forward `Host` (the origin's certificate is for its own name). AWS documents its
+    managed `AllViewerExceptHostHeader` policy as doing both. If the secret arrives
+    without a usable address, the hub logs it once and uses the fallback.
+  - The secret is as private as the distribution's configuration and the hub's
+    environment. To rotate it, start the hub with both values, comma-separated; change
+    the header on the distribution; once that has deployed, drop the old value.
 - **TLS.** The hub speaks plain HTTP. Terminate TLS in front of it and set `--issuer`
   to the `https://` URL; cookies are then marked `Secure`.
 - **RP id.** WebAuthn only allows passkeys on the RP id's domain.
@@ -986,7 +1042,9 @@ For the hub's operator, under `{issuer}/v1/admin/`. Two credentials open it:
 - the bearer token given as `kith hub serve --admin-token` (or `KITH_ADMIN_TOKEN`);
 - a hub access token (`aud` = issuer, §2.3) for an identity whose roles include the
   admin role, `hub-admin` by default. The policy bundle decides who is in that role,
-  so "who runs the hub" is an ordinary Kith authorization question.
+  so "who runs the hub" is an ordinary Kith authorization question. The token's `aal`
+  MUST be 2 or more as well, whatever level the bundle gives the role at: a weaker
+  sign-in in the role gets `403`.
 
 | Method, path | Does |
 |--------------|------|
@@ -995,7 +1053,7 @@ For the hub's operator, under `{issuer}/v1/admin/`. Two credentials open it:
 | `GET /v1/admin/sessions[?did=…]` | Live hub sessions: `sid`, `did`, `device`, `alias`, `aal`, `amr`, `auth_time`, `expires`, `clients`. Never the cookie. |
 | `DELETE /v1/admin/sessions/{sid}` | Ends that session. Its unredeemed codes and its refresh tokens die; clients that registered a logout URI are told (§7.6). |
 | `DELETE /v1/admin/identities/{did}/sessions` | Signs the identity out everywhere: every session, and every refresh token, including those whose session already expired. |
-| `DELETE /v1/admin/identities/{did}/totp` | Forgets the identity's authenticator, for an owner who lost it and has no strong sign-in. Sign-ins that rested on it alone end (§2.3). |
+| `DELETE /v1/admin/identities/{did}/totp` | Forgets the identity's authenticator, for an owner who lost it and has no strong sign-in. |
 | `GET /v1/admin/clients` | Configured and registered clients, with `source` and `has_secret` in place of the secret. |
 | `DELETE /v1/admin/clients/{id}` | Deletes a registered client with its grants and refresh tokens. A configured client answers `409`: edit the clients file. |
 | `GET /v1/admin/grants/{did}` | What the identity agreed to share, per client: scopes and when. |
@@ -1320,7 +1378,70 @@ that holds the keys can say more: `kith whoami --full` fetches `/v1/whoami` and 
 (`matches_next`), its `policy_signers`, and which of them are `held_here`. A `false` means
 the keys here are not the ones the log commits to.
 
-## 7.15 Not yet implemented
+## 7.15 Signing in with a phone
+
+The login page (§7.4) and the signed-out account page (§7.11) can be signed in by a
+passkey on another device. The page opens a **handoff** and shows a QR code of its link;
+the phone that scans it signs in with its passkey, which approves the handoff; the page
+that opened it is polling, and finishes the sign-in itself. This works with no Bluetooth
+and no browser support beyond WebAuthn on the phone, which is what the platform's own
+cross-device ("hybrid") passkey sign-in needs.
+
+```
+Computer  POST /v1/handoff {request_id?}            → {id, url, secret, expires_in}; shows a QR code of url
+Phone     GET  /handoff/{id}                         names the app and the computer; state "scanned"
+          credentials.get(challenge = SHA-256(message))
+          POST /v1/handoff/{id}/approve {challenge_id, did, factors}    or  POST /v1/handoff/{id}/deny
+Computer  polls GET /v1/handoff/{id}; once "approved":
+          POST /v1/handoff/{id}/finish {secret}      → {redirect} and the session cookie
+```
+
+| Method, path | Who may call | Does |
+|--------------|--------------|------|
+| `POST /v1/handoff` `{request_id?}` | anyone; rate limited per address | Opens a handoff for the login page's request, or with no `request_id` for the account page. Returns a `secret` once; the hub keeps its hash. |
+| `GET /v1/handoff/{id}` | anyone with the id | `state` (`waiting`, `scanned`, `approved`, `denied`) and `expires_at`. Nothing about who. |
+| `GET /handoff/{id}` | a browser | The phone's page: the app, the computer's browser and address as the hub saw them (§7.9: behind a CDN, configure the hub so that this is the visitor's address), and a challenge. Opening it sets `scanned`. |
+| `GET /handoff/{id}/qr.svg` | a browser | A QR code of the handoff's link. |
+| `POST /v1/handoff/{id}/approve` | the phone | A login (§7.4) over the handoff's own message. One of the identity's devices must sign, as on the account page: a one-time code alone does not. |
+| `POST /v1/handoff/{id}/deny` | anyone with the id | Ends the handoff; the computer is told. |
+| `POST /v1/handoff/{id}/finish` `{secret}` | the page that opened it | Takes the phone's login as this browser's: continues the app's request as `POST /oauth/login` would (consent, then the code), or for the account page starts a hub session. Once. |
+
+The phone's message names the handoff, so an assertion made for any other page can't
+approve it:
+
+```
+localhost wants you to sign in to Demo App on another device with your Kith identity.
+
+URI: http://localhost:7777/handoff/{id}
+Version: 1
+Nonce: …
+Issued At: …
+Expiration Time: …
+```
+
+Rules:
+- The link in the QR code is a bearer value for **approving** only. Finishing takes the
+  secret, which the opening page holds and never shows, so someone who photographs the
+  code can at most decline it.
+- The session belongs to the phone's device: its `amr` is the phone's, and it ends when
+  that device is revoked (§7.6). Its AAL is the phone's, **capped at 2**. The computer
+  proved nothing itself, and a QR code can be relayed: a page that shows someone else's
+  code can get them to sign it in. An app that asks for AAL3 (`acr_values` or the
+  client's `min_aal`) is not offered the QR code, and an approval for one is refused with
+  `step_up_required`.
+- A handoff lasts 5 minutes and is held in memory, at most 1000 at once. Opening one
+  counts against the login limit per address.
+
+What a person checks, on the phone: the app's name, the computer's browser and address
+(and whether that address is the phone's own), and that they scanned the code from a
+screen in front of them. The page says so before the passkey is asked for. That relay
+is the risk this flow adds; it is why the cap exists, and why the computer's address is
+shown.
+
+The page shows the QR code at once on a device with a fine pointer (a computer), and
+behind "Sign in with your phone" under "Other ways to sign in" on a touch screen.
+
+## 7.16 Not yet implemented
 
 - A page for the user to review and withdraw remembered consent (the admin API can).
 - Open client registration, and the registration management endpoint (RFC 7592).
@@ -1331,6 +1452,7 @@ the keys here are not the ones the log commits to.
 - Logout notices when a session expires or its device is revoked; retries.
 - Session management through `check_session_iframe`.
 - Pushed authorization requests (PAR), DPoP-bound tokens.
+- Per-client allowed web origins other than its redirect URIs' (§7.1.1).
 - `claims` request parameter; request objects (JAR).
 - Replacing or removing the authenticator app from the account page (`DELETE
   /v1/totp` and the CLI can).
@@ -1345,3 +1467,4 @@ the keys here are not the ones the log commits to.
   (§7.8.4) are the one proof it lists. It lists no orgs or groups the identity
   belongs to (§8, §10) either.
 - Ending your own sessions; today only the operator can (§7.10).
+- The client address from a CDN other than CloudFront (§7.9).

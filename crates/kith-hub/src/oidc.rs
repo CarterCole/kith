@@ -248,7 +248,7 @@ impl Client {
         Ok(())
     }
 
-    fn display_name(&self) -> String {
+    pub(crate) fn display_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| self.client_id.clone())
     }
 
@@ -632,7 +632,7 @@ pub async fn authorize(
             .and_then(|sid| h.store.session(&sid).ok().flatten().map(|s| (s.authn, sid)));
         if let Some((a, sid)) = existing {
             let fresh = max_age.is_none_or(|m| now() - a.auth_time <= m);
-            if fresh && session_holds(&h, &a).is_some() && h.totp_session_alive(&a) && a.aal >= min_aal {
+            if fresh && session_holds(&h, &a).is_some() && a.aal >= min_aal {
                 if !h.needs_consent(&client, &a.st.did, &req) {
                     return match issue_code(&h, req, a, &sid) {
                         Ok(url) => Redirect::to(&url).into_response(),
@@ -659,7 +659,7 @@ pub async fn authorize(
                     return fail("server_error", "could not save the sign-in request");
                 }
                 return Redirect::to(&consent_url(&request_id)).into_response();
-            } else if fresh && session_holds(&h, &a).is_some() && h.totp_session_alive(&a) {
+            } else if fresh && session_holds(&h, &a).is_some() {
                 step_up = Some((a.st.did.clone(), store::hash(&sid)));
             }
         }
@@ -714,6 +714,7 @@ pub(crate) fn login_page(
         "min_aal": ar.min_aal,
         "upstreams": upstream::summary(h),
         "signup": h.cfg.signup,
+        "phone": ar.min_aal <= crate::handoff::MAX_AAL,
         "federated": federated.map(|(f, provider)| json!({"did": f.did, "provider": provider, "token": f.token, "totp": has_totp(h, &f.did)})),
         // Signed in already, but not strongly enough: ask only for what is missing.
         "step_up": ar.step_up.as_ref().filter(|_| federated.is_none()).map(|(did, _)| json!({"did": did, "totp": has_totp(h, did)})),
@@ -800,7 +801,11 @@ fn start_session_carrying(h: &Hub, sid: &str, a: &Authn, carry: Option<SsoSessio
 
 /// The identity behind a hub session, as long as the session still holds: the device
 /// it signed in with, or the alias a federated login came through, is still in the KEL.
+/// A session an earlier hub started for a one-time code alone never holds (spec §2.3).
 pub(crate) fn session_holds(h: &Hub, a: &Authn) -> Option<kith_core::kel::KeyState> {
+    if a.rests_on_totp_alone() {
+        return None;
+    }
     let st = h.resolve(&a.st.did).ok()?;
     let device_ok = a.dev.as_ref().is_none_or(|d| st.device(d).is_some());
     let alias_ok = a.alias.as_ref().is_none_or(|al| h.alias_linked(&st, al));
@@ -1031,11 +1036,11 @@ pub async fn login(State(h): State<Arc<Hub>>, ip: ClientIp, headers: HeaderMap, 
             h.store.session(sid).ok().flatten()
         });
         match (sid, session) {
-            (Some(sid), Some(s)) if s.authn.st.did == did && session_holds(&h, &s.authn).is_some() && h.totp_session_alive(&s.authn) => prior = Some((sid, s)),
+            (Some(sid), Some(s)) if s.authn.st.did == did && session_holds(&h, &s.authn).is_some() => prior = Some((sid, s)),
             _ => return retry(ApiError::unauthorized("there is no sign-in here to step up; sign in again")),
         }
     }
-    let a = match h.authenticate(&did, &ch.message, &factors) {
+    let a = match h.authenticate_onto(&did, &ch.message, &factors, prior.as_ref().map(|(_, s)| &s.authn)) {
         Ok(a) => Authn { attrs, ..a },
         Err(e) => return retry(e),
     };
@@ -1312,9 +1317,9 @@ pub(crate) fn refresh_grant(h: &Hub, headers: &HeaderMap, req: &TokenReq) -> Api
             "the account this session signed in with has been unlinked",
         ));
     }
-    if !h.totp_session_alive(&g.authn) {
+    if g.authn.rests_on_totp_alone() {
         return Err(ApiError::grant(
-            "the authenticator this session signed in with has been reset",
+            "this session was started with a one-time code alone, which no longer signs in",
         ));
     }
     let scope = match &req.scope {
