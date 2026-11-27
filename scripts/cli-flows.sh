@@ -11,7 +11,7 @@ rm -rf "$D" && mkdir -p "$D"
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 # On macOS, keys go to the login keychain (and this device's key into the Secure
 # Enclave); each run makes new identities, so drop their keychain items at the end.
-cleanup() { kill "${HUB:-}" "${WFS:-}" 2>/dev/null || true; for h in ada bob phone; do $K --home "$D/$h" keys forget --yes 2>/dev/null || true; done; }
+cleanup() { kill "${HUB:-}" "${WFS:-}" 2>/dev/null || true; for h in ada bob phone carol server; do $K --home "$D/$h" keys forget --yes 2>/dev/null || true; done; }
 trap cleanup EXIT
 
 step "create identities (Ada uses an Ethereum wallet as a recovery signer; Bob keeps his keys in a file for now)"
@@ -193,5 +193,43 @@ last=rs[1]
 assert last['revoked_devices'] is True and len(last['signers'])==2,last
 assert set(last['signers'])<=set(strings(last['rotation'])),last
 print('rotations at seq',[x['seq'] for x in rs],'| the last revoked every device and was signed by',len(last['signers']),'of its policy')"
+
+step "an org made in a terminal adds a server, then lets either one approve changes (spec §7.13, §1.5)"
+# Carol stands in for an org whose root moves into a server's TPM: the server joins as a
+# device, makes a manage key there (`keys new-manage --tpm` on a Linux machine with a
+# TPM; a software key here), and a rotation makes the manage policy "that key OR the
+# laptop's own device key".
+$K --home "$D/carol" init --keystore file --device-name laptop > "$D/carol.did" 2>/dev/null
+CAROL=$(cat "$D/carol.did")
+$K --home "$D/server" device join --hub "$KITH_HUB" --keystore file --name server --did "$CAROL" --no-open --yes 2> "$D/join.log" &
+JOIN=$!
+LINK=""
+for _ in $(seq 100); do LINK=$(grep -o "$KITH_HUB/join/[A-Za-z0-9_-]*" "$D/join.log" | head -1 || true); [[ -n "$LINK" ]] && break; sleep 0.1; done
+[[ -n "$LINK" ]] || { echo "FAIL: no join link: $(cat "$D/join.log")"; exit 1; }
+# Carol has no browser session: her terminal claims the request with a hub token and
+# approves it with the manage key it holds.
+$K --home "$D/carol" device approve "$LINK" --yes
+wait $JOIN
+if $K --home "$D/server" device add --name extra --kind software --out "$D/extra.json" 2>/dev/null; then echo "FAIL: a device that does not manage signed as manage"; exit 1; fi
+echo "the server can't sign as manage yet (good)"
+MK=$($K --home "$D/server" keys new-manage)
+$K --home "$D/carol" rotate --manage-threshold 1 --manage "$MK" --manage laptop
+$K --home "$D/server" manage show | python3 -c "
+import sys,json
+m=json.load(sys.stdin); p=m['policy']
+assert p['threshold']==1 and len(p['of'])==2,p
+names=sorted(str(s['name']) for s in m['signers'])
+assert names==['None','laptop'],names
+print('manage:',m['manage'])"
+$K --home "$D/carol" keys list | python3 -c "import sys,json;ks=json.load(sys.stdin)['keys'];assert not any(k['role']=='manage' for k in ks),ks;print('the old manage key is gone from the laptop')"
+$K --home "$D/server" device add --name extra --kind software --out "$D/extra.json" >/dev/null
+$K --home "$D/carol" device add --name extra2 --kind software --out "$D/extra2.json" >/dev/null
+curl -sf "$KITH_HUB/v1/kel/$CAROL" | python3 -c "
+import sys,json
+kel=json.load(sys.stdin); mk='$MK'
+adds=[e for e in kel if e['kind']=='add_device' and e['device']['name'] in ('extra','extra2')]
+assert len(adds)==2,[e['kind'] for e in kel]
+assert mk in [s['signer'] for s in adds[0]['sigs']],adds[0]['sigs']
+print('the server signed one change as manage, the laptop the next')"
 
 step "all CLI flows passed"

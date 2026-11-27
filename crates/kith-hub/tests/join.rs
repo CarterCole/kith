@@ -665,3 +665,89 @@ async fn the_account_page_sets_up_an_authenticator() {
     let again = post(&w.app, "/v1/account/totp", json!({}), Some(&acct.cookie)).await;
     assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.text());
 }
+
+/// A hub access token for `dev`, as `kith login` gets one: a session token exchanged at
+/// the token endpoint (spec §2.3).
+async fn hub_token(w: &World, st: &KeyState, dev: &str, key: &LocalSigner) -> String {
+    use kith_core::session::{DeviceSigner, SessionKey};
+    let d = st.device(dev).unwrap().clone();
+    let sk = SessionKey::create(&st.did, &d, DeviceSigner::Key(&key.secret), 3600).unwrap();
+    let body = format!(
+        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&subject_token={}&subject_token_type={}",
+        sk.session_token(ISSUER, json!({})).unwrap(),
+        kith_hub::TT_SESSION.replace(':', "%3A"),
+    );
+    let r = send(
+        &w.app,
+        Request::post("/oauth/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["access_token"].as_str().unwrap().to_string()
+}
+
+async fn post_bearer(app: &Router, uri: &str, token: &str) -> Resp {
+    send(
+        app,
+        Request::post(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await
+}
+
+/// An identity made in a terminal (`kith init`) has no browser session. Its CLI claims a
+/// request with a hub access token, and its manage key, which is no device, approves.
+#[tokio::test]
+async fn a_terminal_identity_claims_with_a_hub_token_and_its_manage_key_approves() {
+    use kith_core::kel::{new_inception, Device, DeviceKind};
+    let w = world(|_| {});
+    let root = LocalSigner::generate(KeyType::Ed25519);
+    let laptop = LocalSigner::generate(KeyType::Ed25519);
+    let recovery = LocalSigner::generate(KeyType::Ed25519);
+    let dev = Device {
+        id: "dev_laptop".into(),
+        key: laptop.id.clone(),
+        name: "laptop".into(),
+        kind: DeviceKind::Software,
+        aal: 1,
+        caps: vec!["session".into(), "alias".into()],
+        rp_id: None,
+        xkey: None,
+    };
+    let mut inc = new_inception(SignerPolicy::single(&root.id), &SignerPolicy::single(&recovery.id), vec![dev]);
+    inc.sign(&root).unwrap();
+    inc.sign(&laptop).unwrap();
+    let st = verify_log(std::slice::from_ref(&inc), &VerifyOptions::default()).unwrap();
+    w.hub.put_kel(&st.did, vec![inc]).unwrap();
+    let token = hub_token(&w, &st, "dev_laptop", &laptop).await;
+
+    let server = LocalSigner::generate(KeyType::P256);
+    let id = terminal_request(&w, &server, "server").await;
+    // A token for another audience is not a sign-in to the hub.
+    let msg = "a challenge";
+    let a = w.hub.authenticate(&st.did, msg, &[kith_hub::Factor::Signature { sig: laptop.sign(msg.as_bytes()).unwrap() }]).unwrap();
+    let elsewhere = w.hub.issue(&a, "api://invoices", None).unwrap()["access_token"].as_str().unwrap().to_string();
+    let r = post_bearer(&w.app, &format!("/v1/join/{id}/claim"), &elsewhere).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+
+    let c = post_bearer(&w.app, &format!("/v1/join/{id}/claim"), &token).await;
+    assert_eq!(c.status, StatusCode::OK, "{}", c.text());
+    let c = c.json();
+    assert_eq!(c["did"], st.did);
+    assert_eq!(c["state"], "waiting_for_approval");
+    let message = c["message"].as_str().unwrap();
+
+    // The laptop is a device but does not manage: it can't approve. The root key can.
+    let r = post(&w.app, &format!("/v1/join/{id}/approve"), json!({"sig": laptop.sign(message.as_bytes()).unwrap()}), None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    let r = post(&w.app, &format!("/v1/join/{id}/approve"), json!({"sig": root.sign(message.as_bytes()).unwrap()}), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(terminal_pop(&w, &id, &server).await.json()["state"], "done");
+    assert!(state(&w, &st.did).devices.values().any(|d| d.key == server.id && d.name == "server"));
+}

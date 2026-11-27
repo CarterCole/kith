@@ -62,10 +62,21 @@
   private key is a login-keychain item keyed by DID and key id, and this device's key
   is a P-256 key in the Secure Enclave that signs inside the chip, enrolled as a
   `hardware` device. `kith init --keystore keychain|file`, `kith keys list`, `kith keys
-  migrate` (file → keychain), `kith keys forget`. Linux keeps the plaintext file (0600).
-  Checked by `scripts/cli-flows.sh` (Ada's whole flow runs from the keychain and the
-  Enclave; Bob migrates mid-run) and Rust tests that round-trip a key through the
-  keychain and through the Enclave's handle.
+  migrate` (file → keychain), `kith keys forget`. Linux keeps the plaintext file (0600),
+  and with `--features tpm` a TPM 2.0: `kith device join --tpm` puts the device key in
+  the TPM, and `kith keys new-manage --tpm` makes a manage key there behind a PIN that
+  the TPM's lockout protects. Checked by `scripts/cli-flows.sh` (Ada's whole flow runs
+  from the keychain and the Enclave; Bob migrates mid-run) and Rust tests that
+  round-trip a key through the keychain and through the Enclave's handle. The TPM test
+  (`KITH_TPM_TESTS=1 cargo test -p kith-cli --features tpm`) needs a real TPM, so CI
+  does not run it.
+- **Manage keys on several machines** ([spec §1.3.3](../spec/01-identity.md)). The CLI
+  signs as manage with whatever keys it holds that the policy names, a manage key or
+  its own device key, after taking the log from the hub. `kith rotate --manage …` names
+  the new manage policy, and `kith device approve` claims a terminal's join request
+  with a hub token, so an identity made with `kith init` can add a server and then let
+  "the server's TPM key OR the laptop's Secure Enclave key" approve changes
+  (`scripts/cli-flows.sh`, with software keys standing in).
 - **Policy DAG, revocations, freshness** ([spec §8](../spec/08-policy-dag.md)).
   - Bundles become DAG-JSON blocks. The CIDs match `@ipld/dag-json` + `multiformats`.
   - A slice (one action, or one principal) decides exactly like the full bundle for
@@ -252,8 +263,12 @@
 
 - **Keys at rest.** The macOS keychain and the Secure Enclave are done
   ([spec §1.3.3](../spec/01-identity.md)). Still to do:
-  - Linux: a Secret Service (libsecret) backend, and a TPM for the device key. Today
-    `--keystore keychain` there warns and writes the plaintext file;
+  - Linux: a Secret Service (libsecret) backend. Today `--keystore keychain` there
+    warns and writes the plaintext file. The TPM backend is a build feature, not in the
+    release binaries or the .deb, and has no PIN for device keys or policy (PCR) binding;
+  - a manage policy split across machines that each hold less than the threshold: the
+    CLI refuses to sign when the keys it holds can't meet the policy alone, and there is
+    no way yet to pass a half-signed event to the other machine;
   - YubiKey PIV / FIDO;
   - hardware wallets for manage keys;
   - an Enclave key for a device enrolled later: `kith device add` makes portable

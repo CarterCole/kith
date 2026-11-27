@@ -315,8 +315,15 @@ pub async fn claim(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let (_, st) = account::current(&h, &headers)
-        .ok_or_else(|| ApiError::unauthorized("sign in to claim this device"))?;
+    // A browser's hub session, or a terminal's hub access token: an identity made with
+    // `kith init` has no browser to sign in with. Claiming only names the identity; its
+    // manage signers still approve.
+    let did = match account::current(&h, &headers) {
+        Some((_, st)) => st.did,
+        None if headers.contains_key(header::AUTHORIZATION) => h.bearer(&headers)?.sub,
+        None => return Err(ApiError::unauthorized("sign in to claim this device")),
+    };
+    let st = h.resolve(&did)?;
     with(&h, &id, |j| {
         if j.invite || j.did.is_some() {
             return Err(conflict("this request already belongs to an identity"));

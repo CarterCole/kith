@@ -11,6 +11,8 @@ mod join;
 mod keystore;
 mod names;
 mod org;
+#[cfg(all(target_os = "linux", feature = "tpm"))]
+mod tpm;
 
 use std::path::PathBuf;
 
@@ -70,6 +72,10 @@ enum Cmd {
         /// Secure Enclave key, and enroll the device at AAL3.
         #[arg(long)]
         touch_id: bool,
+        /// Make this device's key inside the TPM (Linux, a kith built with `--features
+        /// tpm`), so it can't be copied off the machine. It has no PIN and joins at AAL1.
+        #[arg(long, conflicts_with = "touch_id")]
+        tpm: bool,
     },
     /// Show this identity.
     Status,
@@ -100,6 +106,14 @@ enum Cmd {
         /// TOTP code, when the current recovery policy includes the hub co-signer.
         #[arg(long)]
         totp: Option<String>,
+        /// Make the new manage policy these signers instead of a new software key here:
+        /// device names, device ids or did:keys, such as a TPM key from `kith keys
+        /// new-manage --tpm` on another machine. Repeat it for each signer.
+        #[arg(long = "manage", value_name = "SIGNER")]
+        manage: Vec<String>,
+        /// How many of the `--manage` signers must sign each change.
+        #[arg(long, requires = "manage", default_value_t = 1)]
+        manage_threshold: usize,
     },
     #[command(subcommand)]
     Alias(AliasCmd),
@@ -279,6 +293,10 @@ enum DeviceCmd {
         /// join at AAL3.
         #[arg(long)]
         touch_id: bool,
+        /// Make this device's key inside the TPM (Linux, a kith built with `--features
+        /// tpm`), so it can't be copied off the machine. It has no PIN and joins at AAL1.
+        #[arg(long, conflicts_with = "touch_id")]
+        tpm: bool,
         /// Don't try to open the browser; just print the link and QR code.
         #[arg(long)]
         no_open: bool,
@@ -286,8 +304,10 @@ enum DeviceCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Approve a device that is joining this identity, with this device's key. The key
-    /// must be one of the identity's manage signers (`kith manage show`).
+    /// Approve a device that is joining this identity, with the manage keys this machine
+    /// holds: this device's key when it is a manage signer, or a manage key kept here
+    /// (`kith manage show` lists who manages). A request no browser has claimed yet is
+    /// claimed for this identity first, with a hub token.
     Approve {
         /// The join link, or its id.
         request: String,
@@ -349,6 +369,16 @@ enum KeysCmd {
     Forget {
         #[arg(long)]
         yes: bool,
+    },
+    /// Make a manage key on this machine and print its did:key. It signs nothing until
+    /// a rotation names it (`kith rotate --manage <did:key>` where the recovery keys
+    /// are). With `--tpm` it is made inside the TPM with a PIN (Linux, `--features tpm`).
+    NewManage {
+        #[arg(long)]
+        tpm: bool,
+        /// With `--tpm`: no PIN, so anything that runs as this user can sign with it.
+        #[arg(long, requires = "tpm")]
+        no_pin: bool,
     },
 }
 
@@ -592,6 +622,9 @@ enum DeviceKey {
     /// In the Secure Enclave; only its handle is here.
     #[cfg(target_os = "macos")]
     Enclave(keystore::enclave::EnclaveKey),
+    /// In a TPM 2.0; only its encrypted blob is here.
+    #[cfg(all(target_os = "linux", feature = "tpm"))]
+    Tpm(tpm::TpmKey),
 }
 
 impl DeviceKey {
@@ -600,6 +633,8 @@ impl DeviceKey {
             DeviceKey::Software(s) => &s.id,
             #[cfg(target_os = "macos")]
             DeviceKey::Enclave(k) => &k.id,
+            #[cfg(all(target_os = "linux", feature = "tpm"))]
+            DeviceKey::Tpm(k) => &k.id,
         }
     }
 
@@ -608,6 +643,8 @@ impl DeviceKey {
             DeviceKey::Software(_) => false,
             #[cfg(target_os = "macos")]
             DeviceKey::Enclave(_) => true,
+            #[cfg(all(target_os = "linux", feature = "tpm"))]
+            DeviceKey::Tpm(_) => true,
         }
     }
 
@@ -617,6 +654,13 @@ impl DeviceKey {
             DeviceKey::Software(s) => Ok(s.sign(msg)?),
             #[cfg(target_os = "macos")]
             DeviceKey::Enclave(k) => Ok(Sig {
+                signer: k.id.clone(),
+                alg: kith_core::keys::key_sig_alg(KeyType::P256).into(),
+                sig: b64u(k.sign(msg)?),
+                webauthn: None,
+            }),
+            #[cfg(all(target_os = "linux", feature = "tpm"))]
+            DeviceKey::Tpm(k) => Ok(Sig {
                 signer: k.id.clone(),
                 alg: kith_core::keys::key_sig_alg(KeyType::P256).into(),
                 sig: b64u(k.sign(msg)?),
@@ -637,6 +681,8 @@ impl DeviceKey {
             DeviceKey::Software(s) => Ok(&s.secret),
             #[cfg(target_os = "macos")]
             DeviceKey::Enclave(_) => bail!("a Secure Enclave key cannot act as a software passkey"),
+            #[cfg(all(target_os = "linux", feature = "tpm"))]
+            DeviceKey::Tpm(_) => bail!("a TPM key cannot act as a software passkey"),
         }
     }
 
@@ -673,17 +719,41 @@ impl DeviceKey {
                     ttl,
                 )?
             }
+            #[cfg(all(target_os = "linux", feature = "tpm"))]
+            DeviceKey::Tpm(k) => {
+                let sign = |m: &[u8]| {
+                    k.sign(m)
+                        .map_err(|e| kith_core::Error::Signature(e.to_string()))
+                };
+                SessionKey::create(
+                    did,
+                    dev,
+                    DeviceSigner::External {
+                        kty: KeyType::P256,
+                        sign: &sign,
+                    },
+                    ttl,
+                )?
+            }
         })
     }
 }
 
-/// This machine's new device key: in the Secure Enclave when the keychain backend is
-/// on and there is a chip (unless the user opted out), else an Ed25519 software key.
-fn new_device_key(backend: Backend, no_enclave: bool, touch_id: bool) -> DeviceKey {
+/// This machine's new device key: in the TPM when asked (`--tpm`, Linux), in the Secure
+/// Enclave when the keychain backend is on and there is a chip (unless the user opted
+/// out), else an Ed25519 software key. A device key in the TPM has no PIN: it signs
+/// every session grant, and the PIN is for the manage key (`kith keys new-manage`).
+fn new_device_key(backend: Backend, no_enclave: bool, touch_id: bool, use_tpm: bool) -> Result<DeviceKey> {
+    if use_tpm {
+        #[cfg(all(target_os = "linux", feature = "tpm"))]
+        return Ok(DeviceKey::Tpm(tpm::TpmKey::generate(None)?));
+        #[cfg(not(all(target_os = "linux", feature = "tpm")))]
+        bail!("--tpm needs Linux and a kith built with `--features tpm`");
+    }
     #[cfg(target_os = "macos")]
     if backend == Backend::Keychain && !no_enclave {
         match keystore::enclave::EnclaveKey::generate(touch_id) {
-            Ok(k) => return DeviceKey::Enclave(k),
+            Ok(k) => return Ok(DeviceKey::Enclave(k)),
             Err(e) => eprintln!("note: {e}; using a software key"),
         }
     }
@@ -691,7 +761,7 @@ fn new_device_key(backend: Backend, no_enclave: bool, touch_id: bool) -> DeviceK
         eprintln!("warning: --touch-id needs a Secure Enclave key; ignored");
     }
     let _ = (backend, no_enclave);
-    DeviceKey::Software(Box::new(LocalSigner::generate(KeyType::Ed25519)))
+    Ok(DeviceKey::Software(Box::new(LocalSigner::generate(KeyType::Ed25519))))
 }
 
 /// The keychain slot of a device's exchange key.
@@ -842,9 +912,27 @@ impl Home {
         Ok(())
     }
 
+    /// Drop the manage keys kept here that `policy` does not name.
+    fn retain_manage(&mut self, policy: &SignerPolicy) -> Result<()> {
+        let names = policy.signers();
+        let mut kept = vec![];
+        for old in self.v["manage"].as_array().cloned().unwrap_or_default() {
+            if old["id"].as_str().is_some_and(|id| names.contains(id)) {
+                kept.push(old);
+            } else {
+                self.forget(old["id"].as_str().unwrap_or_default(), &old["secret"])?;
+            }
+        }
+        self.v["manage"] = json!(kept);
+        Ok(())
+    }
+
     fn device(&self) -> Result<(String, DeviceKey)> {
         let id = self.device_id()?;
         let s = &self.v["device"]["signer"];
+        if s["store"] == "tpm" {
+            return Ok((id, self.held_from_json(s)?));
+        }
         if s["store"] != "secure_enclave" {
             return Ok((id, DeviceKey::Software(Box::new(self.signer_from_json(s)?))));
         }
@@ -874,6 +962,8 @@ impl Home {
                 }
                 v
             }
+            #[cfg(all(target_os = "linux", feature = "tpm"))]
+            DeviceKey::Tpm(_) => self.held_json(key)?,
         };
         let mut d = json!({"id": dev_id, "signer": signer});
         if let Some(x) = xkey {
@@ -885,10 +975,107 @@ impl Home {
         Ok(d)
     }
 
+    /// A key for the JSON file: a software key with its secret stashed, or a TPM key's
+    /// blob (which only that TPM can use).
+    fn held_json(&self, key: &DeviceKey) -> Result<Value> {
+        match key {
+            DeviceKey::Software(s) => self.signer_json(s),
+            #[cfg(all(target_os = "linux", feature = "tpm"))]
+            DeviceKey::Tpm(k) => {
+                let mut v = json!({"id": k.id, "scheme": Scheme::Raw, "kty": KeyType::P256, "store": "tpm", "pin": k.has_pin});
+                let secret = self.stash(&k.id, &k.blob()?)?;
+                if !secret.is_null() {
+                    v["secret"] = secret;
+                }
+                Ok(v)
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("only software and TPM keys are kept this way"),
+        }
+    }
+
+    /// A key [`Home::held_json`] wrote.
+    fn held_from_json(&self, v: &Value) -> Result<DeviceKey> {
+        match v["store"].as_str() {
+            None => Ok(DeviceKey::Software(Box::new(self.signer_from_json(v)?))),
+            Some("tpm") => {
+                let id = v["id"].as_str().unwrap_or_default();
+                #[cfg(all(target_os = "linux", feature = "tpm"))]
+                {
+                    let k = tpm::TpmKey::from_blob(&self.fetch(id, &v["secret"])?)?;
+                    if k.id != id {
+                        bail!("the TPM blob holds a different key than {id}");
+                    }
+                    Ok(DeviceKey::Tpm(k))
+                }
+                #[cfg(not(all(target_os = "linux", feature = "tpm")))]
+                bail!("key {id} is in a TPM; use the machine it was made on, with a kith built with `--features tpm`")
+            }
+            Some(other) => bail!("unknown key store {other}"),
+        }
+    }
+
+    /// The keys on this machine that `st`'s manage policy names: manage keys kept here
+    /// (`manage` in identity.json) and this device's own key. Software keys come first,
+    /// so a Touch ID or TPM PIN is asked for only when they are not enough.
+    fn manage_keys(&self, st: &KeyState) -> Result<Vec<DeviceKey>> {
+        let names = st.manage.signers();
+        let mut keys = vec![];
+        for v in self.v["manage"].as_array().into_iter().flatten() {
+            if v["id"].as_str().is_some_and(|id| names.contains(id)) {
+                keys.push(self.held_from_json(v)?);
+            }
+        }
+        if let Ok((_, d)) = self.device() {
+            if names.contains(d.id()) && !keys.iter().any(|k| k.id() == d.id()) {
+                keys.push(d);
+            }
+        }
+        keys.sort_by_key(|k| k.is_hardware());
+        Ok(keys)
+    }
+
+    /// Signatures over `msg` by the manage keys held here, as many as `st`'s manage
+    /// policy needs and no more.
+    fn manage_sigs(&self, st: &KeyState, msg: &[u8]) -> Result<Vec<Sig>> {
+        let keys = self.manage_keys(st)?;
+        if keys.is_empty() {
+            bail!("this machine holds no key that manages {}; `kith manage show` lists who does", st.did);
+        }
+        let mut sigs = vec![];
+        let mut signed = std::collections::BTreeSet::new();
+        for k in keys {
+            if st.manage.is_satisfied_by(&signed) {
+                break;
+            }
+            let sig = k.sign(msg)?;
+            signed.insert(sig.signer.clone());
+            sigs.push(sig);
+        }
+        if !st.manage.is_satisfied_by(&signed) {
+            bail!("the manage keys on this machine are not enough for the manage policy of {}; `kith manage show` lists who else signs", st.did);
+        }
+        Ok(sigs)
+    }
+
+    fn sign_as_manage(&self, st: &KeyState, ev: &mut Event) -> Result<()> {
+        for sig in self.manage_sigs(st, &ev.signing_message()?)? {
+            ev.add_sig(sig);
+        }
+        Ok(())
+    }
+
+    /// The log as the hub has it, when this home has a hub: another machine may have
+    /// changed it, as a manage signer elsewhere or a rotation can.
+    fn synced_state(&mut self) -> Result<KeyState> {
+        join::sync_kel(self)
+    }
+
     /// Where a stored secret lives, for `kith keys list` and `kith status`.
     fn location(&self, inline: &Value, store: Option<&str>) -> &'static str {
         match (store, inline.is_null(), self.backend()) {
             (Some("secure_enclave"), _, _) => "secure_enclave",
+            (Some("tpm"), _, _) => "tpm",
             (_, true, Backend::Keychain) => "keychain",
             _ => "file",
         }
@@ -900,7 +1087,7 @@ impl Home {
         let mut keys = vec![];
         for role in ["manage", "recovery"] {
             for s in self.v[role].as_array().into_iter().flatten() {
-                keys.push(json!({"role": role, "id": s["id"], "where": self.location(&s["secret"], None)}));
+                keys.push(json!({"role": role, "id": s["id"], "where": self.location(&s["secret"], s["store"].as_str())}));
             }
         }
         let d = &self.v["device"];
@@ -1337,6 +1524,7 @@ fn main() -> Result<()> {
             keystore,
             no_secure_enclave,
             touch_id,
+            tpm,
         } => {
             if home.v.get("did").is_some() {
                 bail!("{} already holds an identity", home.dir.display());
@@ -1368,7 +1556,7 @@ fn main() -> Result<()> {
             // in software or in the Secure Enclave; step up with TOTP or a passkey. An
             // Enclave key that asks for Touch ID on every use is a multi-factor
             // hardware authenticator, AAL3.
-            let dkey = new_device_key(backend, no_secure_enclave, touch_id);
+            let dkey = new_device_key(backend, no_secure_enclave, touch_id, tpm)?;
             let xkey = ExchangeKey::generate();
             let (kind, aal) = if dkey.is_hardware() {
                 (DeviceKind::Hardware, if touch_id { 3 } else { 1 })
@@ -1445,6 +1633,7 @@ fn main() -> Result<()> {
             keystore,
             no_secure_enclave,
             touch_id,
+            tpm,
             no_open,
             yes,
         }) => join::join(
@@ -1456,6 +1645,7 @@ fn main() -> Result<()> {
                 keystore,
                 no_secure_enclave,
                 touch_id,
+                tpm,
                 no_open,
                 yes,
             },
@@ -1497,7 +1687,7 @@ fn main() -> Result<()> {
             } else {
                 DeviceKind::Hardware
             };
-            let st = home.state()?;
+            let st = home.synced_state()?;
             let dev = Device {
                 id: device_id.unwrap_or_else(|| format!("dev_{}", &random_id()[..8])),
                 key,
@@ -1514,9 +1704,7 @@ fn main() -> Result<()> {
                     device: dev.clone(),
                 },
             );
-            for m in home.signers("manage")? {
-                ev.sign(&m)?;
-            }
+            home.sign_as_manage(&st, &mut ev)?;
             let msg = String::from_utf8(ev.signing_message()?)?;
             home.v["pending"] = serde_json::to_value(&ev)?;
             home.save()?;
@@ -1553,7 +1741,7 @@ fn main() -> Result<()> {
                 DeviceKind::Passkey => 2,
                 DeviceKind::Hardware => 3,
             });
-            let st = home.state()?;
+            let st = home.synced_state()?;
             let (dev, signer, xkey) = new_device(&name, kind, aal);
             let mut ev = next_event(
                 &st,
@@ -1561,9 +1749,7 @@ fn main() -> Result<()> {
                     device: dev.clone(),
                 },
             );
-            for m in home.signers("manage")? {
-                ev.sign(&m)?;
-            }
+            home.sign_as_manage(&st, &mut ev)?;
             device_sign(&mut ev, &signer, kind)?;
             home.append(ev)?;
             publish(&home)?;
@@ -1606,7 +1792,7 @@ fn main() -> Result<()> {
             );
         }
         Cmd::Device(DeviceCmd::Revoke { id }) => {
-            let st = home.state()?;
+            let st = home.synced_state()?;
             let mut ev = next_event(
                 &st,
                 EventBody::RevokeDevice {
@@ -1614,12 +1800,48 @@ fn main() -> Result<()> {
                     reason: None,
                 },
             );
-            for m in home.signers("manage")? {
-                ev.sign(&m)?;
-            }
+            home.sign_as_manage(&st, &mut ev)?;
             home.append(ev)?;
             publish(&home)?;
             eprintln!("revoked {id}");
+        }
+        Cmd::Keys(KeysCmd::NewManage { tpm, no_pin }) => {
+            let did = home.did()?;
+            let key = if tpm {
+                #[cfg(all(target_os = "linux", feature = "tpm"))]
+                {
+                    let pin = if no_pin { None } else { Some(tpm::new_pin()?) };
+                    let k = tpm::TpmKey::generate(pin.as_deref())?;
+                    // Sign once now, so a key that can't sign is never committed to.
+                    let probe = b"kith: a new manage key checks that it signs";
+                    let sig = Sig {
+                        signer: k.id.clone(),
+                        alg: kith_core::keys::key_sig_alg(KeyType::P256).into(),
+                        sig: b64u(k.sign_with(probe, pin.as_deref())?),
+                        webauthn: None,
+                    };
+                    kith_core::keys::verify_sig(&sig, probe, &VerifyOptions::default())?;
+                    DeviceKey::Tpm(k)
+                }
+                #[cfg(not(all(target_os = "linux", feature = "tpm")))]
+                {
+                    let _ = no_pin;
+                    bail!("--tpm needs Linux and a kith built with `--features tpm`");
+                }
+            } else {
+                DeviceKey::Software(Box::new(LocalSigner::generate(KeyType::Ed25519)))
+            };
+            let entry = home.held_json(&key)?;
+            let mut list = home.v["manage"].as_array().cloned().unwrap_or_default();
+            list.push(entry);
+            home.v["manage"] = json!(list);
+            home.save()?;
+            println!("{}", key.id());
+            eprintln!(
+                "made a manage key for {did}{}. It signs nothing until a rotation names it; where the recovery keys are, run\n  kith rotate --manage {} [--manage <another signer> --manage-threshold 1]",
+                if tpm { " inside the TPM" } else { "" },
+                key.id()
+            );
         }
         Cmd::Keys(KeysCmd::List) => print(
             &json!({"did": home.did()?, "keystore": home.backend().name(), "keys": home.key_inventory()?}),
@@ -1647,11 +1869,19 @@ fn main() -> Result<()> {
             revoke_devices,
             add_cosigner,
             totp,
+            manage,
+            manage_threshold,
         } => {
-            let st = home.state()?;
+            let st = home.synced_state()?;
             let rotation: SignerPolicy = serde_json::from_value(home.v["rotation_policy"].clone())
                 .context("no rotation policy stored here")?;
-            let new_root = LocalSigner::generate(KeyType::Ed25519);
+            // The new manage policy: named signers, or a new software key kept here.
+            let (new_manage, new_root) = if manage.is_empty() {
+                let k = LocalSigner::generate(KeyType::Ed25519);
+                (SignerPolicy::single(&k.id), Some(k))
+            } else {
+                (join::manage_policy(&st, manage_threshold, &manage)?, None)
+            };
             let mut new_recovery = vec![
                 LocalSigner::generate(KeyType::Ed25519),
                 LocalSigner::generate(KeyType::Ed25519),
@@ -1679,7 +1909,7 @@ fn main() -> Result<()> {
                 &st,
                 EventBody::Rotate {
                     rotation: rotation.clone(),
-                    manage: SignerPolicy::single(&new_root.id),
+                    manage: new_manage.clone(),
                     next: next.digest(),
                     revoke_devices,
                 },
@@ -1710,7 +1940,11 @@ fn main() -> Result<()> {
                 ev.add_sig(serde_json::from_value(sig)?);
             }
             let st = home.append(ev)?;
-            home.replace_signers("manage", std::slice::from_ref(&new_root))?;
+            match &new_root {
+                Some(k) => home.replace_signers("manage", std::slice::from_ref(k))?,
+                // Keep only manage keys here that the new policy still names.
+                None => home.retain_manage(&new_manage)?,
+            }
             home.replace_signers("recovery", &new_recovery)?;
             home.v["rotation_policy"] = serde_json::to_value(&next)?;
             if revoke_devices {
@@ -1724,9 +1958,9 @@ fn main() -> Result<()> {
             home.save()?;
             publish(&home)?;
             eprintln!(
-                "rotated to seq {}; new manage key {}{}",
+                "rotated to seq {}; manage is now {}{}",
                 st.seq,
-                new_root.id,
+                new_root.as_ref().map_or_else(|| join::describe(&new_manage, &st), |k| format!("the new key {}", k.id)),
                 if add_cosigner {
                     "; hub co-signer is now a recovery signer"
                 } else {
@@ -1804,16 +2038,14 @@ fn main() -> Result<()> {
             println!("valid: {} is an alias of {}", proof.alias, proof.root);
         }
         Cmd::Alias(AliasCmd::Link { alias }) => {
-            let st = home.state()?;
+            let st = home.synced_state()?;
             let mut ev = next_event(
                 &st,
                 EventBody::AliasLink {
                     alias: alias.clone(),
                 },
             );
-            for m in home.signers("manage")? {
-                ev.sign(&m)?;
-            }
+            home.sign_as_manage(&st, &mut ev)?;
             home.append(ev)?;
             publish(&home)?;
             eprintln!("linked {alias} (add a back-link on the alias side so others can check both directions)");
@@ -2064,7 +2296,7 @@ fn main() -> Result<()> {
                 bail!("not approved; nothing was added (pass --yes to skip the question)");
             }
             eprintln!("approving with your manage key");
-            let st = home.state()?;
+            let st = home.synced_state()?;
             let dev = Device {
                 id: format!("dev_{}", &random_id()[..8]),
                 key,
@@ -2081,9 +2313,7 @@ fn main() -> Result<()> {
                     device: dev.clone(),
                 },
             );
-            for m in home.signers("manage")? {
-                ev.sign(&m)?;
-            }
+            home.sign_as_manage(&st, &mut ev)?;
             let message = String::from_utf8(ev.signing_message()?)?;
             check(
                 http()

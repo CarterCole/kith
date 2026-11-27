@@ -105,13 +105,16 @@ kith device add --name build-bot --kind agent --out bot.json   # a non-human key
 kith device join --hub https://hub.example   # join an identity made in the browser: approve this machine there
                                              # (phones join by the QR code on the hub's account page)
 kith manage set 2 passkey mac phone --recovery-key kith-recovery-key.json   # who approves new devices
-kith device approve <link>                   # add this device's approval, when it is a manage signer
+kith device approve <link>                   # approve with the manage keys here; claims a terminal's request first
 kith login --aud api://invoices --totp 123456
 kith login --aud api://invoices --role break-glass   # an assumable role, for its max_age
 curl -H "authorization: Bearer $(kith token --aud api://invoices)" https://api.example/graphql …
 kith alias new gaming && kith alias prove gaming --aud https://shop.example
 kith delegate --to did:kith:… --action 'Query.*'
 kith rotate --revoke-devices                 # recovery keys (or paper key + TOTP co-signer)
+kith device join --hub https://hub.example --tpm     # Linux, built with --features tpm: this device's key in the TPM
+kith keys new-manage --tpm                   # a manage key in the TPM, behind a PIN; prints its did:key
+kith rotate --manage did:key:zDn… --manage laptop --manage-threshold 1   # where the recovery keys are: either may manage
 kith hub serve --bundle bundle.json --clients clients.json   # run a hub (+ OIDC clients)
 kith hub serve --upstreams upstreams.json    # also accept "Sign in with Telegram"
 kith hub serve --registration-token "$TOKEN" # let apps register themselves (RFC 7591)

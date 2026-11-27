@@ -1281,7 +1281,7 @@ Account   polls; shows the fingerprint; credentials.get(…); POST /v1/join/{id}
 | `POST /v1/join` `{device: {key, xkey?, name, kind, aal}}` | anyone; rate limited per address | Opens a request for a device that already holds its key. `kind` is `software` (`aal` 1) or `hardware` (`aal` 1 to 3); the device gets the caps `session` and `alias`. |
 | `POST /v1/join/invite` `{name?}` | a hub session (§7.6) | Opens a request for the session's identity, for a passkey not made yet. |
 | `GET /v1/join/{id}` | anyone with the id | The request as it stands: `state`, `did`, `device` (with its `fingerprint`), the unsigned `event` and its `message`, the signer ids in `approvals`, whether the manage policy is `approved`, whether the proof (`pop`) is in, `expires_at`, and `error` if it failed. |
-| `POST /v1/join/{id}/claim` | a hub session | Binds a terminal's request to the session's identity and builds the event. Once per request. |
+| `POST /v1/join/{id}/claim` | a hub session, or a hub access token (`aud` = issuer, no actor, §2.3) | Binds a terminal's request to that identity and builds the event. Once per request. A token lets an identity made in a terminal (`kith init`), which has no browser session, claim with `kith device approve`. Claiming names the identity only; its manage signers still approve. |
 | `POST /v1/join/{id}/device` `{key, name?}` | anyone with the id | Supplies the new passkey (`ES256`) for an invite and builds the event. Once per request. The device is a `passkey` at `aal` 2 with the cap `session`, scoped to the hub's RP id. |
 | `POST /v1/join/{id}/approve` `{sig}` or `{webauthn}` | a manage signer | Adds one approval (below). |
 | `POST /v1/join/{id}/pop` `{sig}` or `{webauthn}` | the new device | Adds the proof of possession. |
@@ -1319,8 +1319,10 @@ What a person checks:
   terminal or the phone shows the same code for its own key. The person compares them
   before approving.
 
-A terminal whose device key is a manage signer approves with
-`kith device approve <link or id>`, after the same check.
+A terminal that holds a manage key approves with `kith device approve <link or id>`,
+after the same check: its device key when that is a manage signer, or a manage key kept
+there (§1.3.3), as many as the policy needs. A request nobody has claimed yet is claimed
+first, with the terminal's hub token, once the person has said yes.
 
 **Changing who approves.** Only a `rotate` replaces the manage policy (§1.5), and only
 the keys committed in `next` sign one. For an identity made in the browser that is its

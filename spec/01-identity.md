@@ -216,6 +216,34 @@ and a policy may require it.
   keychain. `kith keys migrate` moves a file-backed home into the keychain; `kith keys
   list` shows where each key lives; `kith keys forget` deletes them.
 
+On Linux, with a `kith` built with `--features tpm`, keys can live in a **TPM 2.0**
+instead (`/dev/tpmrm0`, or the TCTI in `KITH_TPM_TCTI`; the user needs the device, as the
+`tss` group gives it):
+
+- `kith device join --tpm` (and `kith init --tpm`) makes this device's key in the TPM, a
+  P-256 ECDSA key with no PIN, enrolled as `kind: hardware` at `aal: 1`.
+- `kith keys new-manage --tpm` makes a **manage key** in the TPM, with a PIN (its
+  `authValue`) unless `--no-pin`. The TPM signs only with the PIN and counts wrong ones
+  against its dictionary-attack lockout; the PIN reaches the TPM over an HMAC session.
+  A key without a PIN is `noDA`. The new key signs nothing until a rotation names it in
+  the manage policy (§1.5): `kith rotate --manage <did:key> [--manage <signer> …]
+  --manage-threshold N`, run where the recovery keys are.
+
+Either key is a child of the owner hierarchy's storage key. `identity.json` keeps the
+TPM's public area and the private area encrypted under that storage key (`store:
+"tpm"`), and nothing is stored in the TPM itself: the storage key is derived again from
+the TPM's owner seed and a fixed template on each use. So the blob opens only in the TPM
+that made it, and only until that TPM is cleared, which some firmware updates do on an
+AMD fTPM. A cleared TPM loses the key; the recovery keys (§1.5) then rotate to a new one.
+
+**Manage keys on more than one machine.** The CLI signs as manage with every key it
+holds that the manage policy names: manage keys kept in `identity.json` (software or
+TPM) and this device's own key (Secure Enclave, TPM or software). It signs with as few
+as the policy needs, software keys first, so a Touch ID or TPM PIN is asked for only
+when they are not enough. Before it signs it takes the log from the hub, since another
+machine may have changed it. A policy such as "the server's TPM key OR the laptop's
+Secure Enclave key" lets either machine approve changes on its own.
+
 Device keys exported for another machine (`kith device add --out`) are software keys in
 plaintext, because the file has to travel; the importing machine then stores them the
 way it stores its own.
@@ -255,6 +283,12 @@ identity at all: a challenge signed by its key (§2.3), a passkey assertion from
 session grant it signs and a delegation made through that grant are all refused. A
 device with only `revoke`, such as the hub's relay (§8.6), can sign revocations and
 heartbeats and nothing else. Manage signers can always authenticate.
+
+**Reference CLI.** `kith rotate` signs with the recovery keys held here and, by default,
+makes a new software manage key. `kith rotate --manage <signer> … --manage-threshold N`
+names the new manage policy instead: device names, device ids or `did:key`s, such as a
+TPM key made on another machine (§1.3.3). Manage keys kept here that the new policy does
+not name are deleted.
 
 **Pre-rotation** comes from KERI. The rotation keys are published only as a hash (`next`)
 and are revealed only when they are used. An attacker who steals every *current* key

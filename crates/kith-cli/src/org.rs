@@ -347,7 +347,7 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
                     .json(&blocks_to_json(&blocks))
                     .send()?,
             )?;
-            let st = home.state()?;
+            let st = home.synced_state()?;
             // Revocations up to now are presumed folded into the new bundle.
             let r = check(
                 http()
@@ -366,9 +366,7 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
                     revocations_through: through,
                 },
             );
-            for m in home.signers("manage")? {
-                ev.sign(&m)?;
-            }
+            home.sign_as_manage(&st, &mut ev)?;
             home.append(ev)?;
             publish(home)?;
             println!("{root}");
@@ -517,7 +515,7 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
                 .as_str()
                 .ok_or_else(|| anyhow!("hub has no revoker key"))?
                 .to_string();
-            let st = home.state()?;
+            let st = home.synced_state()?;
             if st.devices.values().any(|d| d.key == key) {
                 bail!("the hub's revoker is already a device of {}", st.did);
             }
@@ -532,9 +530,7 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
                 xkey: None,
             };
             let mut ev = next_event(&st, EventBody::AddDevice { device: dev });
-            for m in home.signers("manage")? {
-                ev.sign(&m)?;
-            }
+            home.sign_as_manage(&st, &mut ev)?;
             let pop = check(
                 http()
                     .post(format!("{hub}/v1/hub/revoker"))
@@ -555,7 +551,7 @@ pub fn policy(home: &mut Home, cmd: PolicyCmd) -> Result<()> {
 
 pub fn revoke(home: &mut Home, cmd: RevokeCmd) -> Result<()> {
     let hub = home.hub()?;
-    let st = home.state()?;
+    let st = home.synced_state()?;
     let r = match cmd {
         RevokeCmd::Principal { id } => Revocation::Principal {
             id: super::names::principal(home, &id)?,
@@ -587,9 +583,7 @@ pub fn revoke(home: &mut Home, cmd: RevokeCmd) -> Result<()> {
         .map(|e| serde_json::from_value(e.clone()))
         .transpose()?;
     let mut e = Entry::new(&st.did, prev.as_ref(), vec![r])?;
-    for m in home.signers("manage")? {
-        e.sign(&m)?;
-    }
+    e.sigs.extend(home.manage_sigs(&st, &e.signing_message()?)?);
     check(
         http()
             .post(format!("{hub}/v1/revocations/{}", st.did))

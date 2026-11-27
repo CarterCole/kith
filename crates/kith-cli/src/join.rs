@@ -20,6 +20,7 @@ pub(super) struct JoinOpts {
     pub keystore: Option<String>,
     pub no_secure_enclave: bool,
     pub touch_id: bool,
+    pub tpm: bool,
     pub no_open: bool,
     pub yes: bool,
 }
@@ -94,7 +95,7 @@ fn fetch_kel(hub: &str, did: &str) -> Result<Vec<Event>> {
 }
 
 /// Bring this home's log up to the hub's, which must extend it, and save it.
-fn sync_kel(home: &mut Home) -> Result<KeyState> {
+pub(super) fn sync_kel(home: &mut Home) -> Result<KeyState> {
     let Ok(hub) = home.hub() else {
         return home.state();
     };
@@ -153,7 +154,7 @@ pub(super) fn join(home: &mut Home, o: JoinOpts) -> Result<()> {
         .transpose()?
         .unwrap_or_else(Backend::platform_default)
         .resolve();
-    let dkey = new_device_key(backend, o.no_secure_enclave, o.touch_id);
+    let dkey = new_device_key(backend, o.no_secure_enclave, o.touch_id, o.tpm)?;
     let xkey = ExchangeKey::generate();
     let (kind, aal) = if dkey.is_hardware() {
         (DeviceKind::Hardware, if o.touch_id { 3 } else { 1 })
@@ -262,8 +263,10 @@ pub(super) fn join(home: &mut Home, o: JoinOpts) -> Result<()> {
     Ok(())
 }
 
-/// `kith device approve`: add this device's approval to a request, when its key is one
-/// of the identity's manage signers.
+/// `kith device approve`: add this machine's approvals to a request, with the manage
+/// keys it holds (this device's key when it is a manage signer, or manage keys kept
+/// here). A terminal's request that no browser claimed is claimed for this identity
+/// first, with a hub token: an identity made with `kith init` has no browser session.
 pub(super) fn approve(home: &mut Home, request: &str, yes: bool) -> Result<()> {
     let hub = home.hub()?;
     let did = home.did()?;
@@ -272,41 +275,46 @@ pub(super) fn approve(home: &mut Home, request: &str, yes: bool) -> Result<()> {
         bail!("that link is not on this identity's hub ({hub})");
     }
     let id = request.rsplit('/').next().unwrap_or(request);
-    let s = check(http().get(format!("{hub}/v1/join/{id}")).send()?)?;
+    let mut s = check(http().get(format!("{hub}/v1/join/{id}")).send()?)?;
     failed(&s)?;
-    match s["state"].as_str() {
-        Some("waiting_for_approval") => {}
+    let unclaimed = match s["state"].as_str() {
+        Some("waiting_for_approval") => false,
+        Some("waiting_for_identity") => true,
         Some("done") => bail!("that device has already been added"),
         Some(other) => bail!("the request is not ready to approve ({other})"),
         None => bail!("the hub returned no state"),
-    }
-    if s["did"] != json!(did) {
+    };
+    if !unclaimed && s["did"] != json!(did) {
         bail!(
             "that request is for {}, not this identity",
             s["did"].as_str().unwrap_or("another identity")
         );
     }
     let st = sync_kel(home)?;
-    let (dev_id, dkey) = home.device()?;
-    if st
-        .device(&dev_id)
-        .is_some_and(|d| d.kind == DeviceKind::Passkey)
-    {
-        bail!("this device is a passkey; approve in the browser instead");
+    if let Ok((dev_id, _)) = home.device() {
+        if st
+            .device(&dev_id)
+            .is_some_and(|d| d.kind == DeviceKind::Passkey)
+        {
+            bail!("this device is a passkey; approve in the browser instead");
+        }
     }
-    if !st.manage.signers().contains(dkey.id()) {
-        bail!("this device ({dev_id}) does not manage {did}, so it can't approve devices; `kith manage show` lists who does");
+    let keys = home.manage_keys(&st)?;
+    if keys.is_empty() {
+        bail!("this machine holds no key that manages {did}, so it can't approve devices; `kith manage show` lists who does");
     }
-    let ev: Event = serde_json::from_value(s["event"].clone())?;
-    let key = s["device"]["key"].as_str().unwrap_or_default();
-    let dev = check_event(&ev, &st, key)?;
-    let message = message_of(&ev, &s)?;
+    // What the request asks for, as the hub holds it. A claimed request's event must add
+    // exactly this device.
+    let asked = &s["device"];
+    let key = asked["key"].as_str().unwrap_or_default().to_string();
+    let (name, kind, aal) = (
+        asked["name"].as_str().unwrap_or("?").to_string(),
+        asked["kind"].as_str().unwrap_or("?").to_string(),
+        asked["aal"].as_u64().unwrap_or(0),
+    );
     eprintln!(
-        "{} ({}, aal {}) wants to join {did}. Its code is {}; check that the new device shows the same.",
-        dev.name,
-        kind_str(dev.kind),
-        dev.aal,
-        key_fingerprint(&dev.key)
+        "{name} ({kind}, aal {aal}) wants to join {did}. Its code is {}; check that the new device shows the same.",
+        key_fingerprint(&key)
     );
     if !confirm(
         "Approve it?",
@@ -316,13 +324,39 @@ pub(super) fn approve(home: &mut Home, request: &str, yes: bool) -> Result<()> {
     )? {
         bail!("not approved (pass --yes to skip the question)");
     }
-    let r = check(
-        http()
-            .post(format!("{hub}/v1/join/{id}/approve"))
-            .json(&json!({"sig": dkey.sign(&message)?}))
-            .send()?,
-    )?;
-    failed(&r)?;
+    if unclaimed {
+        let auth = bearer(home)?;
+        s = check(
+            http()
+                .post(format!("{hub}/v1/join/{id}/claim"))
+                .header("authorization", auth)
+                .json(&json!({}))
+                .send()?,
+        )?;
+        failed(&s)?;
+        if s["did"] != json!(did) {
+            bail!("the hub claimed the request for another identity; nothing was signed");
+        }
+    }
+    let ev: Event = serde_json::from_value(s["event"].clone())?;
+    let dev = check_event(&ev, &st, &key)?;
+    if dev.name != name || kind_str(dev.kind) != kind || u64::from(dev.aal) != aal {
+        bail!("the hub's event describes the device differently than the request did; nothing was signed");
+    }
+    let message = message_of(&ev, &s)?;
+    let mut r = Value::Null;
+    for k in &keys {
+        r = check(
+            http()
+                .post(format!("{hub}/v1/join/{id}/approve"))
+                .json(&json!({"sig": k.sign(&message)?}))
+                .send()?,
+        )?;
+        failed(&r)?;
+        if r["approved"] == true {
+            break;
+        }
+    }
     if r["state"] == "done" {
         sync_kel(home)?;
         eprintln!("Approved. {} is now a device of {did}.", dev.name);
@@ -335,7 +369,7 @@ pub(super) fn approve(home: &mut Home, request: &str, yes: bool) -> Result<()> {
 }
 
 /// The manage policy with device names where its signers are devices.
-fn describe(p: &SignerPolicy, st: &KeyState) -> String {
+pub(super) fn describe(p: &SignerPolicy, st: &KeyState) -> String {
     match p {
         SignerPolicy::Signer(id) => st
             .devices
@@ -409,14 +443,12 @@ fn write_private(path: &std::path::Path, v: &Value) -> Result<()> {
     Ok(())
 }
 
-/// `kith manage set`: a `rotate` signed with the recovery key that replaces the manage
-/// policy and commits a new recovery key.
-pub(super) fn manage_set(home: &mut Home, o: ManageSet) -> Result<()> {
-    let did = home.did()?;
-    let st = sync_kel(home)?;
-
+/// A manage policy of `threshold` of `signers`: device names, device ids or did:keys
+/// (a key that is no device, such as one in a TPM from `kith keys new-manage`).
+pub(super) fn manage_policy(st: &KeyState, threshold: usize, signers: &[String]) -> Result<SignerPolicy> {
+    let did = &st.did;
     let mut ids: Vec<String> = vec![];
-    for s in &o.signers {
+    for s in signers {
         let id = if s.starts_with("did:key:") {
             PublicKey::from_did_key(s).with_context(|| format!("{s} is not a valid did:key"))?;
             s.clone()
@@ -437,15 +469,25 @@ pub(super) fn manage_set(home: &mut Home, o: ManageSet) -> Result<()> {
         }
         ids.push(id);
     }
-    if o.threshold == 0 || o.threshold > ids.len() {
+    if threshold == 0 || threshold > ids.len() {
         bail!("the threshold must be from 1 to {}", ids.len());
     }
     let manage = if ids.len() == 1 {
         SignerPolicy::single(&ids[0])
     } else {
-        SignerPolicy::threshold(o.threshold, ids.iter().map(SignerPolicy::single).collect())
+        SignerPolicy::threshold(threshold, ids.iter().map(SignerPolicy::single).collect())
     };
     manage.validate()?;
+    Ok(manage)
+}
+
+/// `kith manage set`: a `rotate` signed with the recovery key that replaces the manage
+/// policy and commits a new recovery key.
+pub(super) fn manage_set(home: &mut Home, o: ManageSet) -> Result<()> {
+    let did = home.did()?;
+    let st = sync_kel(home)?;
+
+    let manage = manage_policy(&st, o.threshold, &o.signers)?;
 
     let recovery = match (&o.recovery_key, o.recovery_words) {
         (Some(path), _) => {

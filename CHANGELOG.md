@@ -8,6 +8,18 @@ behaviour, not a promise about compatibility. Versions follow the workspace vers
 
 ### Added
 
+- **Keys in a TPM 2.0** (spec §1.3.3), on Linux with `--features tpm`. `kith device join
+  --tpm` (and `kith init --tpm`) make the device key in the TPM; `kith keys new-manage
+  --tpm` makes a manage key there behind a PIN, which the TPM's lockout guards.
+  `identity.json` keeps only the TPM's encrypted blob.
+- **Manage keys on several machines** (spec §1.3.3, §1.5). The CLI signs as manage with
+  every key it holds that the policy names, its own device key included, and takes the
+  log from the hub first. `kith rotate --manage <signer>… --manage-threshold N` names the
+  new manage policy instead of making a software key.
+- **A terminal claims a join request** (spec §7.13). `POST /v1/join/{id}/claim` takes a
+  hub access token as well as a browser session, and `kith device approve` claims a
+  request nobody has claimed yet, so an identity made with `kith init` can add devices.
+
 - **Verified domains** (spec §7.8.3). An identity or an org proves it controls a domain
   with a TXT record, a CNAME or an HTML file that names its DID (`kith domain
   records|verify|attest`). Any hub can witness the proof for any DID and sign what it saw
